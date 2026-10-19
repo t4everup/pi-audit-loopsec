@@ -1211,8 +1211,9 @@ export function tickLoop(projectRoot: string, snapshot: TreeSnapshot, opts: Tick
         ...(wasDigging && digSpent < digBudget ? { digRounds: digSpent + 1 } : {}),
       }, at);
     }
-    // THREE KINDS, and the ORDER is the analysis:
-    //   recon   — read the project (once)
+    // FOUR KINDS, and the ORDER is the analysis:
+    //   recon   — read the project (once, or over a phase)
+    //   pursue  — DEEPEN a finding that came out of a breakthrough, before the next item
     //   surface — enumerate the attack surface into a work list
     //   analyze — work ONE item on that list, all the way down
     //
@@ -1234,7 +1235,8 @@ export function tickLoop(projectRoot: string, snapshot: TreeSnapshot, opts: Tick
     // examined and the run moved to the next S-xxx: the closest result it could produce was filed
     // and abandoned in the same round. Bounded by `pursuitBudget`, so it cannot eat the run.
     const pursuitBudget = pursuitRoundsOf(projectRoot);
-    const pursuitTarget = reconPhaseOver(snapshot, reconRounds) ? nextPursuit(snapshot, pursuitBudget) : null;
+    const probesAllowed = loadSettings(projectRoot).settings.allowCommandProbes;
+    const pursuitTarget = reconPhaseOver(snapshot, reconRounds) ? nextPursuit(snapshot, pursuitBudget, probesAllowed) : null;
     // THE RECON PHASE OUTRANKS AN ITEM, and the two must agree: `secRoundBrief` uses the same
     // `reconPhaseOver` predicate, so a round can never get a recon brief with an `analyze` label
     // (or the reverse) — and the plateau counts those two kinds differently. Counted in SECTIONS,
@@ -1248,6 +1250,7 @@ export function tickLoop(projectRoot: string, snapshot: TreeSnapshot, opts: Tick
         digBudget,
         reconRounds,
         pursuitBudget,
+        probesAllowed,
         lastRound: previous ? `Last round (${previous.round}): ${previous.detail}` : null,
         // The loop AFTER this tick's evaluation — see SecBriefOptions.loop.
         loop: current,
@@ -1270,7 +1273,7 @@ export function tickLoop(projectRoot: string, snapshot: TreeSnapshot, opts: Tick
             ]
           : kindForRound === "pursue"
             ? [
-                `SEC ROUND ${round} — PURSUE ${pursuitTarget!.id}: attack its gate`,
+                `SEC ROUND ${round} — PURSUE ${pursuitTarget!.id}: deepen it (a breakthrough, not the work list)`,
                 `${pursuitTarget!.id} [${pursuitTarget!.severity ?? "unrated"}] ${pursuitTarget!.category} — ${clip(pursuitTarget!.title, 90)}`,
                 `${gatesOfFinding(pursuitTarget!).length} gate(s), pursuit ${pursuitTarget!.pursuitSpent ?? 0}/${pursuitBudget} — NOT working the work list this round`,
               ]

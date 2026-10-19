@@ -41,6 +41,7 @@ import {
   MAX_ITEM_ATTEMPTS,
   PURSUIT_MIN_SEVERITY,
   SEC_IMPLICIT_AUTH_GATE,
+  depthReasons,
   gatesOfFinding,
   nextPursuit,
   reconNotePath,
@@ -624,6 +625,126 @@ test("a gated HIGH finding is pursued INSTEAD of the next surface item", () => {
   assert.match(next.brief!, /PARAMETER SOURCE CONFUSION/);
   assert.match(next.brief!, /MOVE 3 — FIND THE DATA OR CONFIG/);
   assert.match(next.brief!, /MOVE 4 — TEST IT/);
+});
+
+// -----------------------------------------------------------------
+// DEPTH — the general reflex: a breakthrough is deepened, not filed
+// -----------------------------------------------------------------
+//
+// The trigger is not "it is post-auth" and not "it is blocked". It is: a round produced something
+// worth turning over, so the next rounds go into THAT before the next item on the work list. Three
+// ways that shows up — a gate, the model saying so (`deepen`), and a HIGH claim nobody ever ran.
+
+test("`deepen=true` makes a finding a depth target even with no gate and no auth problem", () => {
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 1);
+  submitSecRecon(cwd, NOTE);
+  recordSurface(cwd, { title: "S1", kind: "sink", file: "s.py", line: 1 });
+  recordSurface(cwd, { title: "S2", kind: "sink", file: "t.py", line: 2 });
+  const f = recordFinding(cwd, {
+    title: "proven primitive nobody exercised",
+    category: "sqli",
+    severity: "high",
+    file: "b.py",
+    line: 2,
+    evidence: "e",
+    deepen: true,
+  });
+  if (!f.ok) return assert.fail("must record");
+  assert.equal(f.value.deepen, true, "the flag survives the write");
+  assert.deepEqual(depthReasons(loadSec(cwd).snapshot.findings[0]!, false), ["deepen"]);
+
+  const r = tickLoop(cwd, loadSec(cwd).snapshot);
+  const rec = loadSec(cwd).snapshot.roundRecords.at(-1)!;
+  assert.match(r.brief!, /^\[SEC ROUND \d+ — PURSUE F-0001\]/);
+  assert.equal(rec.kind, "pursue");
+  assert.equal(rec.findingId, "F-0001");
+  // The brief says WHY, and gives the playbook for THIS reason — not the gate playbook.
+  assert.match(r.brief!, /WHY THIS FINDING IS BEING DEEPENED/);
+  assert.match(r.brief!, /you recorded that there is MORE HERE/);
+  assert.match(r.brief!, /HOW TO DEEPEN THIS FINDING: four axes/);
+  assert.match(r.brief!, /1\. PROVE IT/);
+  assert.match(r.brief!, /2\. COMPLETE THE PATH/);
+  assert.match(r.brief!, /3\. FOLLOW THE ROOT CAUSE/);
+  assert.match(r.brief!, /4\. ASK WHAT IT COMBINES WITH/);
+  assert.equal(r.brief!.includes("HOW TO BREAK A GATE"), false, "a gate playbook would be the wrong round");
+});
+
+test("a HIGH finding nobody ran is a depth target — but only when probes are ALLOWED", () => {
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 1);
+  submitSecRecon(cwd, NOTE);
+  recordFinding(cwd, { title: "unverified critical", category: "ssrf", severity: "critical", file: "c.py", line: 3, evidence: "e" });
+
+  // With probes on, "never run" is a real gap the model can close this round.
+  assert.deepEqual(depthReasons(loadSec(cwd).snapshot.findings[0]!, true), ["unproven"]);
+  assert.equal(nextPursuit(loadSec(cwd).snapshot, 3, true)!.id, "F-0001");
+  // With probes off it is not a reason at all: telling the model to run something it is forbidden to
+  // run spends a round on an impossible task.
+  assert.deepEqual(depthReasons(loadSec(cwd).snapshot.findings[0]!, false), []);
+  assert.equal(nextPursuit(loadSec(cwd).snapshot, 3, false), null);
+
+  // And once it HAS been run, the reason is gone.
+  saveSettings(cwd, { allowCommandProbes: true });
+  verifyFinding(cwd, "F-0001", { command: "echo ok", expect: "prints ok", expectOutput: "ok" });
+  assert.deepEqual(depthReasons(loadSec(cwd).snapshot.findings[0]!, true), [], "a run finding is no longer 'unproven'");
+});
+
+test("an ordinary HIGH finding with no gate, no deepen flag and probes off is NOT a depth target", () => {
+  // The reflex must not fire on everything, or the work list never gets touched: a depth round is
+  // the expensive kind, and it is spent where the model says there is more.
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 1);
+  submitSecRecon(cwd, NOTE);
+  recordSurface(cwd, { title: "S1", kind: "sink", file: "s.py", line: 1 });
+  recordFinding(cwd, { title: "plain high", category: "rce", severity: "high", file: "d.py", line: 4, evidence: "e" });
+  assert.deepEqual(depthReasons(loadSec(cwd).snapshot.findings[0]!, false), []);
+  const r = tickLoop(cwd, loadSec(cwd).snapshot);
+  assert.match(r.brief!, /^\[SEC ROUND 1 — ANALYZE S-0001\]/, "the work list is still the plan");
+});
+
+test("the depth budget is per finding, and exhausting it returns the loop to the plan", () => {
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 1);
+  saveSettings(cwd, { pursuitRounds: 2 });
+  submitSecRecon(cwd, NOTE);
+  recordSurface(cwd, { title: "S1", kind: "sink", file: "s.py", line: 1 });
+  recordFinding(cwd, { title: "deep one", category: "rce", severity: "high", file: "a.py", line: 1, evidence: "e", deepen: true });
+
+  tickLoop(cwd, loadSec(cwd).snapshot);
+  assert.equal(loadSec(cwd).snapshot.findings[0]!.pursuitSpent, 1);
+  tickLoop(cwd, loadSec(cwd).snapshot);
+  assert.equal(loadSec(cwd).snapshot.findings[0]!.pursuitSpent, 2);
+  const back = tickLoop(cwd, loadSec(cwd).snapshot);
+  assert.match(back.brief!, /^\[SEC ROUND \d+ — ANALYZE S-0001\]/, "budget spent → the work list is back");
+});
+
+test("`deepen` can be turned OFF, and closing the depth stops it", () => {
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 1);
+  submitSecRecon(cwd, NOTE);
+  recordFinding(cwd, { title: "deep one", category: "rce", severity: "high", file: "a.py", line: 1, evidence: "e", deepen: true });
+  assert.equal(nextPursuit(loadSec(cwd).snapshot, 3, false)!.id, "F-0001");
+
+  updateFinding(cwd, "F-0001", { deepen: false });
+  assert.deepEqual(depthReasons(loadSec(cwd).snapshot.findings[0]!, false), []);
+  assert.equal(nextPursuit(loadSec(cwd).snapshot, 3, false), null, "false really clears it");
+
+  updateFinding(cwd, "F-0001", { deepen: true });
+  assert.equal(nextPursuit(loadSec(cwd).snapshot, 3, false)!.id, "F-0001");
+  updateFinding(cwd, "F-0001", { pursuitClosed: "四个轴都试过，没有更深的东西" });
+  assert.equal(nextPursuit(loadSec(cwd).snapshot, 3, false), null, "and a closed depth stays closed");
+});
+
+test("the deepen flag survives the log, and a tampered one is not invented", () => {
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 1);
+  submitSecRecon(cwd, NOTE);
+  recordFinding(cwd, { title: "a", category: "rce", severity: "high", file: "a.py", line: 1, evidence: "e", deepen: true });
+  recordFinding(cwd, { title: "b", category: "rce", severity: "high", file: "b.py", line: 2, evidence: "e" });
+  const back = loadSec(cwd).snapshot.findings;
+  assert.equal(back[0]!.deepen, true);
+  assert.equal(back[1]!.deepen, undefined, "silence stays silence");
 });
 
 test("a POST-AUTH high finding is pursued even with NO blocker list — the gate is implicit", () => {

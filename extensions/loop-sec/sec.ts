@@ -161,6 +161,13 @@ export interface FindingInput {
    * the next surface item.
    */
   blockers?: string[];
+  /**
+   * There is MORE HERE — the loop should deepen this finding. See `SecFinding.deepen`.
+   *
+   * The general form of "a breakthrough happened": a gate is one reason to keep going, and this is
+   * how the model says so for every other reason it can see and the plugin cannot.
+   */
+  deepen?: boolean;
 }
 
 /**
@@ -299,6 +306,7 @@ export function recordFinding(projectRoot: string, input: FindingInput, at = now
     ...(input.path && input.path.length > 0 ? { path: input.path } : {}),
     ...(chain.length >= 2 ? { chainOf: [...chain] } : {}),
     ...((input.blockers ?? []).length > 0 ? { blockers: input.blockers!.map((b) => b.trim()) } : {}),
+    ...(input.deepen === true ? { deepen: true } : {}),
   };
   if (!appendSecEvent(projectRoot, { type: "finding_recorded", at, finding })) {
     return { ok: false, errors: ["the finding could not be written to the log"] };
@@ -1054,8 +1062,8 @@ export const PURSUIT_MIN_SEVERITY: Severity = "high";
  *
  * `preAuth` is the one signal the model already records reliably (the brief asks for it every round),
  * so it is the right thing to derive the gate from. `undefined` stays UNGATED: "nobody determined
- * it" is not "needs a session", and treating it as gated would spend pursuit rounds on findings
- * whose reachability was never even asserted.
+ * it" is not "needs a session", and treating it as gated would spend depth rounds on findings whose
+ * reachability was never even asserted.
  */
 export function gatesOfFinding(f: SecFinding): string[] {
   const explicit = f.blockers ?? [];
@@ -1072,21 +1080,74 @@ export function gatesOfFinding(f: SecFinding): string[] {
  */
 export const SEC_IMPLICIT_AUTH_GATE = "需要一个已认证会话（该发现记录为认证后，没有声明更具体的前提）";
 
-export function nextPursuit(snapshot: TreeSnapshot, pursuitBudget: number): SecFinding | null {
+/**
+ * The DEPTH SIGNAL for a finding: is there something here worth turning over?
+ *
+ * This is the generalisation of what used to be a gate-only test. The trigger for going deeper is
+ * not "it is post-auth" and not "it is blocked" — it is **a breakthrough**: a round produced
+ * something real, and there is more to establish about it. Three ways that shows up, in the order a
+ * reader would trust them:
+ *
+ *   "gate"    something real that does not work yet (explicit blockers, or marked post-auth).
+ *             Deepening it means opening the precondition, and closing it converts the finding.
+ *   "deepen"  the model's own judgement that there is more here — a proven primitive that was never
+ *             exercised, a root cause that probably holds elsewhere, a piece that only becomes
+ *             dangerous combined with another finding. The plugin cannot read that from prose, so it
+ *             asks (see `SecFinding.deepen`).
+ *   "unproven" a HIGH-or-worse finding nobody ever ran. It is a claim with an artifact and no test,
+ *             and on a 0day hunt the difference between "read it" and "ran it" is the whole product.
+ *             Only counts when the project allows probes — otherwise there is literally nothing the
+ *             model could do about it, and scheduling it would burn rounds on an impossible round.
+ *
+ * Returns the REASONS, not a boolean, so the brief can say which one it is and give the matching
+ * playbook instead of one generic "go deeper".
+ */
+export type DepthReason = "gate" | "deepen" | "unproven";
+
+export function depthReasons(f: SecFinding, probesAllowed: boolean): DepthReason[] {
+  const reasons: DepthReason[] = [];
+  if (gatesOfFinding(f).length > 0) reasons.push("gate");
+  if (f.deepen === true) reasons.push("deepen");
+  if (probesAllowed && !!f.severity && severityRank(f.severity) <= severityRank(PURSUIT_MIN_SEVERITY) && !f.verification) {
+    reasons.push("unproven");
+  }
+  return reasons;
+}
+
+/**
+ * The finding whose open threads the next round should deepen, or null.
+ *
+ * THE FIX FOR "WE FOUND SOMETHING AND WALKED AWAY", generalised. Two measured failures drove it: a
+ * critical RCE recorded `preAuth: false` was filed and the run went on enumerating (the operator had
+ * to ask "can this be pre-auth?" in chat, and that question produced a critical pre-auth RCE); and the
+ * same run's most useful primitive sat unexercised because nothing told the loop that a proven sink
+ * is worth a round of its own.
+ *
+ * So the question is not "is it gated" but "is there a breakthrough here to finish". Conditions:
+ *   1. it has a depth reason (see `depthReasons`),
+ *   2. its depth is not already closed, and its budget is not spent,
+ *   3. it is at or above `PURSUIT_MIN_SEVERITY` — a depth round is the expensive kind.
+ *
+ * Worst-first, then NEWEST first: among equals the round that just produced something wins, because
+ * the model still has the context that made it a breakthrough.
+ */
+export function nextPursuit(
+  snapshot: TreeSnapshot,
+  pursuitBudget: number,
+  probesAllowed = false,
+): SecFinding | null {
   if (pursuitBudget <= 0) return null;
   const candidates = snapshot.findings.filter(
     (f) =>
-      gatesOfFinding(f).length > 0 &&
+      depthReasons(f, probesAllowed).length > 0 &&
       !f.pursuitClosed &&
       (f.pursuitSpent ?? 0) < pursuitBudget &&
       !!f.severity &&
       severityRank(f.severity) <= severityRank(PURSUIT_MIN_SEVERITY),
   );
   if (candidates.length === 0) return null;
-  // Worst-first, then by id so the order is stable across rounds (an unstable order would
-  // make the same two findings trade places every round and neither would get finished).
   return [...candidates].sort(
-    (a, b) => severityRank(a.severity!) - severityRank(b.severity!) || a.id.localeCompare(b.id),
+    (a, b) => severityRank(a.severity!) - severityRank(b.severity!) || b.round - a.round || a.id.localeCompare(b.id),
   )[0]!;
 }
 
@@ -1100,6 +1161,14 @@ export function nextPursuit(snapshot: TreeSnapshot, pursuitBudget: number): SecF
 export interface SecBriefOptions {
   /** Depth rounds one item may be given. See `SEC_DIG_BUDGET`. */
   digBudget?: number;
+  /**
+   * Does the project allow command probes?
+   *
+   * Passed IN because it decides whether the "unproven" depth reason is reachable at all: telling a
+   * model to run the PoC on a project that forbids running commands spends a round on an impossible
+   * task, and the plugin has the setting in hand already.
+   */
+  probesAllowed?: boolean;
   /**
    * How many PURSUIT rounds one finding's blockers may cost. See `HypothesisSettings.pursuitRounds`.
    *
@@ -1197,6 +1266,49 @@ function renderFoundSoFar(snapshot: TreeSnapshot): string {
   }
   return lines.join("\n");
 }
+
+/**
+ * The depth moves for a finding that has NO gate — the other half of "keep going on this".
+ *
+ * A gate is the loudest reason to deepen something, but it is not the only one. When the model says
+ * "there is more here" (`deepen`) or when a HIGH finding has never been RUN, the round is not about
+ * opening a precondition — it is about FINISHING the finding: prove it, complete the path, find where
+ * else the root cause holds, and see what it combines with. Those are the four depth axes of a
+ * FINDING, the same way the class ladders are the depth axes of a bug class.
+ */
+function renderNonGateDepth(lines: string[], finding: SecFinding): void {
+  const id = finding.id;
+  lines.push("--- HOW TO DEEPEN THIS FINDING: four axes ---");
+  lines.push("");
+  lines.push("**1. PROVE IT.** The finding is a claim plus an artifact. Run the thing: a response that comes");
+  lines.push("back carrying your own string, or a 500 with your input in the message, settles more than any");
+  lines.push("reading. `sec_verify` records the command, its exit code and its output, and the report then");
+  lines.push("marks the finding REPRODUCED instead of static — the difference between a lead and a result.");
+  lines.push("");
+  lines.push("**2. COMPLETE THE PATH.** Walk entry → check → sink and write each hop as a `path` step with a");
+  lines.push("`file:line`. A finding whose reachability rests on \"this looks callable\" is one a reader cannot");
+  lines.push("check, and the hop that is missing is usually where the guard is.");
+  lines.push("");
+  lines.push("**3. FOLLOW THE ROOT CAUSE.** The bug is rarely one endpoint. Ask: what shared helper, base");
+  lines.push("class, decorator, framework default or middleware produced this? Then enumerate every other");
+  lines.push("caller of it — each one is a new place, and each is cheaper to check than the original was.");
+  lines.push("Record the ones that hold as findings; `sec_surface` the ones that need analysis of their own.");
+  lines.push("");
+  lines.push("**4. ASK WHAT IT COMBINES WITH.** Two medium findings that meet can be one critical. Does this");
+  lines.push("primitive give you a value, a write, a position or a token that another recorded finding needs?");
+  lines.push("If so, record the COMBINATION as its own finding with `chainOf=[...]` — its artifact is its");
+  lines.push("parts, and the report can only state the chain if you record it.");
+  lines.push("");
+  lines.push("--- WHAT THIS ROUND CAN END WITH ---");
+  lines.push(`**You learned something** → land it: \`sec_verify\` when you ran it, \`sec_update ${id} path=[...]\``);
+  lines.push("when you completed the chain, `sec_finding` for each new place the root cause reaches, and");
+  lines.push("`sec_finding` with `chainOf` when it combines with something already recorded.");
+  lines.push("**There is genuinely nothing more here** → say so, so the loop returns to the work list:");
+  lines.push(`  \`sec_update ${id} pursuitClosed="<理由：四个轴分别试到了哪里，为什么没有更深的东西>"\``);
+  lines.push("**There is more, and it needs its own rounds** → keep `deepen=true` and name which axis is open.");
+  lines.push("");
+}
+
 
 /**
  * The depth axes for a class, in THIS mode's terms.
@@ -1310,6 +1422,7 @@ export function renderSecPursuitBrief(
   const budget = opts.pursuitBudget ?? 2;
   const spent = finding.pursuitSpent ?? 0;
   const gates = gatesOfFinding(finding);
+  const reasons = depthReasons(finding, opts.probesAllowed === true);
   const lines: string[] = [];
   lines.push(`[SEC ROUND ${round} — PURSUE ${finding.id}]`);
   lines.push("");
@@ -1332,10 +1445,20 @@ export function renderSecPursuitBrief(
   lines.push("**surface item this round.** Everything else on the list can wait; this cannot, because");
   lines.push("closing the gate below is what turns this into the objective.");
   lines.push("");
-  lines.push("--- THE GATE ---");
-  for (const g of gates) lines.push(`  - ${g}`);
+  // WHY THIS FINDING — the depth reasons, so the round knows which playbook applies. A gate and
+  // "there is more here" are different problems and deserve different rounds.
+  lines.push("--- WHY THIS FINDING IS BEING DEEPENED ---");
+  if (reasons.includes("gate")) lines.push("  - it is REAL but does not work yet — a gate is blocking it");
+  if (reasons.includes("deepen")) lines.push("  - you recorded that there is MORE HERE (deepen=true) — this round finishes turning it over");
+  if (reasons.includes("unproven")) lines.push("  - it has never been RUN — a claim with an artifact and no test");
   lines.push("--- END ---");
   lines.push("");
+  if (gates.length > 0) {
+    lines.push("--- THE GATE ---");
+    for (const g of gates) lines.push(`  - ${g}`);
+    lines.push("--- END ---");
+    lines.push("");
+  }
 
   // THE FIRST INSTRUCTION CAN BE AN EXIT. A post-auth finding is now a pursuit candidate
   // automatically, which means a run whose objective is NOT about pre-auth lands here on its first
@@ -1350,6 +1473,7 @@ export function renderSecPursuitBrief(
     lines.push("");
   }
 
+  if (gates.length > 0) {
   lines.push("--- HOW TO BREAK A GATE: four moves, in this order ---");
   lines.push("");
   lines.push("**MOVE 0 — VERIFY THE GATE ITSELF. Maybe it is not real.**");
@@ -1411,6 +1535,9 @@ export function renderSecPursuitBrief(
   lines.push("becomes REPRODUCED instead of static; plain `bash` (curl, docker, mysql) works too, as long as");
   lines.push("what you learn ends up recorded here.");
   lines.push("");
+  } else {
+    renderNonGateDepth(lines, finding);
+  }
   lines.push("--- THE DEPTH AXES FOR THIS KIND OF PROBLEM ---");
   lines.push(renderSecLadder("auth-bypass"));
   lines.push("");
@@ -1595,7 +1722,15 @@ export function renderSecAnalyzeBrief(
   lines.push("`blockers` — the loop treats `preAuth=false` at HIGH-or-worse as a gate in its own right and will");
   lines.push("spend its next rounds trying to open it. So record what you already know about why it needs a");
   lines.push("session: which check enforces it, at which line, and whether that check reads the same input the");
-  lines.push("handler acts on. That note is what the pursuit round starts from.");
+  lines.push("handler acts on. That note is what the depth round starts from.");
+  // THE GENERAL DEPTH REFLEX, and the reason it is an explicit flag: the plugin cannot tell "a proven
+  // primitive nobody exercised" from ordinary prose, so it asks the model — at the moment it knows.
+  lines.push("**Anything else that opened something up?** Set `deepen=true` on the finding and the loop will");
+  lines.push("spend its next rounds deepening THAT instead of moving to the next item on the list. Use it when");
+  lines.push("the round produced something worth turning over: a primitive you proved but never exercised, a");
+  lines.push("root cause that probably holds in five more handlers, a piece that only becomes dangerous when");
+  lines.push("combined with another finding. Do NOT set it on every finding — a depth round is the expensive");
+  lines.push("kind, and the loop is asking you to spend them where you believe there is more.");
   lines.push("**The call chain goes in `path`**, one step per hop with a `file:line` on each — not buried in");
   lines.push("`reasoning`; a reader scans a numbered list and cannot scan prose for a path. Keep `reasoning` for");
   lines.push("why it matters, what it costs, and what you could not settle.");

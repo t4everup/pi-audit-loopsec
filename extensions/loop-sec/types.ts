@@ -1672,6 +1672,19 @@ export interface SecFinding {
    * same in the report.
    */
   pursuitClosed?: string;
+  /**
+   * The model's own judgement that there is MORE HERE — a general "keep going on this".
+   *
+   * A gate is one reason to deepen a finding, but it is not the only one: a primitive that was proven
+   * but never exercised, a root cause that probably holds in five more handlers, a piece that only
+   * becomes dangerous when combined with another finding. The plugin cannot tell those from prose, so
+   * it ASKS: set `deepen` when a round produced something worth turning over, and the loop spends its
+   * next rounds on this finding instead of the next item on the work list.
+   *
+   * Deliberately separate from `blockers`: blockers say WHY it does not work yet, `deepen` says THERE
+   * IS MORE TO FIND. A finding can have both, either, or neither.
+   */
+  deepen?: boolean;
 }
 
 /**
@@ -1772,6 +1785,8 @@ export interface SecFindingPatch {
   pursuitSpent?: number;
   /** Close the pursuit with a reason — the gate opened, or the attempts ran out. */
   pursuitClosed?: string;
+  /** Say there is MORE HERE and the loop should deepen this finding. See `SecFinding.deepen`. */
+  deepen?: boolean;
 }
 
 /**

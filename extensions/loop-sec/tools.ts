@@ -124,6 +124,12 @@ export function registerSecTools(pi: ExtensionAPI): void {
               "TWO OR MORE existing finding ids this one COMBINES, e.g. [\"F-0001\", \"F-0007\"]. Use it when what you found, together with something already recorded, reaches somewhere neither reaches alone — an arbitrary file write alone is medium, and the same write into a file that gets executed is root RCE. A chain needs NO artifact of its own: its artifact IS its parts. Every id must already exist.",
           }),
         ),
+        deepen: Type.Optional(
+          Type.Boolean({
+            description:
+              "Say there is MORE HERE. Set it when the round produced something worth turning over — a proven primitive nobody exercised, a root cause that probably holds in five more handlers, a piece that only becomes dangerous combined with another finding. The loop then spends its next rounds deepening THIS finding instead of moving to the next item on the work list. Separate from \"blockers\": blockers say why it does not work yet, deepen says there is more to find.",
+          }),
+        ),
         blockers: Type.Optional(
           Type.Array(Type.String(), {
             description:
@@ -147,6 +153,7 @@ export function registerSecTools(pi: ExtensionAPI): void {
           ...(params.path && params.path.length > 0 ? { path: params.path } : {}),
           ...(params.chainOf && params.chainOf.length > 0 ? { chainOf: params.chainOf } : {}),
           ...(params.blockers && params.blockers.length > 0 ? { blockers: params.blockers } : {}),
+          ...(params.deepen === true ? { deepen: true } : {}),
         });
         if (!result.ok) {
           return text(`Finding REJECTED — nothing was recorded:\n${result.errors.map((e) => `  - ${e}`).join("\n")}`);
@@ -381,6 +388,12 @@ export function registerSecTools(pi: ExtensionAPI): void {
               "REPLACE the blocker list. Pass `[]` when the gate OPENED (the precondition now holds — the loop stops pursuing it); pass refined text when your pursuit round established something better than what was recorded (\"需要 admin 会话\" → \"需要 core.change_datasource 权限，它由任意已认证用户持有\"). A refined blocker is PROGRESS — the same text is not.",
           }),
         ),
+        deepen: Type.Optional(
+          Type.Boolean({
+            description:
+              "Set true when there is MORE HERE and the loop should keep deepening this finding; false when you are done with it. See sec_finding's deepen.",
+          }),
+        ),
         pursuitClosed: Type.Optional(
           Type.String({
             description:
@@ -410,6 +423,7 @@ export function registerSecTools(pi: ExtensionAPI): void {
         // be pursued until its budget ran out.
         if (Array.isArray(params.blockers)) patch.blockers = params.blockers;
         if (params.pursuitClosed) patch.pursuitClosed = params.pursuitClosed;
+        if (typeof params.deepen === "boolean") patch.deepen = params.deepen;
         // priority is a SURFACE field, not a finding one. sec_update corrects a finding, so a
         // priority here means "the surface item this finding came from" — which is what the
         // model has in hand when it decides an item deserves to jump the queue.

@@ -649,6 +649,7 @@ function normalizeFinding(value: unknown): SecFinding | null {
       ? { pursuitSpent: Math.floor(o.pursuitSpent) }
       : {}),
     ...(typeof o.pursuitClosed === "string" && o.pursuitClosed ? { pursuitClosed: o.pursuitClosed } : {}),
+    ...(o.deepen === true ? { deepen: true } : {}),
   };
 }
 
@@ -861,6 +862,7 @@ function normalizeFindingPatch(value: unknown): SecFindingPatch | null {
     patch.pursuitSpent = Math.floor(o.pursuitSpent);
   }
   if (typeof o.pursuitClosed === "string" && o.pursuitClosed.trim()) patch.pursuitClosed = o.pursuitClosed.trim();
+  if (typeof o.deepen === "boolean") patch.deepen = o.deepen;
   return Object.keys(patch).length > 0 ? patch : null;
 }
 
@@ -882,6 +884,7 @@ function applyFindingPatch(finding: SecFinding, patch: SecFindingPatch): SecFind
     ...(patch.blockers !== undefined ? { blockers: patch.blockers } : {}),
     ...(patch.pursuitSpent !== undefined ? { pursuitSpent: patch.pursuitSpent } : {}),
     ...(patch.pursuitClosed !== undefined ? { pursuitClosed: patch.pursuitClosed } : {}),
+    ...(patch.deepen !== undefined ? { deepen: patch.deepen } : {}),
   };
 }
 
