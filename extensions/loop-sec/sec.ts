@@ -1040,11 +1040,43 @@ export const PURSUIT_MIN_SEVERITY: Severity = "high";
  *
  * Worst-first, so the heaviest near miss is attacked before the lighter ones.
  */
+/**
+ * The blocking gates on a finding, explicit or implicit.
+ *
+ * EXPLICIT: the model recorded `blockers`. IMPLICIT: the finding is marked POST-AUTH.
+ *
+ * The implicit case is what closes the measured failure. On a real run a CRITICAL RCE was recorded
+ * with `preAuth: false` and NO blocker list — the field did not exist yet — so the loop marked its
+ * surface item examined and went on enumerating. The operator then asked "can this be pre-auth?"
+ * in chat, that one question produced a CRITICAL pre-auth RCE two exchanges later, and the loop had
+ * had nothing to do with it. A post-auth finding on a pre-auth objective IS a near miss, and it must
+ * not depend on the model remembering to say so.
+ *
+ * `preAuth` is the one signal the model already records reliably (the brief asks for it every round),
+ * so it is the right thing to derive the gate from. `undefined` stays UNGATED: "nobody determined
+ * it" is not "needs a session", and treating it as gated would spend pursuit rounds on findings
+ * whose reachability was never even asserted.
+ */
+export function gatesOfFinding(f: SecFinding): string[] {
+  const explicit = f.blockers ?? [];
+  if (explicit.length > 0) return explicit;
+  if (f.preAuth === false) return [SEC_IMPLICIT_AUTH_GATE];
+  return [];
+}
+
+/**
+ * The blocker text invented for a POST-AUTH finding that declared none.
+ *
+ * Exported so the report renders it the same way and a test can pin the wording: this string is the
+ * difference between "the run never asked" and "the run asked and could not open it".
+ */
+export const SEC_IMPLICIT_AUTH_GATE = "需要一个已认证会话（该发现记录为认证后，没有声明更具体的前提）";
+
 export function nextPursuit(snapshot: TreeSnapshot, pursuitBudget: number): SecFinding | null {
   if (pursuitBudget <= 0) return null;
   const candidates = snapshot.findings.filter(
     (f) =>
-      (f.blockers?.length ?? 0) > 0 &&
+      gatesOfFinding(f).length > 0 &&
       !f.pursuitClosed &&
       (f.pursuitSpent ?? 0) < pursuitBudget &&
       !!f.severity &&
@@ -1250,19 +1282,23 @@ export function renderSecSurfaceBrief(snapshot: TreeSnapshot, objective: string,
   lines.push("`categories` — the analyze round then hands you that class's depth axes.");
   return lines.join("\n");
 }
-
 /**
- * A PURSUIT round: attack the precondition of a finding that is one step from the objective.
+ * A PURSUIT round: attack the gate of a finding that is one step from the objective.
  *
- * This brief exists because of a measured failure: a real RCE was recorded on a pre-auth
- * objective, its surface item was marked examined, and the run went on enumerating the list. The
- * finding that came closest to the goal was filed and abandoned in the same round — and the two
- * rounds that would have turned it into the objective went to unrelated S-xxx items instead.
+ * This brief exists because of a measured failure, and it is worth stating precisely because the
+ * fix is aimed at exactly what happened. A critical RCE was recorded with `preAuth: false`; the loop
+ * marked its surface item examined and went on enumerating. The operator then asked, in chat, "can
+ * this be pre-auth?" — and that ONE question, in two exchanges, produced a critical pre-auth RCE:
+ * they enumerated the unauthenticated entrypoints against the expression sink, queried the live
+ * database for a usable share record, questioned that premise, and found the real flaw — the guard
+ * read `request.getParameter("id")` (query string) while the handler read `@RequestBody.id`. The
+ * loop contributed nothing to any of it.
  *
- * So this round does NOT work the list. It works ONE gate: "what must hold for this to be
- * reachable, and can I get that?". The brief is deliberately explicit that the model must not
- * drift back to the plan — the loop will return to the plan by itself once the gate is opened or
- * the budget runs out.
+ * So this brief is NOT "go and think about the gate". It is a PLAYBOOK: the moves that actually
+ * break a gate, ordered cheapest-and-most-decisive first, printed in full every round because the
+ * failure mode was never "the model repeated an angle" — it was "the model never considered the
+ * angles". The previous round's outcome is at the top, so a second round continues rather than
+ * repeats.
  */
 export function renderSecPursuitBrief(
   snapshot: TreeSnapshot,
@@ -1273,6 +1309,7 @@ export function renderSecPursuitBrief(
 ): string {
   const budget = opts.pursuitBudget ?? 2;
   const spent = finding.pursuitSpent ?? 0;
+  const gates = gatesOfFinding(finding);
   const lines: string[] = [];
   lines.push(`[SEC ROUND ${round} — PURSUE ${finding.id}]`);
   lines.push("");
@@ -1287,7 +1324,7 @@ export function renderSecPursuitBrief(
   lines.push(`  ${finding.title}`);
   if (finding.location) lines.push(`  at ${finding.location.file}:${finding.location.line}`);
   if (finding.preAuth === false) lines.push("  recorded as POST-AUTH — a session is required first");
-  if (finding.preAuth === true) lines.push("  recorded as PRE-AUTH");
+  if (finding.preAuth === true) lines.push("  recorded as PRE-AUTH (the gate below is something else)");
   lines.push(`  PURSUIT ${spent}/${budget} — ${budget - spent} round(s) left on this finding`);
   lines.push("--- END ---");
   lines.push("");
@@ -1296,38 +1333,99 @@ export function renderSecPursuitBrief(
   lines.push("closing the gate below is what turns this into the objective.");
   lines.push("");
   lines.push("--- THE GATE ---");
-  for (const b of finding.blockers ?? []) lines.push(`  - ${b}`);
+  for (const g of gates) lines.push(`  - ${g}`);
   lines.push("--- END ---");
   lines.push("");
-  lines.push("**Attack the gate. For EACH blocker above, find out whether it can be obtained, and how:**");
-  lines.push("  - **An authentication or session requirement** → is there a route that reaches this");
-  lines.push("    handler without one? A default credential, a token that is not verified, a signing key");
-  lines.push("    in the repository, an alternate entry (internal API, websocket, GraphQL alias, a second");
-  lines.push("    route to the same function), or a check that fails open?");
-  lines.push("  - **A field that must be attacker-controlled** → who sets it, is it really fixed, and is");
-  lines.push("    there another caller of the same sink where it IS attacker-controlled?");
-  lines.push("  - **A configuration value** → is it the shipped DEFAULT, and is that default deployed?");
-  lines.push("    Is there a second code path that does not read the setting at all?");
-  lines.push("  - **A race, an order, or a state** → is there a sequence that gets there?");
-  lines.push("  - **An upstream service or network position** → what is actually required, and is any part");
-  lines.push("    of that requirement satisfied by default?");
+
+  // THE FIRST INSTRUCTION CAN BE AN EXIT. A post-auth finding is now a pursuit candidate
+  // automatically, which means a run whose objective is NOT about pre-auth lands here on its first
+  // high post-auth finding. One sentence closes it; without this line the mechanism would tax every
+  // ordinary audit.
+  if (finding.preAuth === false && (finding.blockers?.length ?? 0) === 0) {
+    lines.push(`**FIRST: does this objective even care about pre-auth?** If \`${clip(objective, 100)}\``);
+    lines.push("does not require reaching the sink without authentication, then this gate is not worth a");
+    lines.push("round — close it and go back to the plan:");
+    lines.push(`  \`sec_update ${finding.id} pursuitClosed="目标不要求认证前，该发现的认证后属性不构成缺口"\``);
+    lines.push("Only continue if pre-auth reachability is what this run is FOR.");
+    lines.push("");
+  }
+
+  lines.push("--- HOW TO BREAK A GATE: four moves, in this order ---");
   lines.push("");
-  lines.push("Read the code for each. **A blocker you cannot open is as valuable as one you can** — it is");
-  lines.push("what turns \"maybe\" into a recorded near miss with a reason. Do not stop at the first one.");
+  lines.push("**MOVE 0 — VERIFY THE GATE ITSELF. Maybe it is not real.**");
+  lines.push("The premise you recorded may be wrong, and this is the cheapest move because it needs no new");
+  lines.push("entry: re-read the guard's ACTUAL body, not its name, and check what it really disables or");
+  lines.push("enforces. Measured example from a real run: a template sandbox was recorded as complete because");
+  lines.push("one line read `disableFeature(Feature.NewInstance)` — the library's default feature set is");
+  lines.push("*fully* enabled, so `Use`, `StaticMethods` and `StaticFields` were wide open and code execution");
+  lines.push("was reachable through `use java.lang.System; System.load(...)` with no `new` at all. That finding");
+  lines.push("was re-graded from high to CRITICAL without ever attacking an entrypoint.");
+  lines.push("Ask: which specific check makes this impossible, at which line, and does it check what its");
+  lines.push("name claims? A `sanitize()` that concatenates is not a sanitizer; an `isValid()` that returns");
+  lines.push("true on a missing field is not a check.");
+  lines.push("");
+  lines.push("**MOVE 1 — FIND AN ENTRY THAT SKIPS THE GATE ENTIRELY.**");
+  lines.push("Do not hunt for a bypass of the check; hunt for a second door into the same SINK. Enumerate");
+  lines.push("**every unauthenticated entrypoint you know of, crossed with this sink**, and ask of each pair:");
+  lines.push("does attacker-controlled input from that entry reach the same dangerous call?");
+  lines.push("  - the anonymous/public routes your recon found, and every `@NoAuth`-style annotation;");
+  lines.push("  - a share/token/preview/explicitly-public route, and its whitelist in the config;");
+  lines.push("  - an export/render/download variant of the same handler (`show`, `exportPdf`, `exportExcel`");
+  lines.push("    usually share the whole data path — one guard, four entries);");
+  lines.push("  - an internal/RPC/websocket/GraphQL entry that calls the same service method.");
+  lines.push("This is where a run usually wins, because the sink is already proven and only the door is new.");
+  lines.push("");
+  lines.push("**MOVE 2 — PARAMETER SOURCE CONFUSION. The guard and the handler may read DIFFERENT inputs.**");
+  lines.push("The single highest-yield auth-bypass pattern, and it is worth checking literally: for the SAME");
+  lines.push("request, **where does the guard get the value it validates, and where does the handler get the");
+  lines.push("value it acts on?** If they differ, put a legitimate value where the guard looks and the");
+  lines.push("attacker's value where the handler looks.");
+  lines.push("  - guard reads `request.getParameter(\"id\")` (query string) while the handler reads");
+  lines.push("    `@RequestBody.id` (JSON body) → `?id=<a value the guard accepts>` with a different body id.");
+  lines.push("    Measured: this exact mismatch turned a post-auth expression-injection into a CRITICAL");
+  lines.push("    pre-auth RCE on a real target, and JSON bodies never enter `parameterMap`, so the two values");
+  lines.push("    genuinely cannot agree by accident.");
+  lines.push("  - guard checks the path prefix while the handler routes on a suffix; guard checks a header");
+  lines.push("    the client controls, or a cookie whose signature is not verified; guard validates one id");
+  lines.push("    and the handler resolves a second one from the same body.");
+  lines.push("  - guard runs on `/api/**` while an identical handler exists under `/internal/**` or `/v2/**`.");
+  lines.push("Read the guard's read side and the handler's read side as two separate code paths and diff them.");
+  lines.push("");
+  lines.push("**MOVE 3 — FIND THE DATA OR CONFIG THAT UNLOCKS IT.**");
+  lines.push("Many gates are not code but STATE: a record, a token, a flag, a default. Go and look at the");
+  lines.push("state instead of the code:");
+  lines.push("  - **seed/fixture SQL and migration scripts in the repo** — plaintext tokens, default passwords");
+  lines.push("    and demo share records are routinely checked in. A leaked token whose row is enabled is a");
+  lines.push("    working bypass, and the repo is where it lives.");
+  lines.push("  - the **shipped default** of the setting that gates you, and whether the default deployment");
+  lines.push("    uses it (config files, env defaults, docker-compose, the example app's profile).");
+  lines.push("  - whether the guard's own condition is satisfied by a record that ALREADY exists — a share");
+  lines.push("    row, a public flag, a disabled feature. Query the state if the target is reachable.");
+  lines.push("  - a **token that unlocks a different object than the one being protected**: check whether the");
+  lines.push("    guard validates the OBJECT it was given, or only that A valid token exists somewhere.");
+  lines.push("");
+  lines.push("**MOVE 4 — TEST IT. A gate you only READ is a gate you may have misread.**");
+  lines.push("You have tools. If a live instance is reachable, send the request — do not stop at \"the code");
+  lines.push("says this is blocked\". A 500 carrying your own string, or a response body whose length changes");
+  lines.push("with your input, is proof that beats any reading. `sec_verify` records the run so the finding");
+  lines.push("becomes REPRODUCED instead of static; plain `bash` (curl, docker, mysql) works too, as long as");
+  lines.push("what you learn ends up recorded here.");
+  lines.push("");
+  lines.push("--- THE DEPTH AXES FOR THIS KIND OF PROBLEM ---");
+  lines.push(renderSecLadder("auth-bypass"));
   lines.push("");
   lines.push("--- HOW THIS ROUND CAN END ---");
-  lines.push("**The gate opened** → record the ENABLING thing as its own finding (`sec_finding`, with its");
-  lines.push("own artifact — an auth bypass is a finding, not a footnote), then update this one:");
+  lines.push("**The gate opened** → record the ENABLING thing as its own finding (`sec_finding`, with its own");
+  lines.push("artifact — an auth bypass IS a finding, not a footnote), then update this one:");
   lines.push(`  \`sec_update ${finding.id} blockers=[]\``);
   lines.push(`  \`sec_update ${finding.id} preAuth=true\``, "   (if it is now reachable pre-auth)");
   lines.push("  or link them so the report can state the chain:");
   lines.push(`  \`sec_update ${finding.id} chainOf=[<new finding id>, ${finding.id}]\``);
-  lines.push("**The gate is still closed, and you know more now** → refine it. Replace the blocker text");
-  lines.push("with what you actually established (\"需要 admin 会话\" → \"需要 core.change_datasource 权限，");
-  lines.push("它由任意已认证用户持有\"). A refined blocker is progress; the same text is not.");
-  lines.push(`**The gate cannot be opened** → close the pursuit with the reason, so the report says the`);
-  lines.push("finding was attacked rather than forgotten:");
-  lines.push(`  \`sec_update ${finding.id} pursuitClosed="试过 a/b/c：均无法在认证前到达"\``);
+  lines.push("**The gate is still closed, and you know more now** → refine it. Replace the blocker text with");
+  lines.push("what you actually established. A refined blocker is progress; the same text is not.");
+  lines.push("**The gate cannot be opened** → close the pursuit with the reason, so the report says the");
+  lines.push("finding was ATTACKED rather than forgotten:");
+  lines.push(`  \`sec_update ${finding.id} pursuitClosed="试过 <哪几条路>：<为什么每条都不成立>"\``);
   lines.push("**A new place the pursuit revealed** → `sec_surface` it (it joins the plan, and the loop");
   lines.push("returns to the plan when this gate is settled).");
   lines.push("");
@@ -1493,6 +1591,11 @@ export function renderSecAnalyzeBrief(
   lines.push("the loop then spends its next rounds attacking that gate INSTEAD of the next item on the list,");
   lines.push("because closing it converts the finding into the objective. Do not file it as a near miss and");
   lines.push("move on — that is what this field exists to prevent.");
+  lines.push("**Found something HIGH but POST-AUTH?** Then you have recorded a GATE, whether or not you pass");
+  lines.push("`blockers` — the loop treats `preAuth=false` at HIGH-or-worse as a gate in its own right and will");
+  lines.push("spend its next rounds trying to open it. So record what you already know about why it needs a");
+  lines.push("session: which check enforces it, at which line, and whether that check reads the same input the");
+  lines.push("handler acts on. That note is what the pursuit round starts from.");
   lines.push("**The call chain goes in `path`**, one step per hop with a `file:line` on each — not buried in");
   lines.push("`reasoning`; a reader scans a numbered list and cannot scan prose for a path. Keep `reasoning` for");
   lines.push("why it matters, what it costs, and what you could not settle.");
@@ -1615,7 +1718,10 @@ export function renderSecReport(
   // HAS. A high finding whose gate is still open is one pursuit away from the objective, and a
   // reader watching a run should be able to see that at a glance instead of inferring it from the
   // per-finding blocks.
-  const gated = findings.filter((f) => (f.blockers?.length ?? 0) > 0 && !f.pursuitClosed);
+  // `gatesOfFinding`, not `f.blockers`: a POST-AUTH finding has an IMPLICIT gate, and counting only
+  // explicit blockers made exactly the near miss this report exists to surface invisible in the
+  // summary — the finding that is one step from the objective did not appear in the count.
+  const gated = findings.filter((f) => gatesOfFinding(f).length > 0 && !f.pursuitClosed);
   if (gated.length > 0) {
     lines.push(`| ${t.rowGated(gated.length, findings.length)} | **${gated.length}/${findings.length}** |`);
   }
@@ -1892,10 +1998,15 @@ function renderSecFinding(
   // pre-auth objective is not a pre-auth finding, and the gate is the difference. It also carries
   // the PURSUIT outcome, so "we attacked this gate and could not open it" is distinguishable from
   // "nobody ever tried" — the same distinction the rest of this report is built on.
-  if ((f.blockers?.length ?? 0) > 0 || f.pursuitClosed) {
+  //
+  // `gatesOfFinding` decides, not `f.blockers`: a POST-AUTH finding has an IMPLICIT gate even when
+  // nobody wrote a blocker list, and printing the gate is how a reader sees that the run treated it
+  // as a near miss rather than filing it.
+  const gateList = gatesOfFinding(f);
+  if (gateList.length > 0 || f.pursuitClosed) {
     const gateBody: string[] = [];
-    for (const b of f.blockers ?? []) gateBody.push(`- ${b}`);
-    if ((f.blockers?.length ?? 0) === 0) gateBody.push(t.gateOpen);
+    for (const b of gateList) gateBody.push(`- ${b}`);
+    if (gateList.length === 0) gateBody.push(t.gateOpen);
     gateBody.push("");
     gateBody.push(f.pursuitClosed ? t.pursuitClosed(f.pursuitSpent ?? 0, f.pursuitClosed) : t.pursuitOpen(f.pursuitSpent ?? 0));
     fenced(t.gateHeading, gateBody.join("\n"));

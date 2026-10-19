@@ -40,6 +40,8 @@ import {
   secReportPath,
   MAX_ITEM_ATTEMPTS,
   PURSUIT_MIN_SEVERITY,
+  SEC_IMPLICIT_AUTH_GATE,
+  gatesOfFinding,
   nextPursuit,
   reconNotePath,
   reconPhaseOver,
@@ -615,7 +617,120 @@ test("a gated HIGH finding is pursued INSTEAD of the next surface item", () => {
   assert.notEqual(rec.surfaceId, "S-0002", "S-0002 is NOT handed over while the gate is open");
   assert.match(next.brief!, /Do NOT go to the next/, "and the brief says so explicitly");
   assert.match(next.brief!, /需要一个有效的已认证会话/, "the gate is restated in the brief");
-  assert.match(next.brief!, /找.*不需要.*会话|without one/, "and the brief names the way to attack it");
+  // The brief is a PLAYBOOK, not "go and think about it": the four moves that actually break a gate,
+  // including the parameter-source mismatch that cracked a real target.
+  assert.match(next.brief!, /MOVE 0 — VERIFY THE GATE ITSELF/);
+  assert.match(next.brief!, /MOVE 1 — FIND AN ENTRY THAT SKIPS THE GATE ENTIRELY/);
+  assert.match(next.brief!, /PARAMETER SOURCE CONFUSION/);
+  assert.match(next.brief!, /MOVE 3 — FIND THE DATA OR CONFIG/);
+  assert.match(next.brief!, /MOVE 4 — TEST IT/);
+});
+
+test("a POST-AUTH high finding is pursued even with NO blocker list — the gate is implicit", () => {
+  // THE MEASURED FAILURE. A critical RCE was recorded with `preAuth: false` and no blocker list (the
+  // field did not exist), so the loop marked its surface item examined and went on enumerating. The
+  // operator then asked "can this be pre-auth?" in chat, and that one question produced a critical
+  // pre-auth RCE two exchanges later. The loop had nothing to do with it.
+  const cwd = seeded();
+  startSec(cwd, "挖掘认证前RCE漏洞", 99, 1);
+  submitSecRecon(cwd, NOTE);
+  recordSurface(cwd, { title: "S-0006 executeSelectApi", kind: "sink", file: "m.java", line: 872 });
+  recordSurface(cwd, { title: "S-0007 upload", kind: "sink", file: "c.java", line: 21 });
+  tickLoop(cwd, loadSec(cwd).snapshot);
+
+  // NO blockers field at all — only preAuth: false, exactly like the real run.
+  const f = recordFinding(cwd, {
+    title: "Aviator 表达式逃逸 → System.load → RCE",
+    category: "rce",
+    severity: "critical",
+    file: "ExpressUtil.java",
+    line: 550,
+    evidence: "i.disableFeature(Feature.NewInstance)",
+    preAuth: false,
+    surfaceId: "S-0006",
+  });
+  if (!f.ok) return assert.fail("must record");
+  assert.equal(f.value.blockers, undefined, "the fixture has no explicit blockers — that is the point");
+
+  const next = tickLoop(cwd, loadSec(cwd).snapshot);
+  const rec = loadSec(cwd).snapshot.roundRecords.at(-1)!;
+  assert.match(next.brief!, /^\[SEC ROUND \d+ — PURSUE F-0001\]/, "the post-auth finding is pursued, not filed");
+  assert.equal(rec.kind, "pursue");
+  assert.equal(rec.findingId, "F-0001");
+  assert.equal(rec.surfaceId, undefined, "S-0002 is NOT handed over — the pursue record carries no surfaceId at all");
+  assert.match(next.brief!, /需要一个已认证会话/);
+  assert.deepEqual(gatesOfFinding(loadSec(cwd).snapshot.findings[0]!), [SEC_IMPLICIT_AUTH_GATE]);
+});
+
+test("preAuth=undefined is NOT a gate — 'nobody determined it' is not 'needs a session'", () => {
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 1);
+  submitSecRecon(cwd, NOTE);
+  recordFinding(cwd, { title: "unassessed high", category: "rce", severity: "high", file: "a.py", line: 9, evidence: "e" });
+  assert.deepEqual(gatesOfFinding(loadSec(cwd).snapshot.findings[0]!), []);
+  assert.equal(nextPursuit(loadSec(cwd).snapshot, 3), null, "an unassessed reach is not pursued");
+});
+
+test("the pursuit brief is a PLAYBOOK: four moves, the auth ladder, and permission to test", () => {
+  const cwd = seeded();
+  startSec(cwd, "挖掘认证前RCE漏洞", 99, 1);
+  submitSecRecon(cwd, NOTE);
+  recordFinding(cwd, {
+    title: "post-auth rce", category: "rce", severity: "high", file: "a.py", line: 9, evidence: "e", preAuth: false,
+  });
+  const brief = tickLoop(cwd, loadSec(cwd).snapshot).brief!;
+
+  // MOVE 0 — the lesson from the real run: the "sandbox" was not a sandbox.
+  assert.match(brief, /MOVE 0 — VERIFY THE GATE ITSELF/);
+  assert.match(brief, /disableFeature\(Feature\.NewInstance\)/, "the worked example is in the brief");
+  assert.match(brief, /CRITICAL without ever attacking an entrypoint/);
+  // MOVE 1 — cross-product of unauthenticated entries against this sink.
+  assert.match(brief, /MOVE 1 — FIND AN ENTRY THAT SKIPS THE GATE ENTIRELY/);
+  assert.match(brief, /crossed with this sink/);
+  // MOVE 2 — the pattern that actually cracked the target.
+  assert.match(brief, /MOVE 2 — PARAMETER SOURCE CONFUSION/);
+  assert.match(brief, /request\.getParameter\("id"\)/);
+  assert.match(brief, /@RequestBody\.id/);
+  // MOVE 3 — state, not code: seed SQL, defaults, existing records.
+  assert.match(brief, /MOVE 3 — FIND THE DATA OR CONFIG/);
+  assert.match(brief, /seed\/fixture SQL/);
+  // MOVE 4 — empirical.
+  assert.match(brief, /MOVE 4 — TEST IT/);
+  assert.match(brief, /sec_verify/);
+  // The curated auth-bypass ladder rides along, because the gate IS authentication.
+  assert.match(brief, /THE DEPTH AXES FOR THIS KIND OF PROBLEM/);
+  assert.match(brief, /PARAMETER SOURCE CONFUSION/);
+  assert.match(brief, /@RequestBody\.id/, "the worked example rides in the ladder too, not only in MOVE 2");
+});
+
+test("the implicit gate offers an EXIT, so an ordinary audit is not taxed by it", () => {
+  // preAuth=false is now a pursuit candidate automatically, which means a run whose objective is
+  // not about pre-auth lands here on its first high post-auth finding. One sentence closes it.
+  const cwd = seeded();
+  startSec(cwd, "审计这个项目的 SQL 注入", 99, 1);
+  submitSecRecon(cwd, NOTE);
+  recordFinding(cwd, {
+    title: "post-auth sqli", category: "sqli", severity: "high", file: "a.py", line: 9, evidence: "e", preAuth: false,
+  });
+  const brief = tickLoop(cwd, loadSec(cwd).snapshot).brief!;
+  assert.match(brief, /does this objective even care about pre-auth/);
+  assert.match(brief, /sec_update F-0001 pursuitClosed=/, "and it gives the exact command to close it");
+
+  // Following that instruction really does stop the pursuit.
+  updateFinding(cwd, "F-0001", { pursuitClosed: "目标不要求认证前，该发现的认证后属性不构成缺口" });
+  assert.equal(nextPursuit(loadSec(cwd).snapshot, 3), null);
+});
+
+test("the report prints the implicit gate too, so a post-auth near miss is visible", () => {
+  const cwd = seeded();
+  withSurface(cwd, 1);
+  recordFinding(cwd, {
+    title: "认证后 RCE", category: "rce", severity: "high", file: "src/a.c", line: 42, evidence: "e", preAuth: false,
+  });
+  const report = renderSecReport(loadSec(cwd).snapshot, loadSec(cwd).snapshot.loop);
+  assert.match(report, /\*\*前提（要利用它还需要什么成立）\*\*/);
+  assert.match(report, /需要一个已认证会话（该发现记录为认证后/);
+  assert.match(report, /被前提阻塞的高危发现/, "and it counts as a near miss");
 });
 
 test("the pursuit budget is spent on prepare and then the loop returns to the plan", () => {

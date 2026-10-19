@@ -181,8 +181,10 @@ export const LADDERS: Partial<Record<HypothesisCategory, Ladder>> = {
   },
   "auth-bypass": {
     keyAxis:
-      "GLOBAL ENFORCEMENT — is there a parent class, middleware, framework default or listener that applies a check the controller itself does not? Reading the controller alone cannot settle this.",
+      "WHAT THE CHECK ACTUALLY READS — read the guard's body, not its name: which input does it validate, and is that the same input the handler acts on? A guard on one source and a handler on another is the whole class.",
     axes: [
+      "PARAMETER SOURCE CONFUSION — does the guard read the same SOURCE the handler reads (query string vs JSON body vs header vs cookie vs path segment)? Put a value the guard accepts where the guard looks, and a different value where the handler looks. Measured: a guard reading `request.getParameter(\"id\")` next to a handler reading `@RequestBody.id` turned a post-auth expression injection into a CRITICAL pre-auth RCE.",
+      "THE CHECK ITSELF — read the guard's body. A function called `requireAuth` that returns early on a missing header is a bypass, not a guard; one that returns true when no handler bean is configured is a guard that nobody implemented.",
       "GLOBAL ENFORCEMENT — a parent class, middleware, framework default or event listener that applies a check this handler does not (denyAccessUnlessGranted, #[IsGranted], a firewall rule, an auth middleware)?",
       "ENTRY POINT — does the firewall / gateway / entry_point reject before the handler is reached (a token API, an IP allowlist, a base authenticator)?",
       "ROUTE ALIASES — is the same handler reachable by another path, method, version prefix, or with a trailing slash / different case?",

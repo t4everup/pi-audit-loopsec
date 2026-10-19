@@ -149,7 +149,11 @@ export const DEFAULT_SETTINGS: HypothesisSettings = {
   maxLinesScanned: 400_000,
   reconSegmentParagraphs: 4,
   pursueRounds: 2,
-  pursuitRounds: 2,
+  // THREE, not two. The gate that was actually cracked on a real run needed three moves: re-check
+  // the premise (the "sandbox" was not a sandbox), enumerate alternative entries, then find that the
+  // guard and the handler read different parameter sources. Two rounds is enough to look, not enough
+  // to break. The model can always close early with `pursuitClosed` once it concludes.
+  pursuitRounds: 3,
   reconRounds: 2,
   // zh by default: this extension's operating instructions are Chinese-first,
   // and a report nobody on the team can read is not a deliverable.

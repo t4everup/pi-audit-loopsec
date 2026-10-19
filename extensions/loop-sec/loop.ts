@@ -117,6 +117,7 @@ import {
   appendSecLedger,
   nextOpenSurface,
   secCoverage,
+  gatesOfFinding,
   nextPursuit,
   reconPhaseOver,
   reconSections,
@@ -1271,7 +1272,7 @@ export function tickLoop(projectRoot: string, snapshot: TreeSnapshot, opts: Tick
             ? [
                 `SEC ROUND ${round} — PURSUE ${pursuitTarget!.id}: attack its gate`,
                 `${pursuitTarget!.id} [${pursuitTarget!.severity ?? "unrated"}] ${pursuitTarget!.category} — ${clip(pursuitTarget!.title, 90)}`,
-                `${pursuitTarget!.blockers!.length} blocker(s), pursuit ${pursuitTarget!.pursuitSpent ?? 0}/${pursuitBudget} — NOT working the work list this round`,
+                `${gatesOfFinding(pursuitTarget!).length} gate(s), pursuit ${pursuitTarget!.pursuitSpent ?? 0}/${pursuitBudget} — NOT working the work list this round`,
               ]
             : [
               `SEC ROUND ${round} — analyse ${assigned!.id}`,
