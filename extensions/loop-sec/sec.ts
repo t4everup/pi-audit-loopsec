@@ -53,7 +53,7 @@ import * as path from "node:path";
 import { SEC_STATE_DIR_NAME, appendSecEvent, loadSec, nowIso } from "./store.js";
 import { type Result } from "./types.js";
 import { coverageGaps, coverageHeadline, type CoverageReport } from "./coverage.js";
-import { fenceLanguageOf, loadSettings, reportLanguageOf } from "./settings.js";
+import { allowCommandProbesOf, fenceLanguageOf, loadSettings, pursuitRoundsOf, reportLanguageOf } from "./settings.js";
 import { ladderFor } from "./ladders.js";
 import {
   type ReportLanguage,
@@ -840,9 +840,21 @@ export function nextOpenSurface(snapshot: TreeSnapshot, digBudget = SEC_DIG_BUDG
     const digSpent = s.status === "digging" && (s.digRounds ?? 0) >= digBudget;
     return attemptsSpent || digSpent ? -1 : 0;
   };
-  // Ties keep insertion order — `sort` is stable and both terms return 0 — so the plan
-  // still governs everything nobody promoted.
-  return [...open].sort((a, b) => rank(b) - rank(a) || (b.priority ?? 0) - (a.priority ?? 0))[0] ?? null;
+  // `focus` REORDERS, it does not merely decorate. It used to be rendered as a banner at the top
+  // of every brief and touch nothing else — a setting that says "this run is for rce" while the
+  // assignment ignores it is worse than no setting, because the operator stops checking. It sits
+  // below `priority` (an explicit act on ONE item) and above plan order: the operator's scope
+  // outranks enumeration order, and the model's specific judgement outranks both.
+  const focus = snapshot.loop?.focus ?? [];
+  const focusHit = (s: SecSurface): number =>
+    focus.length > 0 && (s.categories ?? []).some((c) => focus.includes(c)) ? 1 : 0;
+  // Ties keep insertion order — `sort` is stable and every term returns 0 — so the plan
+  // still governs everything nobody promoted and nothing in scope.
+  return (
+    [...open].sort(
+      (a, b) => rank(b) - rank(a) || focusHit(b) - focusHit(a) || (b.priority ?? 0) - (a.priority ?? 0),
+    )[0] ?? null
+  );
 }
 
 export interface SurfaceProgress {
@@ -1831,6 +1843,17 @@ export interface SecReportOptions {
   language?: ReportLanguage;
   /** The language tag the content fences open with. See settings.fenceLanguage. */
   fenceLanguage?: string;
+  /**
+   * Whether `sec_verify` is enabled, so the report can name the SAME depth reasons the loop used.
+   *
+   * Passed in rather than re-derived, because a report that recomputed them could disagree with the
+   * rounds it is describing — the depth reflex is judged with this flag, and the report must print
+   * the judgement that actually happened. Omitted means `false`, which under-reports `unproven`
+   * rather than inventing it.
+   */
+  probesAllowed?: boolean;
+  /** The depth budget per finding, so `已花 N/M 轮` can print the M. See settings.pursuitRounds. */
+  pursuitBudget?: number;
 }
 
 /** Findings grouped by severity, worst first, with the unrated last. */
@@ -1849,6 +1872,12 @@ export function renderSecReport(
   const lang: ReportLanguage = opts.language ?? "zh";
   const fenceLanguage = opts.fenceLanguage ?? "c";
   const t = secStrings(lang);
+  // One object rather than two more positional parameters — `renderSecFinding` already takes five, and
+  // the next thing the report needs to name will be a third.
+  const depthCtx: DepthCtx = {
+    probesAllowed: opts.probesAllowed ?? false,
+    pursuitBudget: opts.pursuitBudget ?? 0,
+  };
   const lines: string[] = [];
   const findings = snapshot.findings;
   const { rated, unrated } = secFindingsBySeverity(snapshot);
@@ -2053,7 +2082,9 @@ export function renderSecReport(
     lines.push(t.noneRecorded);
     lines.push("");
   } else {
-    [...rated, ...unrated].forEach((f, i) => lines.push(...renderSecFinding(f, i + 1, t, lang, fenceLanguage)));
+    [...rated, ...unrated].forEach((f, i) =>
+      lines.push(...renderSecFinding(f, i + 1, t, lang, fenceLanguage, depthCtx)),
+    );
   }
 
   // ---- what was not read --------------------------------------------------
@@ -2144,12 +2175,19 @@ function pct(part: number, whole: number): number {
  * report: 27-102 lines per finding, 8-9 of them metadata and 2 a disclaimer the preamble
  * already carried.
  */
+/** What `renderSecFinding` needs to name the SAME depth judgement the loop made. */
+interface DepthCtx {
+  probesAllowed: boolean;
+  pursuitBudget: number;
+}
+
 function renderSecFinding(
   f: SecFinding,
   index: number,
   t: SecStrings,
   lang: ReportLanguage,
   fenceLanguage: string,
+  depthCtx: DepthCtx,
 ): string[] {
   const lines: string[] = [];
   const sev = f.severity ? severityLabel(f.severity, lang) : t.rowUnrated.replace(/\*/g, "");
@@ -2173,6 +2211,26 @@ function renderSecFinding(
   }
   lines.push(meta.join(t.metaSeparator));
   lines.push("");
+
+  // WHY THE RUN WENT DEEP ON THIS ONE, and how much of the budget that has cost.
+  //
+  // The depth reflex is the whole reason a breakthrough is pursued instead of filed, and it left no
+  // trace in the report: a reader could see that a finding had been pursued only when it carried a
+  // gate, because that is the one case the gate block prints. An UNGATED finding that the run
+  // stopped everything to finish looked exactly like one it never touched.
+  //
+  // The reasons come from `depthReasons`, the same function the loop ranks with, fed the same
+  // `probesAllowed` — so the report cannot describe a different judgement than the one made.
+  if (f.deepen === true || (f.pursuitSpent ?? 0) > 0) {
+    const reasons = depthReasons(f, depthCtx.probesAllowed);
+    const named = reasons
+      .map((r) =>
+        r === "gate" ? t.depthReasonGate : r === "deepen" ? t.depthReasonDeepen : t.depthReasonUnproven,
+      )
+      .join("；");
+    lines.push(t.depthLine(named, f.pursuitSpent ?? 0, depthCtx.pursuitBudget));
+    lines.push("");
+  }
 
   // The tag goes on the OPENING fence only: a closing fence must be bare, or the
   // renderer reads it as content.
@@ -2341,6 +2399,11 @@ export function writeSecReport(
       language: opts.language ?? reportLanguageOf(projectRoot),
       fenceLanguage: opts.fenceLanguage ?? fenceLanguageOf(projectRoot),
       coverageReport: opts.coverageReport ?? secCoverage(snapshot, projectRoot),
+      // Read here for the same reason as the language: a caller that forgets them would print a depth
+      // budget of 0/M and silently omit the `unproven` reason, making the report describe a judgement
+      // the run did not make.
+      probesAllowed: opts.probesAllowed ?? allowCommandProbesOf(projectRoot),
+      pursuitBudget: opts.pursuitBudget ?? pursuitRoundsOf(projectRoot),
     });
     // Only the append-and-truncate pair this project uses everywhere: no rename,
     // no held fd, so a non-NTFS volume cannot fail the write.

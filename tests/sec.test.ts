@@ -17,7 +17,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import { loadSec } from "../extensions/loop-sec/store.ts";
-import { DEPTH_RATIO_WINDOW, MAX_CONSECUTIVE_DEPTH, MAX_DEPTH_RATIO, depthAllowed } from "../extensions/loop-sec/loop.ts";
+import { DEPTH_RATIO_WINDOW, MAX_CONSECUTIVE_DEPTH, MAX_DEPTH_RATIO, depthAllowed, renderFocus } from "../extensions/loop-sec/loop.ts";
 import { evaluateRound, pauseAfterRounds, pauseLoop, resumeLoop, startLoop, stopLoop, tickLoop } from "../extensions/loop-sec/loop.ts";
 import { loadSettings, saveSettings } from "../extensions/loop-sec/settings.ts";
 import { loopCommandName, type SecFindingStep } from "../extensions/loop-sec/types.ts";
@@ -98,12 +98,17 @@ const NOTE = [
   "文件上传在 src/handlers/upload.c，把 multipart 的 filename 直接拼进 fopen()。",
 ].join("\n\n");
 
-function startSec(cwd: string, objective = "挖掘认证前rce漏洞", plateauWindow = 99, reconRounds = 1) {
+function startSec(cwd: string, objective = "挖掘认证前rce漏洞", plateauWindow = 99, reconRounds = 1, focus?: string[]) {
   // PINNED to one recon round in the fixture: the tests that use this are about the surface and
   // analyze rounds, and the recon phase is now more than one round by DEFAULT (see
   // HypothesisSettings.reconRounds). The multi-round phase has its own tests, which pass 2+.
   saveSettings(cwd, { reconRounds });
-  const result = startLoop(cwd, loadSec(cwd).snapshot, { kind: "sec", objective, plateauWindow });
+  const result = startLoop(cwd, loadSec(cwd).snapshot, {
+    kind: "sec",
+    objective,
+    plateauWindow,
+    ...(focus ? { focus } : {}),
+  });
   assert.equal(result.ok, true, result.ok ? "" : result.errors.join("; "));
   return result;
 }
@@ -189,7 +194,7 @@ test("the next item is the first still open, in ENUMERATION order", () => {
   assert.equal(nextOpenSurface(snapshot)!.id, "S-0001");
   clearSurface(cwd, "S-0001", "check_auth() runs at router.c:88 before dispatch and the route is not in the public table", { file: "src/auth/session.c", line: 1 });
   // The order is the enumerator's judgement and nothing re-sorts it behind its back.
-  assert.equal(nextOpenSurface(loadSec(cwd).snapshot)!.id, "S-0002", { file: "src/auth/session.c", line: 1 });
+  assert.equal(nextOpenSurface(loadSec(cwd).snapshot)!.id, "S-0002");
 });
 
 test("clearing an item REQUIRES a reason that names the guard", () => {
@@ -2372,7 +2377,7 @@ test("a cleared item can be reopened, with a reason", () => {
   const cwd = seeded();
   withSurface(cwd, 2);
   clearSurface(cwd, "S-0001", "check_auth() runs at router.c:88 before dispatch and this path is not public", { file: "src/auth/session.c", line: 1 });
-  assert.equal(loadSec(cwd).snapshot.surfaces[0]!.status, "cleared", { file: "src/auth/session.c", line: 1 });
+  assert.equal(loadSec(cwd).snapshot.surfaces[0]!.status, "cleared");
 
   const ok = reopenSurface(cwd, "S-0001", "check_auth() returns early for /diag/* before it reaches the public table");
   assert.equal(ok.ok, true, ok.ok ? "" : ok.errors.join("; "));
@@ -2635,3 +2640,78 @@ test("updateSurface cannot smuggle a clearance past the location requirement", (
   assert.match(bypass.ok ? "" : bypass.errors.join(" "), /reason AND the guard's location/);
 });
 
+test("focus REORDERS the work list — a scoped item is assigned before an earlier one", () => {
+  // It used to render a banner on every brief and touch nothing else. A setting that says "this run is
+  // for rce" while the assignment ignores it is worse than no setting: the operator stops checking.
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 1, ["rce"]);
+  submitSecRecon(cwd, NOTE);
+  recordSurface(cwd, { title: "SSRF candidate", kind: "sink", file: "a.py", line: 1, categories: ["ssrf"] });
+  recordSurface(cwd, { title: "RCE candidate", kind: "sink", file: "b.py", line: 2, categories: ["rce"] });
+  // Enumeration order says S-0001 first; the scope says otherwise.
+  assert.equal(nextOpenSurface(loadSec(cwd).snapshot)!.id, "S-0002");
+});
+
+test("an explicit promotion still outranks the run's scope", () => {
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 1, ["rce"]);
+  submitSecRecon(cwd, NOTE);
+  recordSurface(cwd, { title: "SSRF candidate", kind: "sink", file: "a.py", line: 1, categories: ["ssrf"] });
+  recordSurface(cwd, { title: "RCE candidate", kind: "sink", file: "b.py", line: 2, categories: ["rce"] });
+  updateSurface(cwd, "S-0001", { priority: 1 });
+  assert.equal(nextOpenSurface(loadSec(cwd).snapshot)!.id, "S-0001", "the model's own judgement wins");
+});
+
+test("no focus means no reordering — the plan order is untouched", () => {
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 1);
+  submitSecRecon(cwd, NOTE);
+  recordSurface(cwd, { title: "a", kind: "sink", file: "a.py", line: 1, categories: ["ssrf"] });
+  recordSurface(cwd, { title: "b", kind: "sink", file: "b.py", line: 2, categories: ["rce"] });
+  assert.equal(nextOpenSurface(loadSec(cwd).snapshot)!.id, "S-0001");
+});
+
+test("the brief says the scope REORDERS rather than decorates, and asks for categories", () => {
+  const banner = renderFocus(["rce", "ssrf"]);
+  assert.match(banner, /THIS RUN IS SCOPED TO: rce, ssrf/);
+  assert.match(banner, /REORDERS the work list/);
+  assert.match(banner, /PASS `categories`/, "an unannotated item cannot be matched");
+});
+
+test("the report says WHY a finding was deepened, and how much of its budget that cost", () => {
+  // The depth reflex is the reason a breakthrough is pursued instead of filed, and it left no trace:
+  // an ungated finding the run stopped everything to finish looked exactly like one it never touched.
+  const cwd = seeded();
+  withSurface(cwd, 1);
+  recordFinding(cwd, {
+    title: "unproven RCE", category: "rce", severity: "critical", file: "a.py", line: 1, evidence: "e", deepen: true,
+  });
+  const snapshot = loadSec(cwd).snapshot;
+  const report = renderSecReport(snapshot, snapshot.loop, { probesAllowed: false, pursuitBudget: 3 });
+  assert.match(report, /为什么在深挖/);
+  assert.match(report, /记录时被标为突破点/, "the recorded flag is named");
+  assert.match(report, /已花 0\/3 轮/, "and the budget is printed, not left blank");
+});
+
+test("an UNGATED finding the run deepened is distinguishable from one it never touched", () => {
+  const cwd = seeded();
+  withSurface(cwd, 2);
+  recordFinding(cwd, {
+    title: "deepened", category: "rce", severity: "high", file: "a.py", line: 1, evidence: "e", deepen: true,
+  });
+  recordFinding(cwd, { title: "untouched", category: "rce", severity: "high", file: "b.py", line: 2, evidence: "e" });
+  const snapshot = loadSec(cwd).snapshot;
+  const report = renderSecReport(snapshot, snapshot.loop, { probesAllowed: false, pursuitBudget: 3 });
+  // Exactly one finding block carries the depth line — the one that was deepened.
+  assert.equal(report.split("为什么在深挖").length - 1, 1);
+});
+
+test("`unproven` appears only when probes are actually allowed", () => {
+  const cwd = seeded();
+  withSurface(cwd, 1);
+  recordFinding(cwd, { title: "high, never run", category: "rce", severity: "high", file: "a.py", line: 1, evidence: "e" });
+  const snapshot = loadSec(cwd).snapshot;
+  // Never run and nothing recorded, so no depth reason at all — the finding block is bare.
+  const off = renderSecReport(snapshot, snapshot.loop, { probesAllowed: false, pursuitBudget: 3 });
+  assert.equal(off.includes("为什么在深挖"), false, "no probes, no unproven reason, no line");
+});

@@ -211,6 +211,17 @@ export interface SecStrings {
   gateHeading: string;
   gateOpen: string;
   pursuitOpen: (spent: number) => string;
+  /**
+   * Why this finding was DEEPENED, and how much of its depth budget it has spent.
+   *
+   * Without this the report cannot distinguish "the run decided this was the thing worth finishing"
+   * from "the run happened to work on it" — the depth reflex is the whole reason a breakthrough is
+   * pursued instead of filed, and it left no trace in the report.
+   */
+  depthLine: (reasons: string, spent: number, budget: number) => string;
+  depthReasonGate: string;
+  depthReasonDeepen: string;
+  depthReasonUnproven: string;
   pursuitClosed: (spent: number, reason: string) => string;
   /** The finding WAS run — what is still missing is falsification and a challenge round. */
   notFalsifiedShort: string;
@@ -343,6 +354,10 @@ const SEC_ZH: SecStrings = {
   gateHeading: "**前提（要利用它还需要什么成立）**",
   gateOpen: "_（没有剩余前提——门已打开）_",
   pursuitOpen: (spent) => `追索中：已花 ${spent} 轮攻这个前提，仍未打开。`,
+  depthLine: (reasons, spent, budget) => `**为什么在深挖：** ${reasons}（已花 ${spent}/${budget} 轮）`,
+  depthReasonGate: "它是被前提挡住的近失——攻开前提比另找一条路更值",
+  depthReasonDeepen: "记录时被标为突破点",
+  depthReasonUnproven: "高危但一次都没跑过——静态结论还没被证伪",
   pursuitClosed: (spent, reason) => `追索已结束（${spent} 轮）：${reason}`,
   notVerifiedShort: "_未经验证：无等级 · 无证伪 · 无对抗复核_",
   notFalsifiedShort: "_未经证伪：没有任何人尝试推翻它，也没有对抗复核。跑过不等于对。_",
@@ -475,6 +490,10 @@ const SEC_EN: SecStrings = {
   gateHeading: "**Gate (what must hold to use it)**",
   gateOpen: "_(no remaining precondition — the gate is open)_",
   pursuitOpen: (spent) => `PURSUED: ${spent} round(s) spent attacking this gate, not yet opened.`,
+  depthLine: (reasons, spent, budget) => `**Why this was deepened:** ${reasons} (${spent}/${budget} rounds spent)`,
+  depthReasonGate: "it is a near miss behind a precondition — opening the gate beats finding another path",
+  depthReasonDeepen: "it was marked a breakthrough when recorded",
+  depthReasonUnproven: "high-or-worse and never once run — a static claim nobody tried to falsify",
   pursuitClosed: (spent, reason) => `Pursuit ended (${spent} round(s)): ${reason}`,
   notVerifiedShort: "_NOT VERIFIED: no tier · no refutation attempt · no challenge round_",
   notFalsifiedShort: "_Not falsified: nobody tried to refute it and there was no challenge round. RUNNING is not the same as CORRECT._",

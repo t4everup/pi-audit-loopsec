@@ -1081,9 +1081,14 @@ export function renderFocus(focus: readonly string[]): string {
   return [
     `THIS RUN IS SCOPED TO: ${focus.join(", ")}`,
     "",
-    "Spend this round on those classes. If you find something in another class, RECORD it —",
-    "a pre-auth RCE is often reached by chaining a finding from somewhere else — but do not",
-    "spend this round on it, and do not open a new branch in it.",
+    "This REORDERS the work list: an item whose `categories` include one of those classes is assigned",
+    "before an item that was enumerated earlier. It does not narrow what you may record — if you find",
+    "something in another class, RECORD it (a pre-auth RCE is often reached by chaining a finding from",
+    "somewhere else) — but the round you are given will be aimed at these classes.",
+    "If the brief below does not name one of these classes, the list has nothing left in scope and you",
+    "are being given the plan order instead.",
+    "When you enumerate a new item in one of these classes, PASS `categories` to `sec_surface` — an",
+    "unannotated item cannot be matched, so the scope has nothing to aim at.",
   ].join("\n");
 }
 

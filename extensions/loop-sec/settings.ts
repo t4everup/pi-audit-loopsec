@@ -283,6 +283,30 @@ export function reportLanguageOf(projectRoot: string): ReportLanguage {
   }
 }
 
+/**
+ * Whether `sec_verify` is enabled — read per call, like the language.
+ *
+ * The report needs it because it names the same depth reasons the loop ranks with, and `unproven`
+ * only exists when a probe is possible. Falls back to `false` on a settings error: under-reporting a
+ * depth reason is survivable, inventing one is not.
+ */
+export function allowCommandProbesOf(projectRoot: string): boolean {
+  try {
+    return loadSettings(projectRoot).settings.allowCommandProbes === true;
+  } catch {
+    return false;
+  }
+}
+
+/** The per-finding depth budget, so the report can print `已花 N/M 轮`. */
+export function pursuitRoundsOf(projectRoot: string): number {
+  try {
+    return loadSettings(projectRoot).settings.pursuitRounds;
+  } catch {
+    return DEFAULT_SETTINGS.pursuitRounds;
+  }
+}
+
 export function loadSettings(projectRoot: string): LoadedSettings {
   const file = settingsPath(projectRoot);
   let text: string;
