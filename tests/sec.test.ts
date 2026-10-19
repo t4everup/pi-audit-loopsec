@@ -17,6 +17,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import { loadSec } from "../extensions/loop-sec/store.ts";
+import { DEPTH_RATIO_WINDOW, MAX_CONSECUTIVE_DEPTH, MAX_DEPTH_RATIO, depthAllowed } from "../extensions/loop-sec/loop.ts";
 import { evaluateRound, pauseAfterRounds, pauseLoop, resumeLoop, startLoop, stopLoop, tickLoop } from "../extensions/loop-sec/loop.ts";
 import { loadSettings, saveSettings } from "../extensions/loop-sec/settings.ts";
 import { loopCommandName, type SecFindingStep } from "../extensions/loop-sec/types.ts";
@@ -43,6 +44,7 @@ import {
   SEC_IMPLICIT_AUTH_GATE,
   depthReasons,
   gatesOfFinding,
+  objectiveHits,
   nextPursuit,
   reconNotePath,
   reconPhaseOver,
@@ -185,22 +187,22 @@ test("the next item is the first still open, in ENUMERATION order", () => {
   withSurface(cwd);
   const snapshot = loadSec(cwd).snapshot;
   assert.equal(nextOpenSurface(snapshot)!.id, "S-0001");
-  clearSurface(cwd, "S-0001", "check_auth() runs at router.c:88 before dispatch and the route is not in the public table");
+  clearSurface(cwd, "S-0001", "check_auth() runs at router.c:88 before dispatch and the route is not in the public table", { file: "src/auth/session.c", line: 1 });
   // The order is the enumerator's judgement and nothing re-sorts it behind its back.
-  assert.equal(nextOpenSurface(loadSec(cwd).snapshot)!.id, "S-0002");
+  assert.equal(nextOpenSurface(loadSec(cwd).snapshot)!.id, "S-0002", { file: "src/auth/session.c", line: 1 });
 });
 
 test("clearing an item REQUIRES a reason that names the guard", () => {
   const cwd = seeded();
   withSurface(cwd);
-  const empty = clearSurface(cwd, "S-0001", "nothing found");
+  const empty = clearSurface(cwd, "S-0001", "nothing found", { file: "src/auth/session.c", line: 1 });
   assert.equal(empty.ok, false);
   const message = empty.ok ? "" : empty.errors.join(" ");
   assert.match(message, /WHICH guard/);
   assert.match(message, /absence of a reason/, "and it says why the bar exists");
   assert.equal(loadSec(cwd).snapshot.surfaces[0]!.status, "open", "and nothing was cleared");
 
-  const good = clearSurface(cwd, "S-0001", "check_auth() is called at router.c:88 before dispatch, and /diag/ping is not in the public table");
+  const good = clearSurface(cwd, "S-0001", "check_auth() is called at router.c:88 before dispatch, and /diag/ping is not in the public table", { file: "src/auth/session.c", line: 1 });
   assert.equal(good.ok, true, good.ok ? "" : good.errors.join("; "));
   const after = loadSec(cwd).snapshot.surfaces[0]!;
   assert.equal(after.status, "cleared");
@@ -232,7 +234,7 @@ test("progress counts examined items, and a cleared one is examined", () => {
   const cwd = seeded();
   withSurface(cwd);
   assert.deepEqual(surfaceProgress(loadSec(cwd).snapshot), { total: 3, open: 3, examined: 0, cleared: 0, productive: 0, aheadOfPlan: 0, digging: 0, attempted: 0 });
-  clearSurface(cwd, "S-0001", "check_auth() is called at router.c:88 before dispatch, and the route is not public");
+  clearSurface(cwd, "S-0001", "check_auth() is called at router.c:88 before dispatch, and the route is not public", { file: "src/auth/session.c", line: 1 });
   const p = surfaceProgress(loadSec(cwd).snapshot);
   assert.equal(p.examined, 1);
   assert.equal(p.cleared, 1);
@@ -300,7 +302,7 @@ test("the analyze brief says do NOT switch items, and why", () => {
 test("the analyze brief shows what has been cleared, so it is not re-examined", () => {
   const cwd = seeded();
   withSurface(cwd, 3);
-  clearSurface(cwd, "S-0001", "check_auth() runs at router.c:88 before dispatch and the route is not in the public table");
+  clearSurface(cwd, "S-0001", "check_auth() runs at router.c:88 before dispatch and the route is not in the public table", { file: "src/auth/session.c", line: 1 });
   const brief = tickLoop(cwd, loadSec(cwd).snapshot).brief!;
   assert.match(brief, /^\[SEC ROUND \d+ — ANALYZE S-0002\]/, "the cleared item is skipped");
   assert.match(brief, /ALREADY CLEARED/);
@@ -313,7 +315,7 @@ test("a surface round is only reached when every item has been examined", () => 
   withSurface(cwd, 1);
   tickLoop(cwd, loadSec(cwd).snapshot);
   assert.equal(loadSec(cwd).snapshot.roundRecords.at(-1)!.kind, "analyze");
-  clearSurface(cwd, "S-0001", "check_auth() runs at router.c:88 before dispatch and the route is not in the public table");
+  clearSurface(cwd, "S-0001", "check_auth() runs at router.c:88 before dispatch and the route is not in the public table", { file: "src/auth/session.c", line: 1 });
   const next = tickLoop(cwd, loadSec(cwd).snapshot);
   // The list is the enumerator's, so when it is exhausted the right move is to
   // enumerate again with what the analysis revealed — not to stop.
@@ -340,7 +342,7 @@ test("a round that EXAMINES an item and finds nothing is PROGRESS, not a plateau
     assert.equal(result.action, "sent", `round ${i + 1} must be sent: ${result.reason}`);
     const item = nextOpenSurface(loadSec(cwd).snapshot);
     assert.ok(item, "an item must still be open");
-    clearSurface(cwd, item!.id, "check_auth() runs at router.c:88 before dispatch and this path is not in the public table");
+    clearSurface(cwd, item!.id, "check_auth() runs at router.c:88 before dispatch and this path is not in the public table", { file: "src/auth/session.c", line: 1 });
   }
 
   const loop = loadSec(cwd).snapshot.loop!;
@@ -389,7 +391,7 @@ test("the round summary says how much of the surface has been examined", () => {
   const cwd = seeded();
   withSurface(cwd, 2);
   tickLoop(cwd, loadSec(cwd).snapshot);
-  clearSurface(cwd, "S-0001", "check_auth() runs at router.c:88 before dispatch and the route is not in the public table");
+  clearSurface(cwd, "S-0001", "check_auth() runs at router.c:88 before dispatch and the route is not in the public table", { file: "src/auth/session.c", line: 1 });
   tickLoop(cwd, loadSec(cwd).snapshot);
   const ledger = fs.readFileSync(secLedgerPath(cwd), "utf-8");
   // The ledger is written when the round is PREPARED, so it carries the round's
@@ -1059,7 +1061,7 @@ test("the report LEADS with what this mode does not have", () => {
 test("the report shows the attack surface and how much of it was examined", () => {
   const cwd = seeded();
   withSurface(cwd, 3);
-  clearSurface(cwd, "S-0001", "check_auth() runs at router.c:88 before dispatch and the route is not in the public table");
+  clearSurface(cwd, "S-0001", "check_auth() runs at router.c:88 before dispatch and the route is not in the public table", { file: "src/auth/session.c", line: 1 });
   recordFinding(cwd, { title: "run_cmd 拼接 host", category: "rce", file: "src/util/shell.c", line: 1, severity: "high", surfaceId: "S-0002" });
 
   const report = renderSecReport(loadSec(cwd).snapshot, loadSec(cwd).snapshot.loop);
@@ -1218,7 +1220,7 @@ test("every SecSurface field survives being written and read back", () => {
     line: 88,
     categories: ["rce", "command-injection"],
   });
-  clearSurface(cwd, "S-0001", "check_auth() runs at router.c:88 before dispatch and the route is not in the public table");
+  clearSurface(cwd, "S-0001", "check_auth() runs at router.c:88 before dispatch and the route is not in the public table", { file: "src/auth/session.c", line: 1 });
   updateSurface(cwd, "S-0001", { findingId: "F-0001" });
   const back = loadSec(cwd).snapshot.surfaces[0]!;
   assert.equal(back.kind, "entrypoint");
@@ -1550,7 +1552,7 @@ test("a long run never re-enumerates a place it already has", () => {
         recordSurface(cwd, { title: `area ${seq} reaches a sink without the guard the code relies on`, kind: "file", file: "src/cfg/parse.c", line: 1 });
       }
     } else if (rec.kind === "analyze" && rec.surfaceId) {
-      clearSurface(cwd, rec.surfaceId, "check_auth() runs at router.c:88 before dispatch and this path is not in the public table");
+      clearSurface(cwd, rec.surfaceId, "check_auth() runs at router.c:88 before dispatch and this path is not in the public table", { file: "src/auth/session.c", line: 1 });
     }
   }
 
@@ -2035,7 +2037,7 @@ test("everything NOT promoted keeps the plan order, and ties are stable", () => 
   // Drained in plan order after the promoted one — `sort` is stable, so equal priorities
   // keep insertion order. That is what keeps this a plan rather than a free-for-all.
   assert.equal(nextOpenSurface(snap)!.id, "S-0003");
-  clearSurface(cwd, "S-0003", "check_auth() runs at router.c:88 before dispatch and this path is not public");
+  clearSurface(cwd, "S-0003", "check_auth() runs at router.c:88 before dispatch and this path is not public", { file: "src/auth/session.c", line: 1 });
   assert.equal(nextOpenSurface(loadSec(cwd).snapshot)!.id, "S-0001", "back to the plan");
 });
 
@@ -2193,8 +2195,8 @@ test("depth is BUDGETED, and past the budget the refusal names both ways out", (
 test("a CLEARED item cannot be dug — a clearance names a guard", () => {
   const cwd = seeded();
   withSurface(cwd, 2);
-  clearSurface(cwd, "S-0001", "check_auth() runs at router.c:88 before dispatch and this path is not public");
-  const r = digSurface(cwd, "S-0001");
+  clearSurface(cwd, "S-0001", "check_auth() runs at router.c:88 before dispatch and this path is not public", { file: "src/auth/session.c", line: 1 });
+  const r = digSurface(cwd, "S-0001", { file: "src/auth/session.c", line: 1 });
   assert.equal(r.ok, false);
   assert.match(r.ok ? "" : r.errors.join(" "), /is CLEARED/);
   assert.match(r.ok ? "" : r.errors.join(" "), /sec_reopen S-0001/, "and it names how to reopen");
@@ -2249,7 +2251,7 @@ test("ALREADY CLEARED is no longer cut at 12, and says when it truncates", () =>
   // testing anything.
   recordSurface(cwd, { title: "the one still open", kind: "file", file: "src/a.c", line: 1 });
   for (const s of loadSec(cwd).snapshot.surfaces.slice(0, 20)) {
-    clearSurface(cwd, s.id, `guard ${s.id}: check_auth() runs at router.c:88 before dispatch and this path is not public`);
+    clearSurface(cwd, s.id, `guard ${s.id}: check_auth() runs at router.c:88 before dispatch and this path is not public`, { file: "src/auth/session.c", line: 1 });
   }
   const brief = tickLoop(cwd, loadSec(cwd).snapshot).brief!;
   const shown = (brief.match(/^ {2}S-\d{4} {2}/gm) ?? []).length;
@@ -2322,7 +2324,7 @@ test("the surgical brief stops asking for a sweep once the list is at the ceilin
   for (let i = 2; i <= SEC_SURFACE_SOFT_CAP; i++) recordSurface(cwd, { title: `item ${i}`, kind: "file", file: "src/a.c", line: 1 });
   // Force a surface round: clear everything so nothing is left to analyse.
   for (const s of loadSec(cwd).snapshot.surfaces) {
-    clearSurface(cwd, s.id, "check_auth() runs at router.c:88 before dispatch and this path is not public");
+    clearSurface(cwd, s.id, "check_auth() runs at router.c:88 before dispatch and this path is not public", { file: "src/auth/session.c", line: 1 });
   }
   const big = tickLoop(cwd, loadSec(cwd).snapshot).brief!;
   assert.match(big, /^\[SEC ROUND \d+ — SURFACE\]/m, "still a surface round");
@@ -2369,8 +2371,8 @@ test("the soft ceiling and the dig budget are not the same knob", () => {
 test("a cleared item can be reopened, with a reason", () => {
   const cwd = seeded();
   withSurface(cwd, 2);
-  clearSurface(cwd, "S-0001", "check_auth() runs at router.c:88 before dispatch and this path is not public");
-  assert.equal(loadSec(cwd).snapshot.surfaces[0]!.status, "cleared");
+  clearSurface(cwd, "S-0001", "check_auth() runs at router.c:88 before dispatch and this path is not public", { file: "src/auth/session.c", line: 1 });
+  assert.equal(loadSec(cwd).snapshot.surfaces[0]!.status, "cleared", { file: "src/auth/session.c", line: 1 });
 
   const ok = reopenSurface(cwd, "S-0001", "check_auth() returns early for /diag/* before it reaches the public table");
   assert.equal(ok.ok, true, ok.ok ? "" : ok.errors.join("; "));
@@ -2381,7 +2383,7 @@ test("a cleared item can be reopened, with a reason", () => {
 test("reopening needs a REASON — withdrawing a clearance is a claim too", () => {
   const cwd = seeded();
   withSurface(cwd, 1);
-  clearSurface(cwd, "S-0001", "check_auth() runs at router.c:88 before dispatch and this path is not public");
+  clearSurface(cwd, "S-0001", "check_auth() runs at router.c:88 before dispatch and this path is not public", { file: "src/auth/session.c", line: 1 });
   const empty = reopenSurface(cwd, "S-0001", "wrong");
   assert.equal(empty.ok, false);
   assert.match(empty.ok ? "" : empty.errors.join(" "), /say why the guard does not hold/);
@@ -2400,8 +2402,8 @@ test("the sec_dig refusal names sec_reopen, and following it WORKS", () => {
   // The dead end, end to end: refuse, then do what the refusal said, then succeed.
   const cwd = seeded();
   withSurface(cwd, 1);
-  clearSurface(cwd, "S-0001", "check_auth() runs at router.c:88 before dispatch and this path is not public");
-  const refused = digSurface(cwd, "S-0001");
+  clearSurface(cwd, "S-0001", "check_auth() runs at router.c:88 before dispatch and this path is not public", { file: "src/auth/session.c", line: 1 });
+  const refused = digSurface(cwd, "S-0001", { file: "src/auth/session.c", line: 1 });
   assert.equal(refused.ok, false);
   const message = refused.ok ? "" : refused.errors.join(" ");
   assert.match(message, /sec_reopen S-0001/, "it names the command that exists");
@@ -2471,3 +2473,165 @@ test("attempts survives the store round trip", () => {
   assert.equal(loadSec(cwd).snapshot.surfaces[1]!.attempts, 3);
   assert.equal("attempts" in loadSec(cwd).snapshot.surfaces[0]!, false, "untouched stays untouched");
 });
+
+// -----------------------------------------------------------------
+// The three guards that keep the new machinery honest
+// -----------------------------------------------------------------
+
+test("the depth reflex has a GLOBAL bound: three in a row, then the sweep goes first", () => {
+  // The per-finding budget bounds ONE finding; nothing bounded the run. Ten high findings with
+  // `deepen` gave thirty depth rounds and no preference for the work list — and the plateau could not
+  // stop it, because a depth round that produces anything resets the stall counter.
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 1);
+  saveSettings(cwd, { pursuitRounds: 9 });
+  submitSecRecon(cwd, NOTE);
+  for (let i = 0; i < 8; i++) {
+    recordSurface(cwd, { title: `S${i}`, kind: "sink", file: `s${i}.py`, line: i + 1 });
+  }
+  // Five findings that all want depth, each with a budget of nine rounds.
+  for (let i = 0; i < 5; i++) {
+    recordFinding(cwd, {
+      title: `deep ${i}`, category: "rce", severity: "high", file: `f${i}.py`, line: i + 1, evidence: "e", deepen: true,
+    });
+  }
+
+  const kinds: string[] = [];
+  for (let i = 0; i < 6; i++) {
+    tickLoop(cwd, loadSec(cwd).snapshot);
+    kinds.push(loadSec(cwd).snapshot.roundRecords.at(-1)!.kind);
+  }
+  // Three depth rounds, then an analyze round — the sweep is not starved.
+  assert.deepEqual(kinds.slice(0, 4), ["pursue", "pursue", "pursue", "analyze"], `got ${kinds.join(",")}`);
+});
+
+test("the ratio cap holds the reflex even when no run of three happened", () => {
+  // Alternating depth/analyze never trips the consecutive limit, so the RATIO has to catch it.
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 1);
+  saveSettings(cwd, { pursuitRounds: 99 });
+  submitSecRecon(cwd, NOTE);
+  for (let i = 0; i < 20; i++) recordSurface(cwd, { title: `S${i}`, kind: "sink", file: `s${i}.py`, line: i + 1 });
+  for (let i = 0; i < 9; i++) {
+    recordFinding(cwd, {
+      title: `deep ${i}`, category: "rce", severity: "high", file: `f${i}.py`, line: i + 1, evidence: "e", deepen: true,
+    });
+  }
+  const kinds: string[] = [];
+  for (let i = 0; i < 12; i++) {
+    tickLoop(cwd, loadSec(cwd).snapshot);
+    kinds.push(loadSec(cwd).snapshot.roundRecords.at(-1)!.kind);
+  }
+  // The cap is a SLIDING WINDOW, not a total: what it guarantees is that no trailing window of
+  // DEPTH_RATIO_WINDOW picks exceeds its share — a long run converges to at most half depth.
+  const cap = DEPTH_RATIO_WINDOW * MAX_DEPTH_RATIO;
+  for (let end = DEPTH_RATIO_WINDOW; end <= kinds.length; end++) {
+    const win = kinds.slice(end - DEPTH_RATIO_WINDOW, end);
+    const depth = win.filter((k) => k === "pursue").length;
+    assert.ok(depth <= cap, `window ending at ${end} had ${depth} depth round(s): ${win.join(",")}`);
+  }
+  assert.ok(kinds.includes("analyze"), "and the sweep ran");
+});
+
+test("a depth target blocked by the cap is QUEUED, not dropped — and the brief says so", () => {
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 1);
+  saveSettings(cwd, { pursuitRounds: 9 });
+  submitSecRecon(cwd, NOTE);
+  recordSurface(cwd, { title: "S1", kind: "sink", file: "s.py", line: 1 });
+  recordFinding(cwd, { title: "deep", category: "rce", severity: "high", file: "f.py", line: 1, evidence: "e", deepen: true });
+
+  // Burn the consecutive allowance.
+  for (let i = 0; i < MAX_CONSECUTIVE_DEPTH; i++) tickLoop(cwd, loadSec(cwd).snapshot);
+  assert.equal(loadSec(cwd).snapshot.roundRecords.at(-1)!.kind, "pursue");
+  // The cap is evaluated BEFORE the round it blocks, which is the only place it can be: after the
+  // analyze round has run, depth is allowed again — that is the whole point of making the sweep go.
+  assert.equal(depthAllowed(loadSec(cwd).snapshot), false, "the cap is what is about to block it");
+  const blocked = tickLoop(cwd, loadSec(cwd).snapshot);
+  assert.equal(loadSec(cwd).snapshot.roundRecords.at(-1)!.kind, "analyze");
+  assert.match(blocked.brief!, /DEPTH QUEUED, NOT DROPPED/);
+  assert.match(blocked.brief!, /Do not close it/, "and it says the finding is not being abandoned");
+  // The budget is untouched, so it comes back — and the sweep having run, it is allowed again.
+  const f = loadSec(cwd).snapshot.findings[0]!;
+  assert.ok((f.pursuitSpent ?? 0) < 9, "still inside its budget");
+  assert.equal(f.pursuitClosed, undefined, "and nothing closed it");
+  assert.equal(depthAllowed(loadSec(cwd).snapshot), true, "the sweep caught up, so depth may resume");
+  assert.equal(nextPursuit(loadSec(cwd).snapshot, 9, false)!.id, "F-0001", "and the finding is still the target");
+});
+
+test("a pre-auth HIGH finding leads the next round's summary — the moment to stop is announced", () => {
+  const cwd = seeded();
+  startSec(cwd, "挖掘认证前RCE漏洞", 99, 1);
+  submitSecRecon(cwd, NOTE);
+  recordSurface(cwd, { title: "S1", kind: "sink", file: "s.py", line: 1 });
+  recordFinding(cwd, {
+    title: "认证前 RCE", category: "rce", severity: "critical", file: "a.py", line: 1, evidence: "e", preAuth: true,
+  });
+  const r = tickLoop(cwd, loadSec(cwd).snapshot);
+  assert.equal(r.summary![0], "★ 认证前高危发现已记录：F-0001 [critical] rce — 认证前 RCE");
+  assert.match(r.summary!.join("\n"), /SEC ROUND/, "the round line is still there, below it");
+});
+
+test("the objective signal respects the TRI-STATE: unassessed is not pre-auth", () => {
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 1);
+  submitSecRecon(cwd, NOTE);
+  recordFinding(cwd, { title: "unassessed", category: "rce", severity: "critical", file: "a.py", line: 1, evidence: "e" });
+  recordFinding(cwd, { title: "post-auth", category: "rce", severity: "critical", file: "b.py", line: 2, evidence: "e", preAuth: false });
+  assert.deepEqual(objectiveHits(loadSec(cwd).snapshot), [], "neither is a pre-auth hit");
+  const r = tickLoop(cwd, loadSec(cwd).snapshot);
+  assert.equal(r.summary!.some((l) => l.includes("★")), false, "and nothing is announced");
+});
+
+test("a standing pre-auth hit is still reported, but not as news", () => {
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 1);
+  submitSecRecon(cwd, NOTE);
+  recordSurface(cwd, { title: "S1", kind: "sink", file: "s.py", line: 1 });
+  recordFinding(cwd, { title: "认证前 RCE", category: "rce", severity: "high", file: "a.py", line: 1, evidence: "e", preAuth: true });
+  tickLoop(cwd, loadSec(cwd).snapshot); // round 1: the hit is fresh (recorded before any round ran)
+  tickLoop(cwd, loadSec(cwd).snapshot); // round 2: still within the "just landed" window
+  const later = tickLoop(cwd, loadSec(cwd).snapshot); // round 3: it is standing now
+  assert.match(later.summary!.join("\n"), /认证前高危发现 1 条（最新：F-0001/);
+  assert.equal(later.summary!.some((l) => l.includes("已记录：")), false, "not announced as new again");
+});
+
+test("clearing an item REQUIRES the guard's location, and the refusal names both ways out", () => {
+  // A clearance is what BOUNDS the attack surface, so it carries as much weight as a finding — and
+  // "the role check is enforced in the decorator" with no line cannot be checked by anybody.
+  const cwd = seeded();
+  withSurface(cwd, 1);
+  const noLoc = clearSurface(cwd, "S-0001", "check_auth() runs before dispatch and the route is not in the public table");
+  assert.equal(noLoc.ok, false, "a reason alone is not a clearance");
+  assert.match(noLoc.ok ? "" : noLoc.errors.join(" "), /without the guard's LOCATION/);
+  assert.match(noLoc.ok ? "" : noLoc.errors.join(" "), /file=<path> line=<n>/, "and it shows the exact shape");
+  assert.equal(loadSec(cwd).snapshot.surfaces[0]!.status, "open", "nothing was recorded");
+
+  const good = clearSurface(cwd, "S-0001", "check_auth() runs before dispatch and the route is not in the public table", {
+    file: "src/auth/session.c",
+    line: 12,
+  });
+  assert.equal(good.ok, true);
+  assert.deepEqual(loadSec(cwd).snapshot.surfaces[0]!.guardLocation, { file: "src/auth/session.c", line: 12 });
+});
+
+test("the guard location survives the log, and the report prints it next to the clearance", () => {
+  const cwd = seeded();
+  withSurface(cwd, 1);
+  clearSurface(cwd, "S-0001", "check_auth() runs before dispatch and this path is not in the public table", {
+    file: "src/auth/session.c",
+    line: 7,
+  });
+  assert.deepEqual(loadSec(cwd).snapshot.surfaces[0]!.guardLocation, { file: "src/auth/session.c", line: 7 }, "round trip");
+  const report = renderSecReport(loadSec(cwd).snapshot, loadSec(cwd).snapshot.loop);
+  assert.match(report, /守卫位置：src\/auth\/session\.c:7/, "a reader can open the line");
+});
+
+test("updateSurface cannot smuggle a clearance past the location requirement", () => {
+  const cwd = seeded();
+  withSurface(cwd, 1);
+  const bypass = updateSurface(cwd, "S-0001", { status: "cleared", clearedReason: "a long enough reason that names no line at all" });
+  assert.equal(bypass.ok, false, "the pre-write check covers the other path in");
+  assert.match(bypass.ok ? "" : bypass.errors.join(" "), /reason AND the guard's location/);
+});
+

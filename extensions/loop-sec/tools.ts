@@ -246,22 +246,27 @@ export function registerSecTools(pi: ExtensionAPI): void {
       name: "sec_clear",
       label: "Clear a surface item",
       description:
-        "Mark a surface item examined and NOT exploitable. The reason is required and must NAME THE GUARD you found and where it is — 'nothing found' is refused, because it is the absence of a reason rather than one. Clearing an item is a RESULT: it is the only evidence a reader has that a part of the project was looked at and found sound, and it is what stops the next round re-reading the same file.",
+        "Mark a surface item examined and NOT exploitable. The reason is required and must NAME THE GUARD you found, and `file`+`line` must point at where it is enforced — 'nothing found' is refused, because it is the absence of a reason rather than one, and a clearance nobody can open is a shrug with good grammar. Clearing an item is a RESULT: it is the only evidence a reader has that a part of the project was looked at and found sound, and it is what stops the next round re-reading the same file.",
       promptSnippet: "sec_clear — I read this item and it is guarded",
       promptGuidelines: [
-        "The reason must name the guard and where it is. \"I looked and found nothing\" is refused.",
+        "The reason must name the guard, and file+line must point at where it is enforced. \"I looked and found nothing\" is refused.",
+        "A framework default, middleware or base class is fine to cite — point at where it is configured or registered, not at the handler it protects.",
         "Clearing an item is a result, not a failure — it is what makes this an analysis rather than a bug hunt.",
         "Clear only what you actually traced. A clearance on an unread item marks an area done on the strength of a shrug.",
       ],
       parameters: Type.Object({
         id: Type.String({ description: "The surface item id, e.g. S-0003." }),
         reason: Type.String({
-          description: "WHICH guard you found and where: \"check_auth() is called at router.c:88 before dispatch, and the route is not in the public table\".",
+          description: "WHICH guard you found: \"check_auth() runs before dispatch, and the route is not in the public table\".",
         }),
+        file: Type.String({
+          description: "Project-relative path of the line that ENFORCES it — the check itself, its config entry, or the middleware registration.",
+        }),
+        line: Type.Number({ description: "1-based line of that guard." }),
       }),
       async execute(_id, params, _signal, _onUpdate, ctx) {
         const root = projectRootOf(ctx);
-        const result = clearSurface(root, params.id, params.reason);
+        const result = clearSurface(root, params.id, params.reason, { file: params.file, line: params.line });
         if (!result.ok) {
           return text(`Clear REJECTED:\n${result.errors.map((e) => `  - ${e}`).join("\n")}`);
         }

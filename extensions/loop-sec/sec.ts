@@ -625,7 +625,13 @@ export function recordSurface(projectRoot: string, input: SurfaceInput, at = now
  * the guard it found is a clearance nobody can check, and it would let a whole area
  * be marked done on the strength of a shrug.
  */
-export function clearSurface(projectRoot: string, id: string, reason: string, at = nowIso()): Result<SecSurface> {
+export function clearSurface(
+  projectRoot: string,
+  id: string,
+  reason: string,
+  guardLocation?: { file: string; line: number },
+  at = nowIso(),
+): Result<SecSurface> {
   const text = (reason ?? "").trim();
   if (text.length < 20) {
     return {
@@ -637,7 +643,32 @@ export function clearSurface(projectRoot: string, id: string, reason: string, at
       ],
     };
   }
-  return updateSurface(projectRoot, id, { status: "cleared", clearedReason: text }, at);
+  // A CLEARANCE IS AN ARTIFACT TOO, and this is the same bar the findings carry.
+  //
+  // Measured on a real run: the clearances read well ("the role check is enforced in the decorator")
+  // and NOT ONE could be checked, because none named a line. A clearance is what bounds the attack
+  // surface — "this part was looked at and found guarded" — so on a 0day hunt it carries as much
+  // weight as a finding does, and a reason a reader cannot open is a shrug with good grammar.
+  //
+  // The guard is not always in the handler: a framework default lives in the config, a middleware in
+  // the pipeline registration, a base class in the base class. Those are lines too, and they are the
+  // right ones to cite.
+  if (!guardLocation || !guardLocation.file || !(guardLocation.line > 0)) {
+    return {
+      ok: false,
+      errors: [
+        `${id} cannot be cleared without the guard's LOCATION — a clearance nobody can open is not a clearance.`,
+        "Pass the line that enforces it:  sec_clear id=<id> reason=\"<which guard>\" file=<path> line=<n>",
+        "A framework default or middleware is fine to cite: point at where it is configured or registered.",
+      ],
+    };
+  }
+  return updateSurface(
+    projectRoot,
+    id,
+    { status: "cleared", clearedReason: text, guardLocation: { file: guardLocation.file, line: Math.max(1, Math.floor(guardLocation.line)) } },
+    at,
+  );
 }
 
 /**
@@ -727,8 +758,8 @@ export function updateSurface(
   const existing = snapshot.surfaces.find((s) => s.id === id);
   if (!existing) return { ok: false, errors: [`${id} is not on this run's attack surface`] };
   const after = applySurfacePatchForCheck(existing, patch);
-  if (after.status === "cleared" && !after.clearedReason) {
-    return { ok: false, errors: [`${id} cannot be cleared without a reason — see clearSurface`] };
+  if (after.status === "cleared" && (!after.clearedReason || !after.guardLocation)) {
+    return { ok: false, errors: [`${id} cannot be cleared without a reason AND the guard's location — see clearSurface`] };
   }
   // The timestamp is STAMPED here rather than taken from the caller, and it is part
   // of the patch because that is the only way it reaches the log. An earlier version
@@ -751,6 +782,7 @@ function applySurfacePatchForCheck(surface: SecSurface, patch: SecSurfacePatch):
     ...surface,
     ...(patch.status !== undefined ? { status: patch.status } : {}),
     ...(patch.clearedReason !== undefined ? { clearedReason: patch.clearedReason } : {}),
+    ...(patch.guardLocation !== undefined ? { guardLocation: patch.guardLocation } : {}),
     ...(patch.findingId !== undefined ? { findingId: patch.findingId } : {}),
   };
 }
@@ -1170,6 +1202,14 @@ export interface SecBriefOptions {
    */
   probesAllowed?: boolean;
   /**
+   * May this round be a depth round? See `depthAllowed` in loop.ts.
+   *
+   * Passed IN and not recomputed here, because the loop's round-kind decision and the brief MUST
+   * agree: a round labelled `analyze` carrying a pursuit brief (or the reverse) is the bug this
+   * parameter exists to make impossible — and the plateau counts the two kinds differently.
+   */
+  pursuitAllowed?: boolean;
+  /**
    * How many PURSUIT rounds one finding's blockers may cost. See `HypothesisSettings.pursuitRounds`.
    *
    * Passed IN for the same reason `reconRounds` is: the phase boundary and the scheduling decision
@@ -1265,6 +1305,24 @@ function renderFoundSoFar(snapshot: TreeSnapshot): string {
     for (const c of chains.slice(0, FINDINGS_SHOWN)) lines.push(`  ${c.id} [${c.severity ?? "unrated"}] ${clip(c.title, 100)}`);
   }
   return lines.join("\n");
+}
+
+/**
+ * The findings that HIT THE OBJECTIVE: reachable before authentication, at HIGH or worse.
+ *
+ * The thing a pre-auth hunt is actually for. Exported because the round summary leads with it — the
+ * operator watching a run should learn the moment it lands, not when they next open the report.
+ *
+ * Tri-state `preAuth` is respected: `undefined` is NOT counted. "Nobody determined whether it needs a
+ * session" is not "reachable without one", and counting it here would announce a pre-auth hit the run
+ * never established — the exact inflation this mode's report refuses to make.
+ *
+ * Worst-first, then newest-first, so the headline is the most serious and most recent.
+ */
+export function objectiveHits(snapshot: TreeSnapshot): SecFinding[] {
+  return snapshot.findings
+    .filter((f) => f.preAuth === true && !!f.severity && severityRank(f.severity) <= severityRank("high"))
+    .sort((a, b) => severityRank(a.severity!) - severityRank(b.severity!) || b.round - a.round || a.id.localeCompare(b.id));
 }
 
 /**
@@ -2043,7 +2101,10 @@ export function renderSecReport(
     lines.push("");
     lines.push(t.surfaceClearedNote);
     lines.push("");
-    for (const s of clearedItems) lines.push(t.surfaceClearedLine(s.id, s.title, s.clearedReason ?? ""));
+    for (const s of clearedItems) {
+      const guard = s.guardLocation ? `${s.guardLocation.file}:${s.guardLocation.line}` : "（未记录位置）";
+      lines.push(t.surfaceClearedLine(s.id, s.title, s.clearedReason ?? "", guard));
+    }
     lines.push("");
   }
   if (coverage && coverage.gaps.length > 0) {
@@ -2361,13 +2422,26 @@ export function secRoundBrief(
   if (!reconPhaseOver(snapshot, reconRounds)) {
     return renderSecReconBrief(snapshot, objective, round, reconSections(snapshot) + 1, reconRounds);
   }
-  // PURSUIT OUTRANKS THE WORK LIST. A finding that is real but gated is one step from the
-  // objective, and closing its gate converts it — so it is attacked before the next item on the
-  // plan. The brief says so explicitly, because the model's instinct (and its previous twenty
-  // rounds) is to keep working the list. Bounded by `pursuitBudget`, so it cannot eat the run.
-  const pursuitTarget = nextPursuit(snapshot, opts.pursuitBudget ?? 0);
-  if (pursuitTarget) return renderSecPursuitBrief(snapshot, objective, round, pursuitTarget, opts);
+  // DEPTH OUTRANKS THE WORK LIST. A finding that came out of a breakthrough is one step from the
+  // objective, and finishing it is what converts a lead into a result — so it is deepened before
+  // the next item on the plan. Two things bound it: the per-finding budget, and the RUN's share
+  // (`pursuitAllowed`, see `depthAllowed`) so the sweep cannot be starved.
+  const pursuitTarget = nextPursuit(snapshot, opts.pursuitBudget ?? 0, opts.probesAllowed === true);
+  const depthBlocked = pursuitTarget !== null && opts.pursuitAllowed === false;
+  if (pursuitTarget && !depthBlocked) return renderSecPursuitBrief(snapshot, objective, round, pursuitTarget, opts);
   const item = nextOpenSurface(snapshot, opts.digBudget ?? SEC_DIG_BUDGET);
-  if (!item) return renderSecSurfaceBrief(snapshot, objective, round);
-  return renderSecAnalyzeBrief(snapshot, objective, round, item, opts);
+  const brief = item
+    ? renderSecAnalyzeBrief(snapshot, objective, round, item, opts)
+    : renderSecSurfaceBrief(snapshot, objective, round);
+  // A BLOCKED DEPTH TARGET IS SAID OUT LOUD, not silently dropped. Without this line the model
+  // cannot tell "there is nothing worth deepening" from "the ratio cap is holding it", and the
+  // second one must not read as the first: the finding keeps its budget and comes back.
+  if (!depthBlocked) return brief;
+  return [
+    `(DEPTH QUEUED, NOT DROPPED: ${pursuitTarget!.id} still has ${(opts.pursuitBudget ?? 0) - (pursuitTarget!.pursuitSpent ?? 0)} depth round(s)`,
+    " left, but the run's share of depth rounds is used up for now — the sweep goes first, and this",
+    " finding is picked again once it has caught up. Do not close it.)",
+    "",
+    brief,
+  ].join("\n");
 }

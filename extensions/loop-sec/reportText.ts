@@ -173,7 +173,7 @@ export interface SecStrings {
   surfaceTouchedNote: string;
   surfaceClearedTitle: string;
   surfaceClearedNote: string;
-  surfaceClearedLine: (id: string, title: string, reason: string) => string;
+  surfaceClearedLine: (id: string, title: string, reason: string, guard: string) => string;
   surfaceOpenLine: (id: string, kind: string, title: string, where: string) => string;
   surfaceItemLabel: (id: string) => string;
 
@@ -319,7 +319,7 @@ const SEC_ZH: SecStrings = {
   surfaceClearedTitle: "## 已分析并确认有防护",
   surfaceClearedNote:
     "这些项被读过并追踪过，结论是**不可利用**，理由如下。这一节和上面的发现一样重要 —— 它是一份分析报告而非一份 bug 列表的原因。",
-  surfaceClearedLine: (id, title, reason) => `- **${id}** ${title}\n  - ${reason}`,
+  surfaceClearedLine: (id, title, reason, guard) => `- **${id}** ${title}\n  - ${reason}\n  - 守卫位置：${guard}`,
   surfaceOpenLine: (id, kind, title, where) => `- \`${id}\` [${kind}] ${title}${where ? ` — \`${where}\`` : ""}`,
   surfaceItemLabel: (id) => `**来自攻击面：** \`${id}\``,
 
@@ -451,7 +451,7 @@ const SEC_EN: SecStrings = {
   surfaceClearedTitle: "## Examined and found guarded",
   surfaceClearedNote:
     "These items were read and traced, and the conclusion was NOT exploitable, for the reason given. This section matters as much as the findings above — it is what makes this an analysis rather than a list of bugs.",
-  surfaceClearedLine: (id, title, reason) => `- **${id}** ${title}\n  - ${reason}`,
+  surfaceClearedLine: (id, title, reason, guard) => `- **${id}** ${title}\n  - ${reason}\n  - guard at: ${guard}`,
   surfaceOpenLine: (id, kind, title, where) => `- \`${id}\` [${kind}] ${title}${where ? ` — \`${where}\`` : ""}`,
   surfaceItemLabel: (id) => `**From surface item:** \`${id}\``,
 

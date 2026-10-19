@@ -1858,6 +1858,15 @@ export interface SecSurface {
    * a whole area be marked done on the strength of a shrug.
    */
   clearedReason?: string;
+  /**
+   * WHERE the guard is — the line a reader opens to check the clearance.
+   *
+   * REQUIRED to clear an item, and it is the same bar the findings carry. A clearance is what BOUNDS
+   * the attack surface ("this part was looked at and found guarded"), so on a 0day hunt it matters as
+   * much as a finding does — and a reason like "the role check is enforced" names no line, so nobody
+   * can verify it. Measured on a real run: clearances read well and could not be checked.
+   */
+  guardLocation?: EvidenceLocation;
   examinedAt?: string;
   /**
    * How many rounds of DEPTH this item has been given. See `sec_dig`.
@@ -1890,6 +1899,8 @@ export interface SecSurface {
 export interface SecSurfacePatch {
   status?: SecSurfaceStatus;
   clearedReason?: string;
+  /** Where the guard is. See `SecSurface.guardLocation`. */
+  guardLocation?: EvidenceLocation;
   /** Stamped by updateSurface when the status leaves `open`. */
   examinedAt?: string;
   /** Raise to jump the queue; 0 to put it back in plan order. */

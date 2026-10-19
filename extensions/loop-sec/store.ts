@@ -773,6 +773,7 @@ function normalizeSurface(value: unknown): SecSurface | null {
       : {}),
     status,
     ...(typeof o.clearedReason === "string" && o.clearedReason ? { clearedReason: o.clearedReason } : {}),
+    ...(normalizeLocation(o.guardLocation) ? { guardLocation: normalizeLocation(o.guardLocation)! } : {}),
     ...(typeof o.examinedAt === "string" && o.examinedAt ? { examinedAt: o.examinedAt } : {}),
     ...(typeof o.findingId === "string" && o.findingId ? { findingId: o.findingId } : {}),
   };
@@ -796,6 +797,8 @@ function normalizeSurfacePatch(value: unknown): SecSurfacePatch | null {
     patch.status = o.status as SecSurfaceStatus;
   }
   if (typeof o.clearedReason === "string" && o.clearedReason) patch.clearedReason = o.clearedReason;
+  const guard = normalizeLocation(o.guardLocation);
+  if (guard) patch.guardLocation = guard;
   if (typeof o.priority === "number" && Number.isFinite(o.priority)) patch.priority = Math.floor(o.priority);
   if (typeof o.digRounds === "number" && Number.isFinite(o.digRounds)) patch.digRounds = Math.max(0, Math.floor(o.digRounds));
   if (typeof o.attempts === "number" && Number.isFinite(o.attempts)) patch.attempts = Math.max(0, Math.floor(o.attempts));
@@ -817,6 +820,7 @@ function applySurfacePatch(surface: SecSurface, patch: SecSurfacePatch): SecSurf
     ...surface,
     ...(patch.status !== undefined ? { status: patch.status } : {}),
     ...(patch.clearedReason !== undefined ? { clearedReason: patch.clearedReason } : {}),
+    ...(patch.guardLocation !== undefined ? { guardLocation: patch.guardLocation } : {}),
     ...(patch.examinedAt !== undefined ? { examinedAt: patch.examinedAt } : {}),
     ...(patch.priority !== undefined ? { priority: patch.priority } : {}),
     ...(patch.digRounds !== undefined ? { digRounds: patch.digRounds } : {}),

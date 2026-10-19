@@ -119,6 +119,7 @@ import {
   secCoverage,
   gatesOfFinding,
   nextPursuit,
+  objectiveHits,
   reconPhaseOver,
   reconSections,
   secRoundBrief,
@@ -705,6 +706,59 @@ export function currentRunRounds(snapshot: TreeSnapshot): RoundRecord[] {
   return snapshot.roundRecords.filter((r) => r.at >= loop.startedAt);
 }
 
+/**
+ * The anti-tunnelling guard for the DEPTH REFLEX — the one the hypothesis mode always had and this
+ * mode lost when it was cut down.
+ *
+ * WHY IT IS NEEDED. The depth reflex (deepen a breakthrough before the next item) has a per-FINDING
+ * budget, and that is not a global bound: a run that records ten high findings with `deepen`, or ten
+ * gated ones, has thirty depth rounds available and nothing prefers the work list over them. Worse,
+ * the plateau cannot stop it — a depth round that produces anything resets the stall counter, so a
+ * run can spend its whole life deepening and never advance the sweep that gives the report its
+ * coverage.
+ *
+ * Two limits, and they catch different shapes of the same failure:
+ *
+ *   CONSECUTIVE — a run of depth rounds with no analysis between them. Three, because a gate that
+ *                 needs four attempts in a row is a gate the next attempt will not open either.
+ *   RATIO       — the share of the last ten picks. Half, because the sweep is what produces the
+ *                 material worth deepening in the first place: a run that spends most of its rounds
+ *                 on findings it already has is not auditing any more, it is polishing.
+ *
+ * Blocking is TEMPORARY and does not close anything: the finding keeps its remaining budget and is
+ * picked again once the sweep has caught up. That is the difference between "not yet" and "no".
+ */
+export const MAX_CONSECUTIVE_DEPTH = 3;
+export const DEPTH_RATIO_WINDOW = 10;
+export const MAX_DEPTH_RATIO = 0.5;
+
+/**
+ * May this round be a depth round, or is the reflex over its share of the run?
+ *
+ * Judged over the CURRENT RUN's rounds only: a `/loopsec resume` continues a run, and counting the
+ * previous run's depth rounds would hold the new one responsible for them.
+ */
+export function depthAllowed(snapshot: TreeSnapshot): boolean {
+  const rounds = currentRunRounds(snapshot);
+  let consecutive = 0;
+  for (let i = rounds.length - 1; i >= 0; i--) {
+    if (rounds[i]!.kind !== "pursue") break;
+    consecutive++;
+  }
+  if (consecutive >= MAX_CONSECUTIVE_DEPTH) return false;
+  // THE WINDOW IS ALWAYS `DEPTH_RATIO_WINDOW` SLOTS, and a pick that has not happened yet is not a
+  // depth pick. Two wrong versions came before this one, both caught by the test below:
+  //   * counting only the recorded rounds let the tenth round through unchecked — 8 depth rounds in
+  //     the first 10, before the cap engaged at all;
+  //   * returning early while the window was still filling left the first nine rounds to the
+  //     consecutive cap alone, which permits 6 in 9 — so the first full window still broke the ratio.
+  // Treating the not-yet-made picks as non-depth makes the bound hold for EVERY trailing window, from
+  // the first one onward, which is the only version of "at most half" that means anything.
+  const prior = rounds.slice(-(DEPTH_RATIO_WINDOW - 1));
+  const depth = prior.filter((r) => r.kind === "pursue").length + 1;
+  return depth <= DEPTH_RATIO_WINDOW * MAX_DEPTH_RATIO;
+}
+
 // -----------------------------------------------------------------
 // Round evaluation
 // -----------------------------------------------------------------
@@ -1236,7 +1290,12 @@ export function tickLoop(projectRoot: string, snapshot: TreeSnapshot, opts: Tick
     // and abandoned in the same round. Bounded by `pursuitBudget`, so it cannot eat the run.
     const pursuitBudget = pursuitRoundsOf(projectRoot);
     const probesAllowed = loadSettings(projectRoot).settings.allowCommandProbes;
-    const pursuitTarget = reconPhaseOver(snapshot, reconRounds) ? nextPursuit(snapshot, pursuitBudget, probesAllowed) : null;
+    // THE GLOBAL DEPTH GUARD. The per-finding budget bounds ONE finding; this bounds the run — see
+    // `depthAllowed`. When it blocks, the finding keeps its remaining budget and is picked again
+    // after the sweep has caught up, so this is "not yet", never "no".
+    const pursuitAllowed = depthAllowed(snapshot);
+    const pursuitTarget =
+      reconPhaseOver(snapshot, reconRounds) && pursuitAllowed ? nextPursuit(snapshot, pursuitBudget, probesAllowed) : null;
     // THE RECON PHASE OUTRANKS AN ITEM, and the two must agree: `secRoundBrief` uses the same
     // `reconPhaseOver` predicate, so a round can never get a recon brief with an `analyze` label
     // (or the reverse) — and the plateau counts those two kinds differently. Counted in SECTIONS,
@@ -1251,6 +1310,7 @@ export function tickLoop(projectRoot: string, snapshot: TreeSnapshot, opts: Tick
         reconRounds,
         pursuitBudget,
         probesAllowed,
+        pursuitAllowed,
         lastRound: previous ? `Last round (${previous.round}): ${previous.detail}` : null,
         // The loop AFTER this tick's evaluation — see SecBriefOptions.loop.
         loop: current,
@@ -1258,8 +1318,24 @@ export function tickLoop(projectRoot: string, snapshot: TreeSnapshot, opts: Tick
       snapshot,
       lang,
     );
-    const summary =
-      kindForRound === "recon"
+    // THE OBJECTIVE HIT, at the TOP of the summary.
+    //
+    // The round summary is what the operator actually sees while a run is going. For a pre-auth hunt,
+    // the moment a PRE-AUTH HIGH-or-worse finding lands is the moment they can stop — and before this
+    // line existed the only way to know was to re-read the report, which is exactly the "stop and
+    // check by hand" this mode is supposed to remove. `★` marks one recorded in the last round, so a
+    // new hit is distinguishable from a standing one.
+    const hits = objectiveHits(snapshot);
+    const fresh = hits.filter((f) => f.round >= current.round - 1);
+    const hitLines = fresh.map((f) => `★ 认证前高危发现已记录：${f.id} [${f.severity}] ${f.category} — ${clip(f.title, 90)}`);
+    const standingLines =
+      fresh.length === 0 && hits.length > 0
+        ? [`★ 认证前高危发现 ${hits.length} 条（最新：${hits[0]!.id} [${hits[0]!.severity}] ${hits[0]!.category}）`]
+        : [];
+    const summary = [
+      ...hitLines,
+      ...standingLines,
+      ...(kindForRound === "recon"
         ? [
             `SEC ROUND ${round} — reconnaissance ${reconSections(snapshot) + 1}/${reconRounds}`,
             reconSections(snapshot) + 1 === 1
@@ -1278,11 +1354,12 @@ export function tickLoop(projectRoot: string, snapshot: TreeSnapshot, opts: Tick
                 `${gatesOfFinding(pursuitTarget!).length} gate(s), pursuit ${pursuitTarget!.pursuitSpent ?? 0}/${pursuitBudget} — NOT working the work list this round`,
               ]
             : [
-              `SEC ROUND ${round} — analyse ${assigned!.id}`,
-              `${assigned!.kind}: ${assigned!.title}` +
-                (assigned!.location ? ` (${assigned!.location.file}:${assigned!.location.line})` : ""),
-              `${progress.examined}/${progress.total} examined · ${snapshot.findings.length} finding(s) so far`,
-            ];
+                `SEC ROUND ${round} — analyse ${assigned!.id}`,
+                `${assigned!.kind}: ${assigned!.title}` +
+                  (assigned!.location ? ` (${assigned!.location.file}:${assigned!.location.line})` : ""),
+                `${progress.examined}/${progress.total} examined · ${snapshot.findings.length} finding(s) so far`,
+              ]),
+    ];
     // SPEND THE PURSUIT BUDGET ON PREPARE, like a dig: a crash or a stalled turn must not hand out
     // unlimited rounds on one finding. The blockers are also snapshotted, because that string is the
     // only baseline `evaluateRound` can use to tell a pursuit that learned something from one that
