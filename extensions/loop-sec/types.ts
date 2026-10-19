@@ -1397,6 +1397,24 @@ export interface RoundRecord {
   /** For a `/loopSEC` analyze round: which surface item was handed over. */
   surfaceId?: string | null;
   /**
+   * For a `/loopSEC` pursue round: which FINDING's blockers were handed over.
+   *
+   * Separate from `surfaceId` because they are different axes: an analyze round works a PLACE
+   * (which may be cleared with no finding), a pursue round works a FINDING's precondition. A
+   * pursue round has no surface item — the item was already examined when the finding landed.
+   */
+  findingId?: string | null;
+  /**
+   * The finding's blocker list when this round was prepared, joined.
+   *
+   * THE BASELINE THAT MAKES A PURSUIT ROUND COUNT AS PROGRESS. A pursuit round has no status to
+   * flip (unlike analyze, where `examined` moves): its whole output is a better understanding of
+   * the gate — a refined blocker, a new enabling finding, or the conclusion that the gate cannot
+   * be opened. Comparing this string is how `evaluateRound` tells that from a round that did
+   * nothing, and it is bounded because a finding's pursuit budget is.
+   */
+  pursuitBlockersAtStart?: string;
+  /**
    * Was the assigned item in the `digging` state when this round was prepared?
    *
    * THE SIGNAL THAT MAKES A DEPTH ROUND COUNT AS PROGRESS. Without it, continuing an item
@@ -1621,6 +1639,39 @@ export interface SecFinding {
    * request that came back 200. See `SecVerification`.
    */
   verification?: SecVerification;
+  /**
+   * What must hold for this finding to be exploitable AS RECORDED — the gates that are not open yet.
+   *
+   * THIS FIELD IS WHAT MAKES A NEAR MISS WORKABLE. A real RCE that needs an authenticated session,
+   * or needs one more field to be attacker-controlled, is the most valuable thing a run can hold:
+   * closing the gate CONVERTS it into the objective. Without this recorded, the loop marks its
+   * surface item examined and moves to the next item — the finding is filed and abandoned exactly
+   * when it deserved the next two rounds. (Measured: a post-auth RCE on a pre-auth objective was
+   * recorded, its item closed, and the run went on enumerating.)
+   *
+   * Each entry is a STATE OF THE WORLD, not a task: "needs a valid admin session", "needs base_url
+   * to carry a path prefix", "needs the attacker to control X-Forwarded-Host". A gated finding with
+   * a non-empty list is a PURSUIT candidate — see `nextPursuit` — and the pursuit rounds are spent
+   * attacking these, not the work list.
+   */
+  blockers?: string[];
+  /**
+   * How many PURSUIT rounds this finding's blockers have cost.
+   *
+   * Bounded like every other depth budget here: without it one near miss sits on the run forever,
+   * which is the failure the budget exists to prevent. Incremented by the loop on prepare, so a
+   * crash or a stalled turn cannot hand out unlimited rounds on one finding.
+   */
+  pursuitSpent?: number;
+  /**
+   * Why the pursuit ENDED — set when the gate was opened, or when the attempts ran out.
+   *
+   * A closed pursuit is not scheduled again, and the reason is what tells a reader whether the
+   * finding became reachable ("F-0007 provides the auth bypass") or stayed a near miss ("tried
+   * a/b/c, none reachable pre-auth"). Without it, "we stopped" and "we never tried" look the
+   * same in the report.
+   */
+  pursuitClosed?: string;
 }
 
 /**
@@ -1710,6 +1761,17 @@ export interface SecFindingPatch {
   chainOf?: string[];
   /** The result of a verification run. See `SecVerification`. */
   verification?: SecVerification;
+  /** Replace the blocker list. See `SecFinding.blockers`. An empty array CLEARS it (the gate opened). */
+  blockers?: string[];
+  /**
+   * How many pursuit rounds this finding has cost. Set by the LOOP on prepare, not by the model.
+   *
+   * In the patch type because that is the only way it reaches the log — the same reason
+   * `SecSurface.attempts` is.
+   */
+  pursuitSpent?: number;
+  /** Close the pursuit with a reason — the gate opened, or the attempts ran out. */
+  pursuitClosed?: string;
 }
 
 /**

@@ -117,9 +117,11 @@ import {
   appendSecLedger,
   nextOpenSurface,
   secCoverage,
+  nextPursuit,
   reconPhaseOver,
   reconSections,
   secRoundBrief,
+  updateFinding,
   surfaceProgress,
   updateSurface,
   writeSecReport,
@@ -780,6 +782,42 @@ export function evaluateRound(snapshot: TreeSnapshot, record: RoundRecord): Roun
     // slot for being thorough, which pays it to close an item hastily instead of finishing
     // the trace. Bounded by construction: `digging` can only be set `digBudget` times.
     const dug = record.surfaceWasDigging === true;
+
+    // A PURSUIT ROUND IS A DIFFERENT AXIS, and its progress signal has to be different too: there
+    // is no status to flip (the finding's item was already examined when the finding landed), so
+    // "did it produce" is about the GATE — was the blocker list refined, cleared, or the pursuit
+    // closed with a reason? A refined blocker counts: the model learned something about the gate,
+    // and calling that nothing would pay it to give up instead of finishing the trace. Bounded by
+    // construction: `pursuitSpent` cannot exceed `pursuitBudget`.
+    if (record.kind === "pursue") {
+      const target = record.findingId ? snapshot.findings.find((f) => f.id === record.findingId) : undefined;
+      if (!target) {
+        return {
+          round: record.round,
+          kind: record.kind,
+          verdictReached: false,
+          evidenceAdded: false,
+          detail: record.findingId ? `the pursued finding ${record.findingId} is no longer in the run` : "the pursuit round named no finding",
+          produced: false,
+        };
+      }
+      const now = (target.blockers ?? []).join(" | ");
+      const gateChanged = now !== (record.pursuitBlockersAtStart ?? "");
+      const closed = !!target.pursuitClosed;
+      const bits: string[] = [];
+      if (closed) bits.push(`pursuit closed: ${clip(target.pursuitClosed!, 120)}`);
+      else if (gateChanged) bits.push(`gate refined: ${(target.blockers ?? []).length} blocker(s)`);
+      if (added > 0) bits.push(`${added} finding(s) recorded`);
+      return {
+        round: record.round,
+        kind: record.kind,
+        verdictReached: false,
+        evidenceAdded: gateChanged || closed || added > 0,
+        detail: bits.length > 0 ? `${target.id} — ${bits.join(", ")}` : `${target.id}'s gate is unchanged and nothing was recorded`,
+        produced: gateChanged || closed || added > 0,
+      };
+    }
+
     const bits: string[] = [];
     if (added > 0) bits.push(`${added} finding(s) recorded`);
     if (examined > 0) bits.push(`${examined} item(s) examined`);
@@ -1189,18 +1227,26 @@ export function tickLoop(projectRoot: string, snapshot: TreeSnapshot, opts: Tick
     const secKind: RoundKind =
       assigned ? "analyze" : snapshot.secNote === null ? "recon" : "surface";
     const reconRounds = reconRoundsOf(projectRoot);
+    // THE PURSUIT COMES BEFORE THE PLAN. A finding that is real but GATED — a post-auth RCE on a
+    // pre-auth objective, an RCE that needs one more controllable field — is one step from the
+    // goal, and closing its gate converts it. Before this the finding's surface item was marked
+    // examined and the run moved to the next S-xxx: the closest result it could produce was filed
+    // and abandoned in the same round. Bounded by `pursuitBudget`, so it cannot eat the run.
+    const pursuitBudget = pursuitRoundsOf(projectRoot);
+    const pursuitTarget = reconPhaseOver(snapshot, reconRounds) ? nextPursuit(snapshot, pursuitBudget) : null;
     // THE RECON PHASE OUTRANKS AN ITEM, and the two must agree: `secRoundBrief` uses the same
     // `reconPhaseOver` predicate, so a round can never get a recon brief with an `analyze` label
     // (or the reverse) — and the plateau counts those two kinds differently. Counted in SECTIONS,
     // so a run that recorded nothing stays in recon instead of enumerating from an empty note.
     const inReconPhase = !reconPhaseOver(snapshot, reconRounds);
-    const kindForRound: RoundKind = inReconPhase ? "recon" : secKind;
+    const kindForRound: RoundKind = inReconPhase ? "recon" : pursuitTarget ? "pursue" : secKind;
     const coverageReport = secCoverage(snapshot, projectRoot);
     const progress = surfaceProgress(snapshot);
     const brief = withBriefExtras(
       secRoundBrief(snapshot, current.objective, round, {
         digBudget,
         reconRounds,
+        pursuitBudget,
         lastRound: previous ? `Last round (${previous.round}): ${previous.detail}` : null,
         // The loop AFTER this tick's evaluation — see SecBriefOptions.loop.
         loop: current,
@@ -1221,17 +1267,36 @@ export function tickLoop(projectRoot: string, snapshot: TreeSnapshot, opts: Tick
               `SEC ROUND ${round} — enumerate the attack surface`,
               `${progress.total} item(s) on the list, all examined — enumerate what the analysis revealed.`,
             ]
-          : [
+          : kindForRound === "pursue"
+            ? [
+                `SEC ROUND ${round} — PURSUE ${pursuitTarget!.id}: attack its gate`,
+                `${pursuitTarget!.id} [${pursuitTarget!.severity ?? "unrated"}] ${pursuitTarget!.category} — ${clip(pursuitTarget!.title, 90)}`,
+                `${pursuitTarget!.blockers!.length} blocker(s), pursuit ${pursuitTarget!.pursuitSpent ?? 0}/${pursuitBudget} — NOT working the work list this round`,
+              ]
+            : [
               `SEC ROUND ${round} — analyse ${assigned!.id}`,
               `${assigned!.kind}: ${assigned!.title}` +
                 (assigned!.location ? ` (${assigned!.location.file}:${assigned!.location.line})` : ""),
               `${progress.examined}/${progress.total} examined · ${snapshot.findings.length} finding(s) so far`,
             ];
+    // SPEND THE PURSUIT BUDGET ON PREPARE, like a dig: a crash or a stalled turn must not hand out
+    // unlimited rounds on one finding. The blockers are also snapshotted, because that string is the
+    // only baseline `evaluateRound` can use to tell a pursuit that learned something from one that
+    // did nothing (there is no status to flip here, unlike an analyze round).
+    if (pursuitTarget) {
+      updateFinding(projectRoot, pursuitTarget.id, { pursuitSpent: (pursuitTarget.pursuitSpent ?? 0) + 1 }, at);
+    }
     const record: RoundRecord = {
       round,
       at,
       kind: kindForRound,
       ...(kindForRound === "analyze" && assigned ? { nodeId: null, surfaceId: assigned.id } : { nodeId: null }),
+      ...(kindForRound === "pursue" && pursuitTarget
+        ? {
+            findingId: pursuitTarget.id,
+            pursuitBlockersAtStart: (pursuitTarget.blockers ?? []).join(" | "),
+          }
+        : {}),
       nodeStatusAtStart: null,
       nodeEvidenceAtStart: 0,
       confirmedAtStart: snapshot.nodes.filter((n) => n.status === "confirmed").length,
@@ -1286,6 +1351,21 @@ export function pursueRoundsOf(projectRoot: string): number {
     return loadSettings(projectRoot).settings.pursueRounds;
   } catch {
     return 2;
+  }
+}
+
+/**
+ * How many PURSUIT rounds one finding's blockers may cost. See `HypothesisSettings.pursuitRounds`.
+ *
+ * Falls back to 0 on a read failure, NOT to the default 2: this setting spends rounds on a finding
+ * instead of the work list, and a settings file that cannot be read must not silently reallocate the
+ * run. The safe direction is the one that keeps working the plan.
+ */
+export function pursuitRoundsOf(projectRoot: string): number {
+  try {
+    return loadSettings(projectRoot).settings.pursuitRounds;
+  } catch {
+    return 0;
   }
 }
 

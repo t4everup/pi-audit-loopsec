@@ -79,6 +79,20 @@ export interface HypothesisSettings {
    */
   pursueRounds: number;
   /**
+   * How many PURSUIT rounds one finding's blockers may cost.
+   *
+   * A finding that is REAL but GATED is the most valuable thing a run can hold — closing the gate
+   * converts it into the objective — so the loop attacks its precondition BEFORE going back to the
+   * work list. This is the budget that stops that from becoming a way to sit on one finding for the
+   * rest of the run: past it the finding is left as a near miss, with the reason recorded, and the
+   * loop returns to the plan.
+   *
+   * Distinct from `pursueRounds` (which is the DEPTH budget for one surface item): they bound two
+   * different axes — a place versus a finding's precondition — and an operator may well want more
+   * of one than the other.
+   */
+  pursuitRounds: number;
+  /**
    * How many RECON rounds the run takes before it starts enumerating.
    *
    * One round was the original design and it was one model turn: on a 4,000-file project that
@@ -135,6 +149,7 @@ export const DEFAULT_SETTINGS: HypothesisSettings = {
   maxLinesScanned: 400_000,
   reconSegmentParagraphs: 4,
   pursueRounds: 2,
+  pursuitRounds: 2,
   reconRounds: 2,
   // zh by default: this extension's operating instructions are Chinese-first,
   // and a report nobody on the team can read is not a deliverable.
@@ -334,6 +349,8 @@ export function loadSettings(projectRoot: string): LoadedSettings {
   // Clamped to the design's 3–5 range rather than to an arbitrary bound.
   num("reconSegmentParagraphs", 3, 5);
   num("pursueRounds", 0, 5);
+  // 0 disables the pursuit of a finding's blockers entirely (the finding is filed as a near miss).
+  num("pursuitRounds", 0, 5);
   // Capped at 5: past that the rounds are re-reading, not understanding, and the plateau
   // no longer protects the run because a re-read can still add a sentence.
   num("reconRounds", 1, 5);

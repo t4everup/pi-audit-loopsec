@@ -39,6 +39,8 @@ import {
   secLedgerPath,
   secReportPath,
   MAX_ITEM_ATTEMPTS,
+  PURSUIT_MIN_SEVERITY,
+  nextPursuit,
   reconNotePath,
   reconPhaseOver,
   reconSections,
@@ -570,6 +572,232 @@ test("with probes OFF the summary says nothing was run, rather than implying the
   const report = renderSecReport(loadSec(cwd).snapshot, loadSec(cwd).snapshot.loop);
   assert.match(report, /allowCommandProbes[\s\S]*是关的/);
   assert.match(report, /静态声明/);
+});
+
+// -----------------------------------------------------------------
+// PURSUIT — the finding that is ONE STEP from the objective
+// -----------------------------------------------------------------
+//
+// The failure this closes, measured: a real RCE was recorded on a pre-auth objective, its surface
+// item was marked examined, and the run went on enumerating the list. The result that came closest
+// to the goal was filed and abandoned in the same round — and the rounds that would have turned it
+// into the objective went to unrelated S-xxx items.
+//
+// A finding that is REAL but GATED is the most valuable thing a run can hold: closing the gate
+// converts it. So the loop attacks the gate before the next item on the plan.
+
+test("a gated HIGH finding is pursued INSTEAD of the next surface item", () => {
+  const cwd = seeded();
+  startSec(cwd);
+  submitSecRecon(cwd, NOTE);
+  recordSurface(cwd, { title: "POST /api/exec", kind: "sink", file: "src/api/exec.py", line: 42 });
+  recordSurface(cwd, { title: "GET /other", kind: "entrypoint", file: "src/api/other.py", line: 1 });
+
+  tickLoop(cwd, loadSec(cwd).snapshot); // analyze S-0001
+  const f = recordFinding(cwd, {
+    title: "认证后可 RCE：exec 端点拼接命令",
+    category: "rce",
+    severity: "high",
+    file: "src/api/exec.py",
+    line: 42,
+    evidence: "src/api/exec.py:42\n  os.system(cmd)",
+    preAuth: false,
+    surfaceId: "S-0001",
+    blockers: ["需要一个有效的已认证会话（该路由在 requireAuth 装饰器之后）"],
+  });
+  assert.equal(f.ok, true);
+
+  const next = tickLoop(cwd, loadSec(cwd).snapshot);
+  const rec = loadSec(cwd).snapshot.roundRecords.at(-1)!;
+  assert.match(next.brief!, /^\[SEC ROUND 2 — PURSUE F-0001\]/, "the round pursues the finding, not the list");
+  assert.equal(rec.kind, "pursue");
+  assert.equal(rec.findingId, "F-0001");
+  assert.notEqual(rec.surfaceId, "S-0002", "S-0002 is NOT handed over while the gate is open");
+  assert.match(next.brief!, /Do NOT go to the next/, "and the brief says so explicitly");
+  assert.match(next.brief!, /需要一个有效的已认证会话/, "the gate is restated in the brief");
+  assert.match(next.brief!, /找.*不需要.*会话|without one/, "and the brief names the way to attack it");
+});
+
+test("the pursuit budget is spent on prepare and then the loop returns to the plan", () => {
+  const cwd = seeded();
+  startSec(cwd, "挖掘认证前rce漏洞", 99, 1);
+  saveSettings(cwd, { pursuitRounds: 2 });
+  submitSecRecon(cwd, NOTE);
+  recordSurface(cwd, { title: "S1", kind: "sink", file: "a.py", line: 1 });
+  recordSurface(cwd, { title: "S2", kind: "entrypoint", file: "b.py", line: 2 });
+  recordFinding(cwd, {
+    title: "gated rce", category: "rce", severity: "high", file: "a.py", line: 9, evidence: "e",
+    blockers: ["需要一个会话"],
+  });
+
+  // Two pursuit rounds, each spending one of the budget.
+  tickLoop(cwd, loadSec(cwd).snapshot);
+  assert.equal(loadSec(cwd).snapshot.findings[0]!.pursuitSpent, 1);
+  assert.equal(loadSec(cwd).snapshot.roundRecords.at(-1)!.kind, "pursue");
+  tickLoop(cwd, loadSec(cwd).snapshot);
+  assert.equal(loadSec(cwd).snapshot.findings[0]!.pursuitSpent, 2);
+  assert.equal(loadSec(cwd).snapshot.roundRecords.at(-1)!.kind, "pursue");
+
+  // Budget spent → back to the work list, with the finding still recorded as a near miss.
+  tickLoop(cwd, loadSec(cwd).snapshot);
+  const rec = loadSec(cwd).snapshot.roundRecords.at(-1)!;
+  assert.equal(rec.kind, "analyze", "the plan is back in charge");
+  assert.equal(rec.surfaceId, "S-0001");
+  assert.equal(loadSec(cwd).snapshot.findings[0]!.pursuitSpent, 2, "and the budget is not spent further");
+});
+
+test("opening the gate stops the pursuit — an empty blocker list MEANS the gate is open", () => {
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 1);
+  saveSettings(cwd, { pursuitRounds: 3 });
+  submitSecRecon(cwd, NOTE);
+  recordFinding(cwd, {
+    title: "gated rce", category: "rce", severity: "high", file: "a.py", line: 9, evidence: "e",
+    blockers: ["需要一个会话"],
+  });
+  assert.equal(nextPursuit(loadSec(cwd).snapshot, 3)!.id, "F-0001");
+
+  // An EMPTY array must CLEAR the gate — the usual "empty means absent" rule would make the gate
+  // impossible to open and the finding would be pursued until its budget ran out.
+  updateFinding(cwd, "F-0001", { blockers: [] });
+  assert.deepEqual(loadSec(cwd).snapshot.findings[0]!.blockers, [], "the empty list survives the log");
+  assert.equal(nextPursuit(loadSec(cwd).snapshot, 3), null, "and it is no longer pursued");
+});
+
+test("closing the pursuit with a reason stops it, and the reason is recorded", () => {
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 1);
+  saveSettings(cwd, { pursuitRounds: 3 });
+  submitSecRecon(cwd, NOTE);
+  recordFinding(cwd, {
+    title: "gated rce", category: "rce", severity: "high", file: "a.py", line: 9, evidence: "e",
+    blockers: ["需要一个会话"],
+  });
+  updateFinding(cwd, "F-0001", { pursuitClosed: "试过 a/b/c：均无法在认证前到达" });
+  assert.equal(nextPursuit(loadSec(cwd).snapshot, 3), null);
+  assert.match(loadSec(cwd).snapshot.findings[0]!.pursuitClosed!, /试过 a\/b\/c/);
+});
+
+test("only HIGH-or-worse RATED findings are pursued — the budget is the expensive kind of round", () => {
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 1);
+  saveSettings(cwd, { pursuitRounds: 2 });
+  submitSecRecon(cwd, NOTE);
+  // medium → not pursued
+  recordFinding(cwd, { title: "medium gated", category: "rce", severity: "medium", file: "a.py", line: 1, evidence: "e", blockers: ["需要会话"] });
+  assert.equal(nextPursuit(loadSec(cwd).snapshot, 2), null, "a medium finding's gate is not worth a round");
+  // unrated → not pursued either: "we have not decided whether this matters" is not a reason
+  recordFinding(cwd, { title: "unrated gated", category: "rce", file: "b.py", line: 2, evidence: "e", blockers: ["需要会话"] });
+  assert.equal(nextPursuit(loadSec(cwd).snapshot, 2), null);
+  // high → pursued
+  recordFinding(cwd, { title: "high gated", category: "rce", severity: "high", file: "c.py", line: 3, evidence: "e", blockers: ["需要会话"] });
+  assert.equal(nextPursuit(loadSec(cwd).snapshot, 2)!.id, "F-0003");
+  // critical outranks high
+  recordFinding(cwd, { title: "critical gated", category: "rce", severity: "critical", file: "d.py", line: 4, evidence: "e", blockers: ["需要会话"] });
+  assert.equal(nextPursuit(loadSec(cwd).snapshot, 2)!.id, "F-0004", "worst-first");
+});
+
+test("pursuitRounds=0 switches the mechanism off entirely", () => {
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 1);
+  saveSettings(cwd, { pursuitRounds: 0 });
+  submitSecRecon(cwd, NOTE);
+  recordSurface(cwd, { title: "S1", kind: "sink", file: "a.py", line: 1 });
+  recordFinding(cwd, {
+    title: "gated rce", category: "rce", severity: "high", file: "a.py", line: 9, evidence: "e",
+    blockers: ["需要一个会话"],
+  });
+  const r = tickLoop(cwd, loadSec(cwd).snapshot);
+  assert.match(r.brief!, /^\[SEC ROUND 1 — ANALYZE S-0001\]/, "the plan runs as before");
+  assert.equal(loadSec(cwd).snapshot.findings[0]!.pursuitSpent, undefined, "nothing is spent");
+});
+
+test("a pursuit round is PROGRESS when the gate is refined — and not when nothing changed", () => {
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 1);
+  saveSettings(cwd, { pursuitRounds: 3 });
+  submitSecRecon(cwd, NOTE);
+  recordFinding(cwd, {
+    title: "gated rce", category: "rce", severity: "high", file: "a.py", line: 9, evidence: "e",
+    blockers: ["需要一个会话"],
+  });
+
+  // Round 1: nothing changes → unproductive, so the plateau advances.
+  tickLoop(cwd, loadSec(cwd).snapshot);
+  assert.equal(loadSec(cwd).snapshot.loop!.stallRounds, 0, "the first round has no prior outcome to judge");
+  tickLoop(cwd, loadSec(cwd).snapshot);
+  const stalled = loadSec(cwd).snapshot.loop!.stallRounds;
+  assert.equal(stalled, 1, "a pursuit round that changed nothing is unproductive");
+
+  // Round 3: the gate is refined → productive, so the stall resets. Capture the record that is
+  // ABOUT to be evaluated (round 2's), because `at(-1)` after the tick is the round just PREPARED —
+  // evaluating that one would compare the refined blockers with themselves.
+  updateFinding(cwd, "F-0001", { blockers: ["需要 core.change_datasource 权限，它由任意已认证用户持有"] });
+  const round2 = loadSec(cwd).snapshot.roundRecords.at(-1)!;
+  tickLoop(cwd, loadSec(cwd).snapshot);
+  assert.equal(loadSec(cwd).snapshot.loop!.stallRounds, 0, "a refined gate is progress — the model learned something");
+
+  // And the detail line says which finding, and what changed.
+  const outcome = evaluateRound(loadSec(cwd).snapshot, round2);
+  assert.match(outcome.detail, /F-0001/);
+  assert.match(outcome.detail, /gate refined/);
+  assert.equal(outcome.produced, true);
+});
+
+test("closing the pursuit in a round is progress even with no new finding", () => {
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 1);
+  saveSettings(cwd, { pursuitRounds: 3 });
+  submitSecRecon(cwd, NOTE);
+  recordFinding(cwd, {
+    title: "gated rce", category: "rce", severity: "high", file: "a.py", line: 9, evidence: "e",
+    blockers: ["需要一个会话"],
+  });
+  tickLoop(cwd, loadSec(cwd).snapshot); // prepare the pursuit round
+  const rec = loadSec(cwd).snapshot.roundRecords.at(-1)!;
+  updateFinding(cwd, "F-0001", { pursuitClosed: "穷尽：三条路径都无法认证前到达" });
+  const outcome = evaluateRound(loadSec(cwd).snapshot, rec);
+  assert.equal(outcome.produced, true, "concluding the gate cannot be opened is a result");
+  assert.match(outcome.detail, /pursuit closed/);
+});
+
+test("a blocker list is validated: blank entries refused, and more than six is not one finding", () => {
+  const cwd = seeded();
+  startSec(cwd);
+  const blank = recordFinding(cwd, {
+    title: "x", category: "rce", severity: "high", file: "a.py", line: 1, evidence: "e", blockers: ["   "],
+  });
+  assert.equal(blank.ok, false);
+  assert.match(blank.ok ? "" : blank.errors.join(" "), /non-empty state of the world/);
+  const many = recordFinding(cwd, {
+    title: "y", category: "rce", severity: "high", file: "b.py", line: 2, evidence: "e",
+    blockers: ["a", "b", "c", "d", "e", "f", "g"],
+  });
+  assert.equal(many.ok, false);
+  assert.match(many.ok ? "" : many.errors.join(" "), /not one finding/);
+});
+
+test("the report shows the gate and the pursuit outcome, and counts the near misses", () => {
+  const cwd = seeded();
+  withSurface(cwd, 1);
+  saveSettings(cwd, { pursuitRounds: 2 });
+  const f = recordFinding(cwd, {
+    title: "认证后可 RCE", category: "rce", severity: "high", file: "src/a.c", line: 42, evidence: "e",
+    preAuth: false, blockers: ["需要一个有效的已认证会话"],
+  });
+  if (!f.ok) return assert.fail("must record");
+  const open = renderSecReport(loadSec(cwd).snapshot, loadSec(cwd).snapshot.loop);
+  assert.match(open, /\*\*前提（要利用它还需要什么成立）\*\*/, "the gate block is rendered");
+  assert.match(open, /需要一个有效的已认证会话/);
+  assert.match(open, /被前提阻塞的高危发现/, "and the summary counts the near misses");
+  assert.match(open, /\*\*1\/1\*\*/);
+
+  // Once the pursuit is closed the gate block says WHY it stopped — "we stopped" and "we never
+  // tried" must not look the same.
+  updateFinding(cwd, f.value.id, { blockers: [], pursuitClosed: "F-0007 提供了鉴权绕过" });
+  const closed = renderSecReport(loadSec(cwd).snapshot, loadSec(cwd).snapshot.loop);
+  assert.match(closed, /追索已结束（0 轮）：F-0007 提供了鉴权绕过/);
+  assert.doesNotMatch(closed, /被前提阻塞的高危发现/, "a closed gate is not an open near miss");
 });
 
 test("the report LEADS with what this mode does not have", () => {

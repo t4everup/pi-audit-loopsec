@@ -156,6 +156,10 @@ export interface SecStrings {
   rowSurfaceRounds: string;
   /** Chains — findings that combine other findings. */
   rowChains: string;
+  /** \
+   * \
+   * `被前提阻塞的高危发现` — the near misses: real, high, and not yet reachable. */
+  rowGated: (gated: number, total: number) => string;
   chainTitle: string;
   chainNote: string;
   chainOfLabel: (ids: string) => string;
@@ -203,6 +207,11 @@ export interface SecStrings {
   notesHeading: string;
   evidenceHeading: string;
   notVerifiedShort: string;
+  /**  — the gate block of a gated finding. */
+  gateHeading: string;
+  gateOpen: string;
+  pursuitOpen: (spent: number) => string;
+  pursuitClosed: (spent: number, reason: string) => string;
   /** The finding WAS run — what is still missing is falsification and a challenge round. */
   notFalsifiedShort: string;
   /** Labels inside a finding's verification fence. */
@@ -292,6 +301,7 @@ const SEC_ZH: SecStrings = {
   diggingLine: (id, title, used, budget) => `- **${id}** ${title} — 已用 ${used}/${budget} 个深挖轮，仍未定论`,
   rowSurfaceRounds: "**花在枚举上的轮次**",
   rowChains: "**组合链**",
+  rowGated: (gated, total) => `**被前提阻塞的高危发现（近失，优先追索）**`,
   chainTitle: "## 组合链",
   chainNote:
     "这些发现**由其他发现组合而成** —— 它们的任何一部分单独都到不了这里。它们通常是整份报告里最重的东西：一个写原语单独是中危，写进一个会被执行的文件就是 root 代码执行。",
@@ -330,6 +340,10 @@ const SEC_ZH: SecStrings = {
   chainHeading: "**调用链**",
   notesHeading: "**链子分析**",
   evidenceHeading: "**物证**",
+  gateHeading: "**前提（要利用它还需要什么成立）**",
+  gateOpen: "_（没有剩余前提——门已打开）_",
+  pursuitOpen: (spent) => `追索中：已花 ${spent} 轮攻这个前提，仍未打开。`,
+  pursuitClosed: (spent, reason) => `追索已结束（${spent} 轮）：${reason}`,
   notVerifiedShort: "_未经验证：无等级 · 无证伪 · 无对抗复核_",
   notFalsifiedShort: "_未经证伪：没有任何人尝试推翻它，也没有对抗复核。跑过不等于对。_",
   verifyCommand: "命令",
@@ -419,6 +433,7 @@ const SEC_EN: SecStrings = {
   diggingLine: (id, title, used, budget) => `- **${id}** ${title} — ${used}/${budget} depth round(s) used, still unsettled`,
   rowSurfaceRounds: "**Rounds spent enumerating**",
   rowChains: "**Chains**",
+  rowGated: (gated, total) => `**High findings blocked by a gate (near misses, pursued first)**`,
   chainTitle: "## Chains",
   chainNote:
     "These findings are **combinations of other findings** — no part of them reaches this on its own. They are usually the heaviest thing in the report: a write primitive alone is medium, and the same write into a file that gets executed is root code execution.",
@@ -457,6 +472,10 @@ const SEC_EN: SecStrings = {
   chainHeading: "**Call chain**",
   notesHeading: "**Chain analysis**",
   evidenceHeading: "**Evidence**",
+  gateHeading: "**Gate (what must hold to use it)**",
+  gateOpen: "_(no remaining precondition — the gate is open)_",
+  pursuitOpen: (spent) => `PURSUED: ${spent} round(s) spent attacking this gate, not yet opened.`,
+  pursuitClosed: (spent, reason) => `Pursuit ended (${spent} round(s)): ${reason}`,
   notVerifiedShort: "_NOT VERIFIED: no tier · no refutation attempt · no challenge round_",
   notFalsifiedShort: "_Not falsified: nobody tried to refute it and there was no challenge round. RUNNING is not the same as CORRECT._",
   verifyCommand: "command",

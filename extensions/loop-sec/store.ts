@@ -644,7 +644,25 @@ function normalizeFinding(value: unknown): SecFinding | null {
     ...(chainOf.length >= 2 ? { chainOf } : {}),
     ...(normalizeStepList(o.path).length > 0 ? { path: normalizeStepList(o.path) } : {}),
     ...(normalizeVerification(o.verification) ? { verification: normalizeVerification(o.verification)! } : {}),
+    ...(normalizeBlockers(o.blockers).length > 0 ? { blockers: normalizeBlockers(o.blockers) } : {}),
+    ...(typeof o.pursuitSpent === "number" && Number.isFinite(o.pursuitSpent) && o.pursuitSpent > 0
+      ? { pursuitSpent: Math.floor(o.pursuitSpent) }
+      : {}),
+    ...(typeof o.pursuitClosed === "string" && o.pursuitClosed ? { pursuitClosed: o.pursuitClosed } : {}),
   };
+}
+
+/**
+ * A blocker list, or nothing.
+ *
+ * A blocker is a STATE OF THE WORLD, so an empty entry is not a blocker — it is a blank line, and
+ * keeping it would make the list look longer than the reasoning behind it. Same rule the evidence
+ * list and the call chain use: what fails its own requirement is dropped on read, so a hand-edited
+ * log cannot add a gate that says nothing.
+ */
+function normalizeBlockers(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((b): b is string => typeof b === "string" && b.trim() !== "").map((b) => b.trim());
 }
 
 /**
@@ -834,6 +852,15 @@ function normalizeFindingPatch(value: unknown): SecFindingPatch | null {
   }
   const verification = normalizeVerification(o.verification);
   if (verification) patch.verification = verification;
+  // PRESENT-BUT-EMPTY IS MEANINGFUL HERE, unlike every other list in this file: an empty
+  // `blockers` array is how the model says "the gate is open" — the pursuit is over because the
+  // precondition now holds. Dropping it (the usual "empty list, no field" rule) would make the
+  // gate impossible to clear, and the finding would be pursued until its budget ran out.
+  if (Array.isArray(o.blockers)) patch.blockers = normalizeBlockers(o.blockers);
+  if (typeof o.pursuitSpent === "number" && Number.isFinite(o.pursuitSpent) && o.pursuitSpent >= 0) {
+    patch.pursuitSpent = Math.floor(o.pursuitSpent);
+  }
+  if (typeof o.pursuitClosed === "string" && o.pursuitClosed.trim()) patch.pursuitClosed = o.pursuitClosed.trim();
   return Object.keys(patch).length > 0 ? patch : null;
 }
 
@@ -852,6 +879,9 @@ function applyFindingPatch(finding: SecFinding, patch: SecFindingPatch): SecFind
     ...(patch.chainOf !== undefined ? { chainOf: patch.chainOf } : {}),
     ...(patch.path !== undefined ? { path: patch.path } : {}),
     ...(patch.verification !== undefined ? { verification: patch.verification } : {}),
+    ...(patch.blockers !== undefined ? { blockers: patch.blockers } : {}),
+    ...(patch.pursuitSpent !== undefined ? { pursuitSpent: patch.pursuitSpent } : {}),
+    ...(patch.pursuitClosed !== undefined ? { pursuitClosed: patch.pursuitClosed } : {}),
   };
 }
 
@@ -1139,6 +1169,8 @@ function normalizeRoundRecord(value: unknown): RoundRecord | null {
       ? { findingCountAtStart: Math.max(0, Math.floor(o.findingCountAtStart)) }
       : {}),
     ...(typeof o.surfaceId === "string" && o.surfaceId ? { surfaceId: o.surfaceId } : {}),
+    ...(typeof o.findingId === "string" && o.findingId ? { findingId: o.findingId } : {}),
+    ...(typeof o.pursuitBlockersAtStart === "string" ? { pursuitBlockersAtStart: o.pursuitBlockersAtStart } : {}),
     // RoundRecord.surfaceWasDigging — THE SIXTH field this file has had to be taught, and
     // the first one that landed in the WRONG normalizer: this anchor (a `surfaceId` string)
     // appears in both `normalizeFinding` and `normalizeRoundRecord`, and `replace(…, 1)`

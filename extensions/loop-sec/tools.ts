@@ -124,6 +124,12 @@ export function registerSecTools(pi: ExtensionAPI): void {
               "TWO OR MORE existing finding ids this one COMBINES, e.g. [\"F-0001\", \"F-0007\"]. Use it when what you found, together with something already recorded, reaches somewhere neither reaches alone — an arbitrary file write alone is medium, and the same write into a file that gets executed is root RCE. A chain needs NO artifact of its own: its artifact IS its parts. Every id must already exist.",
           }),
         ),
+        blockers: Type.Optional(
+          Type.Array(Type.String(), {
+            description:
+              "WHAT MUST HOLD for this to be exploitable as recorded — the gates that are not open yet: \"需要一个有效的管理员会话\", \"需要 attacker 控制 X-Forwarded-Host\", \"需要 base_url 带路径前缀\". Record these whenever what you found is REAL but GATED: a high finding with blockers is pursued by the loop — it spends its next rounds attacking that gate INSTEAD of the next item on the work list, because closing the gate converts the finding into the objective. Filing a gated finding with no blockers is what makes the run walk away from its best result.",
+          }),
+        ),
       }),
       async execute(_id, params, _signal, _onUpdate, ctx) {
         const root = projectRootOf(ctx);
@@ -140,6 +146,7 @@ export function registerSecTools(pi: ExtensionAPI): void {
           ...(params.surfaceId ? { surfaceId: params.surfaceId } : {}),
           ...(params.path && params.path.length > 0 ? { path: params.path } : {}),
           ...(params.chainOf && params.chainOf.length > 0 ? { chainOf: params.chainOf } : {}),
+          ...(params.blockers && params.blockers.length > 0 ? { blockers: params.blockers } : {}),
         });
         if (!result.ok) {
           return text(`Finding REJECTED — nothing was recorded:\n${result.errors.map((e) => `  - ${e}`).join("\n")}`);
@@ -351,8 +358,8 @@ export function registerSecTools(pi: ExtensionAPI): void {
       name: "sec_update",
       label: "Correct a /loopSEC finding",
       description:
-        "Change a field of a finding you already recorded — a severity you can now judge, a preAuth you have determined, a poc, or a better title. A field you omit is KEPT, not cleared. The artifact requirement holds: a finding may not be left with neither a location nor an evidence excerpt.",
-      promptSnippet: "sec_update — correct a finding instead of recording a duplicate",
+        "Change a field of a finding you already recorded — a severity you can now judge, a preAuth you have determined, a poc, or a better title. A field you omit is KEPT, not cleared. Also the two ways a PURSUIT ends: pass `blockers=[]` when the gate opened, or `pursuitClosed` with the reason when it cannot be opened. The artifact requirement holds: a finding may not be left with neither a location nor an evidence excerpt.",
+      promptSnippet: "sec_update — correct a finding, or close the pursuit of its gate",
       parameters: Type.Object({
         id: Type.String({ description: "The finding id, e.g. F-0003." }),
         title: Type.Optional(Type.String()),
@@ -368,6 +375,18 @@ export function registerSecTools(pi: ExtensionAPI): void {
         evidence: Type.Optional(Type.String()),
         reasoning: Type.Optional(Type.String()),
         poc: Type.Optional(Type.String()),
+        blockers: Type.Optional(
+          Type.Array(Type.String(), {
+            description:
+              "REPLACE the blocker list. Pass `[]` when the gate OPENED (the precondition now holds — the loop stops pursuing it); pass refined text when your pursuit round established something better than what was recorded (\"需要 admin 会话\" → \"需要 core.change_datasource 权限，它由任意已认证用户持有\"). A refined blocker is PROGRESS — the same text is not.",
+          }),
+        ),
+        pursuitClosed: Type.Optional(
+          Type.String({
+            description:
+              "Close the pursuit of this finding's gate, with the reason. Use it when you attacked the blockers and none can be opened (\"试过 a/b/c：均无法在认证前到达\"). Without it, \"we stopped\" and \"we never tried\" look the same in the report.",
+          }),
+        ),
         priority: Type.Optional(
           Type.Number({
             description:
@@ -386,6 +405,11 @@ export function registerSecTools(pi: ExtensionAPI): void {
         if (params.evidence) patch.evidence = params.evidence;
         if (params.reasoning) patch.reasoning = params.reasoning;
         if (params.poc) patch.poc = params.poc;
+        // AN EMPTY ARRAY IS MEANINGFUL HERE — it is how the model says "the gate opened". The usual
+        // "empty means absent" rule would make the gate impossible to clear, and the finding would
+        // be pursued until its budget ran out.
+        if (Array.isArray(params.blockers)) patch.blockers = params.blockers;
+        if (params.pursuitClosed) patch.pursuitClosed = params.pursuitClosed;
         // priority is a SURFACE field, not a finding one. sec_update corrects a finding, so a
         // priority here means "the surface item this finding came from" — which is what the
         // model has in hand when it decides an item deserves to jump the queue.

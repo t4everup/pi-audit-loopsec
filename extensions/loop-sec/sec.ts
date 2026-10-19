@@ -154,6 +154,13 @@ export interface FindingInput {
   path?: SecFindingStep[];
   /** The findings this one combines. Two or more, all of which must already exist. */
   chainOf?: string[];
+  /**
+   * What must hold for this to be exploitable as recorded. See `SecFinding.blockers`.
+   *
+   * Recording a gated finding is the point: the loop then attacks the gate instead of moving to
+   * the next surface item.
+   */
+  blockers?: string[];
 }
 
 /**
@@ -199,6 +206,16 @@ export function validateFinding(input: FindingInput): Result<FindingInput> {
   }
   if (typeof input.category !== "string" || input.category.trim() === "") {
     errors.push("category is required (free-form here, but it is how the report groups findings)");
+  }
+  // BLOCKERS ARE STATES OF THE WORLD, and a blank one is not a state. Capped at 6 because a finding
+  // gated by more than six independent things is not one finding — it is a description of the
+  // deployment, and the loop would spend its whole pursuit budget reading it.
+  const blockers = input.blockers ?? [];
+  if (blockers.some((b) => typeof b !== "string" || b.trim() === "")) {
+    errors.push("every `blockers` entry must be a non-empty state of the world (e.g. \"需要一个有效的管理员会话\")");
+  }
+  if (blockers.length > 6) {
+    errors.push(`\`blockers\` has ${blockers.length} entries — a finding gated by more than six independent things is not one finding. Name the one that matters most.`);
   }
   return errors.length === 0 ? { ok: true, value: input, warnings: [] } : { ok: false, errors };
 }
@@ -281,6 +298,7 @@ export function recordFinding(projectRoot: string, input: FindingInput, at = now
     ...(input.surfaceId ? { surfaceId: input.surfaceId } : {}),
     ...(input.path && input.path.length > 0 ? { path: input.path } : {}),
     ...(chain.length >= 2 ? { chainOf: [...chain] } : {}),
+    ...((input.blockers ?? []).length > 0 ? { blockers: input.blockers!.map((b) => b.trim()) } : {}),
   };
   if (!appendSecEvent(projectRoot, { type: "finding_recorded", at, finding })) {
     return { ok: false, errors: ["the finding could not be written to the log"] };
@@ -996,6 +1014,51 @@ export function renderSecReconBrief(
 const FINDINGS_SHOWN = 30;
 
 /**
+ * The severity floor for pursuing a finding's blockers.
+ *
+ * Same floor the hypothesis mode used for `pursue`, and for the same reason: a pursuit round is
+ * the expensive kind — it does not advance the sweep — so spending it on a `medium` finding's
+ * precondition costs a round that a `high` finding's whole class could have used. An UNRATED
+ * finding is not pursued either: "we have not decided whether this matters" is not a reason to
+ * spend two rounds on it, and the brief tells the model to rate what it wants pursued.
+ */
+export const PURSUIT_MIN_SEVERITY: Severity = "high";
+
+/**
+ * The finding whose blockers the next round should attack, or null.
+ *
+ * THE FIX FOR "WE FOUND THE RCE AND WALKED AWAY". A finding that is real but gated — a post-auth
+ * RCE on a pre-auth objective, an RCE that needs one more controllable field — is one step from
+ * the objective, and closing its gate converts it. Before this existed the loop marked the
+ * finding's surface item examined and moved to the next S-xxx: the best result the run could
+ * produce was filed and abandoned in the same round.
+ *
+ * Three conditions, each of which bounds it:
+ *   1. it has blockers (the model declared a gate),
+ *   2. its pursuit is not already closed, and its budget is not spent,
+ *   3. it is at or above `PURSUIT_MIN_SEVERITY`.
+ *
+ * Worst-first, so the heaviest near miss is attacked before the lighter ones.
+ */
+export function nextPursuit(snapshot: TreeSnapshot, pursuitBudget: number): SecFinding | null {
+  if (pursuitBudget <= 0) return null;
+  const candidates = snapshot.findings.filter(
+    (f) =>
+      (f.blockers?.length ?? 0) > 0 &&
+      !f.pursuitClosed &&
+      (f.pursuitSpent ?? 0) < pursuitBudget &&
+      !!f.severity &&
+      severityRank(f.severity) <= severityRank(PURSUIT_MIN_SEVERITY),
+  );
+  if (candidates.length === 0) return null;
+  // Worst-first, then by id so the order is stable across rounds (an unstable order would
+  // make the same two findings trade places every round and neither would get finished).
+  return [...candidates].sort(
+    (a, b) => severityRank(a.severity!) - severityRank(b.severity!) || a.id.localeCompare(b.id),
+  )[0]!;
+}
+
+/**
  * What has been found so far, one line each.
  *
  * Carried in EVERY sec brief, not only the analyze one: a round that re-reports a
@@ -1005,6 +1068,13 @@ const FINDINGS_SHOWN = 30;
 export interface SecBriefOptions {
   /** Depth rounds one item may be given. See `SEC_DIG_BUDGET`. */
   digBudget?: number;
+  /**
+   * How many PURSUIT rounds one finding's blockers may cost. See `HypothesisSettings.pursuitRounds`.
+   *
+   * Passed IN for the same reason `reconRounds` is: the phase boundary and the scheduling decision
+   * must read the same number, and the brief should not read the settings file per round.
+   */
+  pursuitBudget?: number;
   /**
    * How many RECON rounds the run takes. See `HypothesisSettings.reconRounds`.
    *
@@ -1078,7 +1148,11 @@ function renderFoundSoFar(snapshot: TreeSnapshot): string {
     const where = f.location ? ` ${f.location.file}:${f.location.line}` : "";
     const chain = f.chainOf && f.chainOf.length > 0 ? `  ⛓ combines ${f.chainOf.join(" + ")}` : "";
     const ran = f.verification?.confirmed ? " ✓ran" : "";
-    lines.push(`  ${f.id} [${f.severity ?? "unrated"}] ${f.category} — ${clip(f.title, 110)}${where}${chain}${ran}`);
+    // A GATED finding is marked, so the model can see at a glance which of its results is one
+    // step from the objective — and whether that gate is still open (being pursued) or was
+    // already attacked and closed.
+    const gated = (f.blockers?.length ?? 0) > 0 ? `  ⊘ gated(${f.blockers!.length})` : f.pursuitClosed ? "  ⊘ gate closed" : "";
+    lines.push(`  ${f.id} [${f.severity ?? "unrated"}] ${f.category} — ${clip(f.title, 110)}${where}${chain}${ran}${gated}`);
   }
   if (findings.length > shown.length) {
     lines.push(`  … +${findings.length - shown.length} more, worst-first — the full list is in SEC-REPORT.md and tree.jsonl.`);
@@ -1177,6 +1251,97 @@ export function renderSecSurfaceBrief(snapshot: TreeSnapshot, objective: string,
   return lines.join("\n");
 }
 
+/**
+ * A PURSUIT round: attack the precondition of a finding that is one step from the objective.
+ *
+ * This brief exists because of a measured failure: a real RCE was recorded on a pre-auth
+ * objective, its surface item was marked examined, and the run went on enumerating the list. The
+ * finding that came closest to the goal was filed and abandoned in the same round — and the two
+ * rounds that would have turned it into the objective went to unrelated S-xxx items instead.
+ *
+ * So this round does NOT work the list. It works ONE gate: "what must hold for this to be
+ * reachable, and can I get that?". The brief is deliberately explicit that the model must not
+ * drift back to the plan — the loop will return to the plan by itself once the gate is opened or
+ * the budget runs out.
+ */
+export function renderSecPursuitBrief(
+  snapshot: TreeSnapshot,
+  objective: string,
+  round: number,
+  finding: SecFinding,
+  opts: SecBriefOptions = {},
+): string {
+  const budget = opts.pursuitBudget ?? 2;
+  const spent = finding.pursuitSpent ?? 0;
+  const lines: string[] = [];
+  lines.push(`[SEC ROUND ${round} — PURSUE ${finding.id}]`);
+  lines.push("");
+  lines.push(`Objective: ${objective}`);
+  lines.push("");
+  if (opts.lastRound) lines.push(opts.lastRound);
+  const stall = renderStall(opts.loop ?? snapshot.loop);
+  if (stall) lines.push(stall);
+  if (opts.lastRound || stall) lines.push("");
+  lines.push("--- THIS ROUND IS THIS FINDING, NOT THE WORK LIST ---");
+  lines.push(`  ${finding.id}  [${finding.severity ?? "unrated"}] ${finding.category}`);
+  lines.push(`  ${finding.title}`);
+  if (finding.location) lines.push(`  at ${finding.location.file}:${finding.location.line}`);
+  if (finding.preAuth === false) lines.push("  recorded as POST-AUTH — a session is required first");
+  if (finding.preAuth === true) lines.push("  recorded as PRE-AUTH");
+  lines.push(`  PURSUIT ${spent}/${budget} — ${budget - spent} round(s) left on this finding`);
+  lines.push("--- END ---");
+  lines.push("");
+  lines.push("**You found something real and it is ONE STEP from the objective. Do NOT go to the next**");
+  lines.push("**surface item this round.** Everything else on the list can wait; this cannot, because");
+  lines.push("closing the gate below is what turns this into the objective.");
+  lines.push("");
+  lines.push("--- THE GATE ---");
+  for (const b of finding.blockers ?? []) lines.push(`  - ${b}`);
+  lines.push("--- END ---");
+  lines.push("");
+  lines.push("**Attack the gate. For EACH blocker above, find out whether it can be obtained, and how:**");
+  lines.push("  - **An authentication or session requirement** → is there a route that reaches this");
+  lines.push("    handler without one? A default credential, a token that is not verified, a signing key");
+  lines.push("    in the repository, an alternate entry (internal API, websocket, GraphQL alias, a second");
+  lines.push("    route to the same function), or a check that fails open?");
+  lines.push("  - **A field that must be attacker-controlled** → who sets it, is it really fixed, and is");
+  lines.push("    there another caller of the same sink where it IS attacker-controlled?");
+  lines.push("  - **A configuration value** → is it the shipped DEFAULT, and is that default deployed?");
+  lines.push("    Is there a second code path that does not read the setting at all?");
+  lines.push("  - **A race, an order, or a state** → is there a sequence that gets there?");
+  lines.push("  - **An upstream service or network position** → what is actually required, and is any part");
+  lines.push("    of that requirement satisfied by default?");
+  lines.push("");
+  lines.push("Read the code for each. **A blocker you cannot open is as valuable as one you can** — it is");
+  lines.push("what turns \"maybe\" into a recorded near miss with a reason. Do not stop at the first one.");
+  lines.push("");
+  lines.push("--- HOW THIS ROUND CAN END ---");
+  lines.push("**The gate opened** → record the ENABLING thing as its own finding (`sec_finding`, with its");
+  lines.push("own artifact — an auth bypass is a finding, not a footnote), then update this one:");
+  lines.push(`  \`sec_update ${finding.id} blockers=[]\``);
+  lines.push(`  \`sec_update ${finding.id} preAuth=true\``, "   (if it is now reachable pre-auth)");
+  lines.push("  or link them so the report can state the chain:");
+  lines.push(`  \`sec_update ${finding.id} chainOf=[<new finding id>, ${finding.id}]\``);
+  lines.push("**The gate is still closed, and you know more now** → refine it. Replace the blocker text");
+  lines.push("with what you actually established (\"需要 admin 会话\" → \"需要 core.change_datasource 权限，");
+  lines.push("它由任意已认证用户持有\"). A refined blocker is progress; the same text is not.");
+  lines.push(`**The gate cannot be opened** → close the pursuit with the reason, so the report says the`);
+  lines.push("finding was attacked rather than forgotten:");
+  lines.push(`  \`sec_update ${finding.id} pursuitClosed="试过 a/b/c：均无法在认证前到达"\``);
+  lines.push("**A new place the pursuit revealed** → `sec_surface` it (it joins the plan, and the loop");
+  lines.push("returns to the plan when this gate is settled).");
+  lines.push("");
+  lines.push(`**A note on the budget:** this finding gets ${budget} pursuit round(s) in total. Past that it is`);
+  lines.push("left as a recorded near miss and the loop goes back to the list — a pursuit that never ends");
+  lines.push("is the same as never deciding.");
+  lines.push("");
+  lines.push(renderFoundSoFar(snapshot));
+  lines.push("");
+  lines.push(`(wider context lives in \`${SEC_STATE_DIR_NAME}/recon.md\` — this run's ceiling.)`);
+  return lines.join("\n");
+}
+
+/**
 /**
  * Round 3..N: work ONE item on the list, all the way down.
  *
@@ -1322,6 +1487,12 @@ export function renderSecAnalyzeBrief(
   lines.push("--- HOW THIS ROUND CAN END ---");
   lines.push("**Found something** → `sec_finding`, with `surfaceId` pointing back at this item, and an artifact");
   lines.push("(`file`+`line` or an `evidence` excerpt).");
+  lines.push("**Found something REAL but GATED** → `sec_finding` it anyway, and pass `blockers` — what");
+  lines.push("must hold for it to be exploitable as recorded (\"需要一个有效的管理员会话\", \"需要 attacker");
+  lines.push("控制 X-Forwarded-Host\"). A gated HIGH finding is the most valuable thing you can record:");
+  lines.push("the loop then spends its next rounds attacking that gate INSTEAD of the next item on the list,");
+  lines.push("because closing it converts the finding into the objective. Do not file it as a near miss and");
+  lines.push("move on — that is what this field exists to prevent.");
   lines.push("**The call chain goes in `path`**, one step per hop with a `file:line` on each — not buried in");
   lines.push("`reasoning`; a reader scans a numbered list and cannot scan prose for a path. Keep `reasoning` for");
   lines.push("why it matters, what it costs, and what you could not settle.");
@@ -1440,6 +1611,14 @@ export function renderSecReport(
   // single finding can.
   const chains = findings.filter((f) => f.chainOf && f.chainOf.length >= 2);
   if (chains.length > 0) lines.push(`| ${t.rowChains} | **${chains.length}** |`);
+  // THE NEAR MISSES, counted separately, because they are what the run is DOING rather than what it
+  // HAS. A high finding whose gate is still open is one pursuit away from the objective, and a
+  // reader watching a run should be able to see that at a glance instead of inferring it from the
+  // per-finding blocks.
+  const gated = findings.filter((f) => (f.blockers?.length ?? 0) > 0 && !f.pursuitClosed);
+  if (gated.length > 0) {
+    lines.push(`| ${t.rowGated(gated.length, findings.length)} | **${gated.length}/${findings.length}** |`);
+  }
   lines.push(`| ${t.rowPreAuth} | ${preAuth} |`);
   lines.push(`| ${t.rowPostAuth} | ${findings.filter((f) => f.preAuth === false).length} |`);
   lines.push(`| ${t.rowUnassessed} | ${findings.filter((f) => typeof f.preAuth !== "boolean").length} |`);
@@ -1707,6 +1886,21 @@ function renderSecFinding(
 
   if (f.poc) fenced(t.pocHeading, f.poc);
 
+  // ---- the GATE, when the finding is real but not yet reachable -----------------------
+  //
+  // BEFORE the PoC, because it changes how everything below should be read: a post-auth RCE on a
+  // pre-auth objective is not a pre-auth finding, and the gate is the difference. It also carries
+  // the PURSUIT outcome, so "we attacked this gate and could not open it" is distinguishable from
+  // "nobody ever tried" — the same distinction the rest of this report is built on.
+  if ((f.blockers?.length ?? 0) > 0 || f.pursuitClosed) {
+    const gateBody: string[] = [];
+    for (const b of f.blockers ?? []) gateBody.push(`- ${b}`);
+    if ((f.blockers?.length ?? 0) === 0) gateBody.push(t.gateOpen);
+    gateBody.push("");
+    gateBody.push(f.pursuitClosed ? t.pursuitClosed(f.pursuitSpent ?? 0, f.pursuitClosed) : t.pursuitOpen(f.pursuitSpent ?? 0));
+    fenced(t.gateHeading, gateBody.join("\n"));
+  }
+
   if (f.path && f.path.length > 0) {
     // The numbered list, with the location on its own line above the detail — so the
     // `file:line` column can be read down the page instead of hunted for in a sentence.
@@ -1921,6 +2115,12 @@ export function secRoundBrief(
   if (!reconPhaseOver(snapshot, reconRounds)) {
     return renderSecReconBrief(snapshot, objective, round, reconSections(snapshot) + 1, reconRounds);
   }
+  // PURSUIT OUTRANKS THE WORK LIST. A finding that is real but gated is one step from the
+  // objective, and closing its gate converts it — so it is attacked before the next item on the
+  // plan. The brief says so explicitly, because the model's instinct (and its previous twenty
+  // rounds) is to keep working the list. Bounded by `pursuitBudget`, so it cannot eat the run.
+  const pursuitTarget = nextPursuit(snapshot, opts.pursuitBudget ?? 0);
+  if (pursuitTarget) return renderSecPursuitBrief(snapshot, objective, round, pursuitTarget, opts);
   const item = nextOpenSurface(snapshot, opts.digBudget ?? SEC_DIG_BUDGET);
   if (!item) return renderSecSurfaceBrief(snapshot, objective, round);
   return renderSecAnalyzeBrief(snapshot, objective, round, item, opts);
