@@ -57,6 +57,7 @@ import {
   type AuditLoopKind,
   loopCommandName,
   type AuditLoopState,
+  type SecLoopDeep,
   type CompletionContract,
   type Hypothesis,
   type HypothesisStatus,
@@ -83,12 +84,16 @@ import {
 import {
   SEC_STATE_DIR_NAME,
   STATE_DIR_NAME,
+  TREE_LOG_NAME,
   appendEvent,
   appendSecEvent,
   load,
   loadSec,
   nowIso,
+  secBaseDir,
+  secStateDir,
   secTreeLogPath,
+  setActiveRun,
   treeLogPath,
   type TreeEvent,
 } from "./store.js";
@@ -120,6 +125,9 @@ import {
   gatesOfFinding,
   nextPursuit,
   objectiveHits,
+  deepObjectiveOf,
+  renderDeepSeedNote,
+  submitDeepSeed,
   reconPhaseOver,
   reconSections,
   secRoundBrief,
@@ -361,6 +369,8 @@ export interface StartLoopOptions {
   plateauWindow?: number;
   /** The classes this run is FOR. See AuditLoopState.focus. */
   focus?: string[];
+  /** Set only by `/loopsec deep`. See AuditLoopState.deep. */
+  deep?: SecLoopDeep;
   at?: string;
 }
 
@@ -459,6 +469,7 @@ export function startLoop(projectRoot: string, snapshot: TreeSnapshot, opts: Sta
     plateauWindow: opts.plateauWindow ?? (opts.kind === "goal" ? LOOP_DEFAULTS.GOAL_PLATEAU : LOOP_DEFAULTS.LOOP_PLATEAU),
     stallRounds: 0,
     ...(opts.focus && opts.focus.length > 0 ? { focus: [...opts.focus] } : {}),
+    ...(opts.deep ? { deep: { ...opts.deep } } : {}),
     pausedMs: 0,
     pausedAt: null,
     endedAt: null,
@@ -473,6 +484,148 @@ export function startLoop(projectRoot: string, snapshot: TreeSnapshot, opts: Sta
 export function writeLoop(projectRoot: string, loop: AuditLoopState, at = nowIso()): boolean {
   const next = { ...loop, updatedAt: at };
   return appendLoopEvent(projectRoot, loop.kind, { type: "loop_updated", at, loop: next });
+}
+
+/**
+ * `/loopsec deep <F-id>` — open a run whose whole job is ONE finding.
+ *
+ * WHY A SEPARATE RUN RATHER THAN MORE ROUNDS ON THE SWEEP. Three reasons, all measured:
+ *   * `pursuitRounds` is 3 and `nextPursuit` refuses a finding once the budget is spent, so a sweep
+ *     can never give a hard target the ten rounds it needs;
+ *   * `depthAllowed` caps depth at half the rounds, by design — breadth must not starve — so a sweep
+ *     that spent twenty rounds on one finding would stop being a sweep;
+ *   * every pursuit round prints the SAME four-move playbook. Round four has nothing new to say, which
+ *     is the real reason more rounds do not help: the target needs to CHAIN, not repeat.
+ *
+ * The order below is load-bearing and every step is a failure mode somebody would otherwise hit:
+ *   1. REFUSE if the parent has a round in flight. The tools resolve the active run through
+ *      `active.json`, so switching while a round is in flight would send that turn's `sec_finding`
+ *      into the deep log — the one way this design can corrupt a record.
+ *   2. PAUSE the parent first, while the pointer still means "main". After the switch the parent is
+ *      unreachable until `deep end`, and a run left `running` that cannot be ticked reports a state
+ *      nobody can act on.
+ *   3. Create the directory BEFORE the pointer (see `setActiveRun`).
+ *   4. Seed the note and start the loop, both of which now land in the deep directory.
+ *   5. On any failure, point back at main: a half-built deep run must not capture every later write.
+ */
+export interface StartDeepOptions {
+  /** Rounds to allow. 0 = unbounded, which the plateau still bounds. */
+  maxRounds?: number;
+  plateauWindow?: number;
+  at?: string;
+}
+
+export interface StartDeepResult {
+  ok: boolean;
+  errors: string[];
+  dir?: string;
+  loop?: AuditLoopState;
+}
+
+export function startDeepRun(projectRoot: string, findingId: string, opts: StartDeepOptions = {}): StartDeepResult {
+  const at = opts.at ?? nowIso();
+  const id = (findingId ?? "").trim().toUpperCase();
+  if (!id) return { ok: false, errors: ["deep needs a finding id: `/loopsec deep F-0008`"] };
+
+  // Every read below is the MAIN run's, because the pointer has not moved yet.
+  const parentSnapshot = loadSec(projectRoot).snapshot;
+  const parentLoop = parentSnapshot.loop;
+  if (parentLoop?.awaitingRound !== null && parentLoop?.awaitingRound !== undefined) {
+    return {
+      ok: false,
+      errors: [
+        `round ${parentLoop.awaitingRound} of the sweep is still in flight.`,
+        "Its tools resolve the active run when they are CALLED, so switching now would write that round's findings",
+        "into the deep log. Finish the round (or `/loopsec cancel` it) and run `deep` again.",
+      ],
+    };
+  }
+  if (parentLoop?.deep) {
+    return {
+      ok: false,
+      errors: [
+        `this project's active run IS a deep run (${parentLoop.deep.findingId}).`,
+        "`/loopsec deep end` first — chains of deep runs are a way to never finish any of them.",
+      ],
+    };
+  }
+  const finding = parentSnapshot.findings.find((f) => f.id === id);
+  if (!finding) {
+    const known = parentSnapshot.findings.map((f) => f.id).join(", ") || "(none recorded yet)";
+    return { ok: false, errors: [`${id} is not a finding of this project's sweep. Recorded: ${known}`] };
+  }
+
+  const parentDir = path.relative(secBaseDir(projectRoot), secStateDir(projectRoot)).split(path.sep).join("/") || ".";
+  const dir = `deep/${finding.id}`;
+  const targetDir = path.join(secBaseDir(projectRoot), dir);
+  if (fs.existsSync(path.join(targetDir, TREE_LOG_NAME))) {
+    return {
+      ok: false,
+      errors: [
+        `${SEC_STATE_DIR_NAME}/${dir}/ already holds a run.`,
+        `Read it with \`/loopsec show\` after pointing at it, or remove that directory to start over.`,
+      ],
+    };
+  }
+
+  // 2. The parent stops BEFORE the pointer moves.
+  const paused = parentLoop
+    ? parentLoop.status === "running"
+      ? pauseLoop(projectRoot, parentSnapshot, `被深挖运行接管（${dir}）`, at)
+      : { ok: true, errors: [] as string[] }
+    : { ok: true, errors: [] as string[] };
+  if (!paused.ok) return { ok: false, errors: paused.errors };
+
+  // 3/4. Directory, pointer, then the run itself.
+  try {
+    fs.mkdirSync(targetDir, { recursive: true });
+  } catch (error) {
+    return { ok: false, errors: [`could not create ${SEC_STATE_DIR_NAME}/${dir}: ${(error as Error).message}`] };
+  }
+  const pointed = setActiveRun(projectRoot, { dir, label: `deep ${finding.id}`, at });
+  if (!pointed.ok) {
+    return { ok: false, errors: pointed.errors };
+  }
+  const back = (errors: string[]): StartDeepResult => {
+    setActiveRun(projectRoot, null);
+    return { ok: false, errors };
+  };
+
+  const seeded = submitDeepSeed(projectRoot, renderDeepSeedNote(finding, parentDir), at);
+  if (!seeded.ok) return back(seeded.errors);
+
+  const deep: SecLoopDeep = {
+    findingId: finding.id,
+    title: finding.title,
+    ...(finding.severity ? { severity: finding.severity } : {}),
+    category: finding.category,
+    parentDir,
+  };
+  const started = startLoop(projectRoot, loadSec(projectRoot).snapshot, {
+    kind: "sec",
+    objective: deepObjectiveOf(finding),
+    deep,
+    ...(opts.maxRounds !== undefined ? { maxRounds: opts.maxRounds } : {}),
+    ...(opts.plateauWindow !== undefined ? { plateauWindow: opts.plateauWindow } : {}),
+    at,
+  });
+  if (!started.ok || !started.loop) return back(started.errors);
+  return { ok: true, errors: [], dir, loop: started.loop };
+}
+
+/**
+ * Leave the deep run and hand the project back to the sweep.
+ *
+ * Does NOT auto-resume the sweep: the operator paused it deliberately (or `deep` did, naming this
+ * run), and a loop that restarts itself is a loop that spends rounds nobody asked for.
+ */
+export function endDeepRun(projectRoot: string): { ok: boolean; errors: string[]; resumed?: boolean } {
+  const snapshot = loadSec(projectRoot).snapshot;
+  const deep = snapshot.loop?.deep;
+  if (!deep) return { ok: false, errors: ["the active run is not a deep run — nothing to leave"] };
+  const pointed = setActiveRun(projectRoot, null);
+  if (!pointed.ok) return { ok: false, errors: pointed.errors };
+  return { ok: true, errors: [], resumed: false };
 }
 
 export interface LoopControlResult {
@@ -1348,10 +1501,16 @@ export function tickLoop(projectRoot: string, snapshot: TreeSnapshot, opts: Tick
               : "Reading the request lifecycle and the auth wiring — what pre-auth findings turn on.",
           ]
         : kindForRound === "surface"
-          ? [
-              `SEC ROUND ${round} — enumerate the attack surface`,
-              `${progress.total} item(s) on the list, all examined — enumerate what the analysis revealed.`,
-            ]
+          ? snapshot.loop?.deep
+            ? [
+                `SEC ROUND ${round} — 子问题：${snapshot.loop.deep.findingId} 还有哪些不知道的`, 
+                `深挖 ${snapshot.loop.deep.findingId} · ${clip(snapshot.loop.deep.title, 90)}`,
+                "一个子问题是一个动作能回答的疑问；不是一句结论。",
+              ]
+            : [
+                `SEC ROUND ${round} — enumerate the attack surface`,
+                `${progress.total} item(s) on the list, all examined — enumerate what the analysis revealed.`,
+              ]
           : kindForRound === "pursue"
             ? [
                 `SEC ROUND ${round} — PURSUE ${pursuitTarget!.id}: deepen it (a breakthrough, not the work list)`,

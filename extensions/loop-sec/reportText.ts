@@ -121,6 +121,10 @@ export interface SecStrings {
   rowNote: string;
   /** `侦察轮次` — how many recon sections the run recorded, out of how many it takes. */
   rowReconRounds: (recorded: number, planned: number) => string;
+  /** Deep runs only: the context came from a finding, not from a recon pass. */
+  rowDeepSeed: string;
+  /** The banner that says this report is a DEEP run, naming the finding it came from. */
+  deepBanner: (findingId: string, title: string, parentDir: string) => string;
   noFindings: string;
   /** The verification split — the one thing that tells a reader which lines were RUN. */
   rowVerified: string;
@@ -275,6 +279,15 @@ const SEC_ZH: SecStrings = {
   rowUnassessed: "**认证要求未评估**",
   rowNote: "已记录侦察笔记",
   rowReconRounds: (recorded, planned) => `侦察轮次（决定了本次能看到什么）`,
+  rowDeepSeed: "种子上下文（来自父发现的记录，不是一次侦察）",
+  deepBanner: (findingId, title, parentDir) =>
+    "> **这是一次深挖运行（不是扫描）。** 全部工作围绕 `" +
+    findingId +
+    "` 这一个发现展开：" +
+    title +
+    "\n>\n> 上下文来自 `" +
+    (parentDir === "." ? "主运行" : parentDir) +
+    "` 记录的该发现，没有侦察阶段；工作清单是子问题。",
   rowVerified: "**已复现（跑过命令，结果符合跑前声明的预期）**",
   rowUnverified: "静态声明（没有跑过任何东西）",
   probesOffNote: (v, t) =>
@@ -411,6 +424,15 @@ const SEC_EN: SecStrings = {
   rowUnassessed: "**Authentication NOT assessed**",
   rowNote: "Recon note recorded",
   rowReconRounds: (recorded, planned) => `Recon rounds (what this run can see)`,
+  rowDeepSeed: "Seed context (the parent finding record, not a recon pass)",
+  deepBanner: (findingId, title, parentDir) =>
+    "> **This is a DEEP run, not a sweep.** Every round works one finding: `" +
+    findingId +
+    "` — " +
+    title +
+    "\n>\n> The context is the record `" +
+    (parentDir === "." ? "the main run" : parentDir) +
+    "` kept for it; there is no recon phase, and the work list is sub-questions.",
   rowVerified: "**Reproduced (ran, matched the pre-stated expectation)**",
   rowUnverified: "Static claims (nothing was run)",
   probesOffNote: (v, t) =>

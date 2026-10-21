@@ -1126,6 +1126,24 @@ export interface CompletionContract {
 // module (which imports this one).
 export type { ReportLanguage } from "./reportText.js";
 
+/**
+ * What a DEEP run was opened from.
+ *
+ * The parent's fields are COPIED rather than referenced: the parent run keeps running, its log can be
+ * archived or wiped, and a deep report that can no longer name what it came from is a report nobody can
+ * relate to its own attack surface. `parentDir` is what ties the two together after the fact.
+ */
+export interface SecLoopDeep {
+  /** The finding's id IN THE PARENT RUN, e.g. F-0008. */
+  findingId: string;
+  /** Its title, verbatim. */
+  title: string;
+  severity?: Severity;
+  category: string;
+  /** The parent's state dir relative to `.pi-loopsec` — `.` for the main run. */
+  parentDir: string;
+}
+
 export interface AuditLoopState {
   kind: AuditLoopKind;
   objective: string;
@@ -1154,6 +1172,16 @@ export interface AuditLoopState {
    * filter would make exactly that chain unfindable.
    */
   focus?: string[];
+  /**
+   * Present only on a DEEP run: the finding this run was opened to work on.
+   *
+   * A deep run is not a sweep. Its work list is a set of SUB-QUESTIONS (what has to be true for this
+   * finding to be exploitable, and which of those is still unknown) rather than an attack surface, its
+   * recon phase is pre-seeded instead of being spent mapping the project, and its report says which
+   * finding it came from. Everything else — the evidence bar, the depth playbook, the verification,
+   * the plateau — is the same machinery, which is why this is a field and not a mode.
+   */
+  deep?: SecLoopDeep;
   /**
    * Consecutive combination passes that handed over candidates and combined nothing.
    *

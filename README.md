@@ -45,7 +45,7 @@ Plateau: `plateau=8` (default) consecutive unproductive rounds stop the run.
 | `sec_recon` | the ONE recon pass; sets the ceiling of what the run can see |
 | `sec_surface` | enumerate the attack surface — a COORDINATE, never a claim |
 | `sec_finding` | record a finding — **must carry `file:line` or an evidence excerpt** |
-| `sec_clear` | mark an item examined and guarded. The reason must NAME the guard |
+| `sec_clear` | mark an item examined and guarded. The reason must NAME the guard, `file`+`line` must point at it |
 | `sec_dig` | hand the SAME item another bounded round |
 | `sec_reopen` | withdraw a clearance: the guard does not actually hold |
 | `sec_update` | correct a finding instead of recording a duplicate |
@@ -56,11 +56,38 @@ Plateau: `plateau=8` (default) consecutive unproductive rounds stop the run.
 /loopsec "<objective>" [maxRounds=0] [plateau=8] [focus=a,b]
 /loopsec status | pause [n] | resume [n] | stop | next
 /loopsec tree | log | report | note <text> | context <text> | notes
+/loopsec deep <F-id> [maxRounds] | deep status | deep end
 /loopsec dismiss | show | help
 ```
 
-`focus=a,b` is a PREFERENCE, not a filter: the work list favours those classes,
-and a finding found outside them is still recorded.
+`focus=a,b` is a PREFERENCE, not a filter: it REORDERS the work list (an item whose
+`categories` match is assigned before one enumerated earlier), and a finding found
+outside them is still recorded.
+
+## A DEEP run — one finding, its own folder
+
+A sweep gives a finding three rounds (`pursuitRounds`) and then never returns it.
+When that is not enough:
+
+```text
+/loopsec deep F-0008 [maxRounds]   # work ONE finding, in .pi-loopsec/deep/F-0008/
+/loopsec deep status               # sub-questions, new findings, budget
+/loopsec deep end                  # hand the project back to the sweep
+```
+
+A deep run is not a sweep with a bigger budget. Its work list is **SUB-QUESTIONS** —
+"which parameter does the guard read, and which does the handler read?" — because the
+round after the seed has to produce the *next* question. Repeating the same playbook
+for twenty rounds is what the sweep already did for three.
+
+- The sweep is **paused**, not stopped, and its log is never touched.
+- The seed is assembled **mechanically** from the parent finding's own fields. Nothing
+  the parent did not record can appear in it.
+- There is **no recon phase**: the run was opened FROM a finding, not from a map.
+- A round **in flight** blocks `deep`: the tools resolve the active run when they are
+  called, so switching mid-round would write that turn into the deep log.
+- Settings **layer**: `deep/F-0008/settings.json` overrides `.pi-loopsec/settings.json`
+  key by key, so `allowCommandProbes` is inherited rather than lost.
 
 ## State — `.pi-loopsec/`
 
@@ -70,7 +97,14 @@ and a finding found outside them is still recorded.
 | `SEC-REPORT.md` | the deliverable, regenerated every round |
 | `SEC-FINDINGS.md` | the per-round journal |
 | `OPERATOR.md` | a mirror of what the operator told the run |
-| `settings.json` | optional; `reportLanguage` (zh default), `fenceLanguage` (`c`), `pursueRounds` (the depth budget) |
+| `settings.json` | optional; `reportLanguage` (zh default), `fenceLanguage` (`c`), `pursuitRounds`, `reconRounds`, `allowCommandProbes` |
+| `active.json` | which run is live. `deep/F-0008` while a deep run owns the project, absent for the sweep |
+| `recon.md` | the recon note mirrored for re-reading (or a deep run's seed) |
+| `deep/<F-id>/` | a deep run's own `tree.jsonl`, `SEC-REPORT.md`, `recon.md`, `settings.json` |
+
+**One active run per project.** The eight tools have no idea which run they belong to —
+they resolve `active.json` — so two live runs would write into each other's log. That
+is why `deep` takes the project over instead of running beside it.
 
 **exFAT-safe:** only `appendFileSync` and `writeFileSync`. No rename, no link, no
 held descriptor. A torn last line is repaired, never silently swallowed.

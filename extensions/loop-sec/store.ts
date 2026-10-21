@@ -74,6 +74,7 @@ import {
   type RoundRecord,
   type SecFinding,
   type SecFindingPatch,
+  type SecLoopDeep,
   type SecFindingStep,
   type SecSurface,
   type SecSurfaceKind,
@@ -140,10 +141,139 @@ export function treeLogPath(projectRoot: string): string {
   return path.join(treeDir(projectRoot), TREE_LOG_NAME);
 }
 
-/** The `/loopsec` state directory and its event log. Same file format, same
- *  append-only rules — a different directory, because it is a different record. */
-export function secStateDir(projectRoot: string): string {
+// -----------------------------------------------------------------
+// WHICH RUN IS ACTIVE
+// -----------------------------------------------------------------
+
+/**
+ * The pointer file naming the run whose directory is live, relative to `.pi-loopsec`.
+ *
+ * A DEEP RUN writes to its own directory (`deep/F-0008/`) instead of the main one. There is only ONE
+ * `loadSec(projectRoot)` signature and twenty call sites, and every one of them means "the run I am
+ * working on" — so the run is resolved here, once, rather than threaded through all of them. That is
+ * also the reason there can only be ONE active run per project: the eight tools read the same
+ * pointer, so two live runs would write into each other's log.
+ */
+export const ACTIVE_RUN_NAME = "active.json";
+
+/** What the pointer says. `dir` is ALWAYS relative to `.pi-loopsec`. */
+export interface ActiveRun {
+  dir: string;
+  /** Where it came from, for `status` to explain itself: `deep F-0008`. */
+  label?: string;
+  at?: string;
+}
+
+export function secBaseDir(projectRoot: string): string {
   return path.join(projectRoot, SEC_STATE_DIR_NAME);
+}
+
+export function activeRunPath(projectRoot: string): string {
+  return path.join(secBaseDir(projectRoot), ACTIVE_RUN_NAME);
+}
+
+/**
+ * Resolve a pointer's `dir` to a real directory INSIDE `.pi-loopsec`, or null.
+ *
+ * THE POINTER FILE LIVES IN THE AUDITED PROJECT, so it is attacker-influenced in the only sense that
+ * matters here: a repository can ship a `.pi-loopsec/active.json` that points at `../../..` and the
+ * next write would land outside the project. An audit tool that can be steered by the thing it is
+ * auditing is worse than a useless one, so an absolute path, a `..` escape, or the base itself is
+ * refused rather than normalised.
+ */
+function resolveActiveDir(projectRoot: string, dir: string): string | null {
+  if (typeof dir !== "string") return null;
+  const trimmed = dir.trim();
+  if (trimmed === "" || path.isAbsolute(trimmed)) return null;
+  const base = path.resolve(secBaseDir(projectRoot));
+  const target = path.resolve(base, trimmed);
+  const rel = path.relative(base, target);
+  if (rel === "" || rel.startsWith("..") || path.isAbsolute(rel)) return null;
+  return target;
+}
+
+/**
+ * The pointer, if it is well-formed AND its directory exists.
+ *
+ * The existence check is what makes a stale pointer harmless: a deep run whose directory was deleted
+ * (or an operator who removed it by hand) falls back to the main run instead of silently starting a
+ * fresh empty one under the same name.
+ */
+export function readActiveRun(projectRoot: string): ActiveRun | null {
+  const file = activeRunPath(projectRoot);
+  let raw: string;
+  try {
+    if (!fs.existsSync(file)) return null;
+    raw = fs.readFileSync(file, "utf-8");
+  } catch {
+    return null;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== "object") return null;
+  const o = parsed as Record<string, unknown>;
+  const dir = typeof o.dir === "string" ? o.dir : "";
+  const resolved = resolveActiveDir(projectRoot, dir);
+  if (!resolved || !fs.existsSync(resolved)) return null;
+  return {
+    dir: dir.trim(),
+    ...(typeof o.label === "string" && o.label ? { label: o.label } : {}),
+    ...(typeof o.at === "string" && o.at ? { at: o.at } : {}),
+  };
+}
+
+/**
+ * Point the project at another run's directory, or back at the main one with `null`.
+ *
+ * `null` is written as `{"dir": null}` rather than deleting the pointer: nothing in a state directory
+ * is ever removed by this module (the append-only rule), and an absent `dir` already reads as "the main
+ * run", so the delete bought nothing and cost a destructive operation on the audit record.
+ *
+ * Refuses a directory that does not exist: setting the pointer first and creating the directory
+ * afterwards would leave a window in which every read falls back to the main run while every write
+ * that already resolved the deep path lands in a directory nobody is reading.
+ */
+export function setActiveRun(projectRoot: string, run: ActiveRun | null): { ok: boolean; errors: string[] } {
+  const file = activeRunPath(projectRoot);
+  try {
+    if (run === null) {
+      // Nothing to do when the project never had a pointer — `.pi-loopsec` must not be created by
+      // the act of going back to a run that is already the default.
+      if (!fs.existsSync(file)) return { ok: true, errors: [] };
+      fs.writeFileSync(file, JSON.stringify({ dir: null, at: nowIso() }, null, 2) + "\n", "utf-8");
+      return { ok: true, errors: [] };
+    }
+    const resolved = resolveActiveDir(projectRoot, run.dir);
+    if (!resolved) {
+      return { ok: false, errors: [`active run dir must be a relative path inside ${SEC_STATE_DIR_NAME}: "${run.dir}"`] };
+    }
+    if (!fs.existsSync(resolved)) {
+      return { ok: false, errors: [`active run dir does not exist: ${run.dir}`] };
+    }
+    fs.mkdirSync(secBaseDir(projectRoot), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ ...run, at: run.at ?? nowIso() }, null, 2) + "\n", "utf-8");
+    return { ok: true, errors: [] };
+  } catch (error) {
+    return { ok: false, errors: [`could not write ${ACTIVE_RUN_NAME}: ${(error as Error).message}`] };
+  }
+}
+
+/**
+ * The `/loopsec` state directory and its event log. Same file format, same
+ * append-only rules — a different directory, because it is a different record.
+ *
+ * Resolves to the ACTIVE run: the main `.pi-loopsec` normally, `deep/<id>/` while a deep run owns
+ * the project. Every path in this module and in sec.ts is built from here, so the pointer is the
+ * single place that decides which run a write belongs to.
+ */
+export function secStateDir(projectRoot: string): string {
+  const active = readActiveRun(projectRoot);
+  if (!active) return secBaseDir(projectRoot);
+  return resolveActiveDir(projectRoot, active.dir) ?? secBaseDir(projectRoot);
 }
 
 export function secTreeLogPath(projectRoot: string): string {
@@ -1100,6 +1230,23 @@ function normalizeContract(value: unknown): CompletionContract | null {
   };
 }
 
+function normalizeSecLoopDeep(value: unknown): SecLoopDeep | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const o = value as Record<string, unknown>;
+  const findingId = typeof o.findingId === "string" ? o.findingId.trim() : "";
+  const category = typeof o.category === "string" ? o.category : "";
+  if (!findingId) return null;
+  return {
+    findingId,
+    title: typeof o.title === "string" ? o.title : "",
+    ...(typeof o.severity === "string" && (SEVERITIES as readonly string[]).includes(o.severity)
+      ? { severity: o.severity as SecLoopDeep["severity"] }
+      : {}),
+    category,
+    parentDir: typeof o.parentDir === "string" && o.parentDir ? o.parentDir : ".",
+  };
+}
+
 function normalizeLoopState(value: unknown): AuditLoopState | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const o = value as Record<string, unknown>;
@@ -1123,6 +1270,10 @@ function normalizeLoopState(value: unknown): AuditLoopState | null {
     ...(Array.isArray(o.focus) && o.focus.some((f) => typeof f === "string" && !!f)
       ? { focus: (o.focus as unknown[]).filter((f): f is string => typeof f === "string" && !!f) }
       : {}),
+    // THE DEEP-RUN MARKER, round-tripped through its own allowlist. Every field that governs how a
+    // round behaves has to survive this function or the run silently stops being the run it was
+    // started as — the failure this file has produced five times now.
+    ...(normalizeSecLoopDeep(o.deep) ? { deep: normalizeSecLoopDeep(o.deep)! } : {}),
     ...(typeof o.consolidationStall === "number" && Number.isFinite(o.consolidationStall) && o.consolidationStall > 0
       ? { consolidationStall: Math.max(0, Math.floor(o.consolidationStall)) }
       : {}),

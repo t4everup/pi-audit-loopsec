@@ -33,6 +33,8 @@ import {
   renderLoopStatus,
   renderWidget,
   resumeLoop,
+  startDeepRun,
+  endDeepRun,
   startLoop,
   stopLoop,
   tickLoop,
@@ -151,7 +153,10 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
   // The ONLY audit command. Contract flags died with /goal; focus survives as a
   // PREFERENCE — generation and the work list favour those classes, and a finding
   // found outside them is still recorded.
-  const verbs = ["start", "status", "pause", "resume", "stop", "cancel", "next", "tree", "log", "report", "note", "context", "notes", "dismiss", "hide", "close", "show", "config", "help"];
+  const verbs = [
+    "start", "status", "pause", "resume", "stop", "cancel", "next", "tree", "log", "report",
+    "note", "context", "notes", "dismiss", "hide", "close", "show", "config", "deep", "help",
+  ];
   const kind: AuditLoopKind = "sec";
     pi.registerCommand(loopCommandName(kind), {
       description:
@@ -181,6 +186,8 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
                       ? "list the findings (this mode has no tree)"
                       : v === "config"
                       ? "show or set project settings (allowCommandProbes, reportLanguage, …)"
+                      : v === "deep"
+                        ? "deep <F-id> [maxRounds] | deep end — work ONE finding in its own folder under .pi-loopsec/deep/"
                       : v === "start"
                         ? "start an audit, or resume the paused one if there is one"
                         : v === "dismiss"
@@ -335,6 +342,9 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
                 `  /${loopCommandName(kind)} context <text>      a standing fact, carried by EVERY round`,
                 `  /${loopCommandName(kind)} notes               what has been recorded and what has landed`,
                 `  /${loopCommandName(kind)} config [k=v]        show or set settings — allowCommandProbes gates sec_verify`,
+                `  /${loopCommandName(kind)} deep <F-id> [max]    work ONE finding in its own folder`,
+                `  /${loopCommandName(kind)} deep status         the deep run, its sub-questions, its budget`,
+                `  /${loopCommandName(kind)} deep end            leave the deep run, back to the sweep`,
                 "",
                 "The REPORT is the deliverable: findings grouped by severity, each with its",
                 "怎么打 / 调用链 / 链子分析 / 物证 — plus the surface list and what was never read.",
@@ -352,6 +362,13 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
                 "with a playbook (verify it, complete the path, follow the root cause, chain it) — and",
                 "only returns to the work list when its depth budget is spent or you close it with",
                 "`sec_update <id> pursuitClosed=\"<why>\"`.",
+                "",
+                "A DEEP RUN is for when that is not enough. A sweep gives a finding three rounds",
+                "(pursuitRounds) and then never returns it; `/loopsec deep F-0008` opens a run whose",
+                "whole job is that finding, in `.pi-loopsec/deep/F-0008/` with its own log and report.",
+                "Its work list is SUB-QUESTIONS — if one action can answer it, list it — so each round",
+                "narrows the next instead of repeating the same four moves. The sweep is paused while",
+                "it runs and its log is never touched.",
               ].join("\n"),
               "info",
             );
@@ -586,6 +603,98 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
             // command that appears to do nothing is worse than none.
             if (ctx.hasUI) ctx.ui.setWidget("hypothesis-loop", undefined, { placement: "belowEditor" });
             notify(result.message!, "info");
+            return;
+          }
+
+          // ---- DEEP: one finding, its own folder, its own report -------------------------------
+          //
+          // `/loopsec deep F-0008` opens a run whose whole job is that finding. It is a VERB rather
+          // than a second command because the eight tools resolve the ACTIVE run through
+          // `.pi-loopsec/active.json` — so a separate command name would buy no isolation, only a
+          // second set of `pause`/`status`/`report` verbs to explain. There is exactly one active
+          // run, and `deep` swaps which one that is.
+          case "deep": {
+            const snapshot = loadSec(cwd).snapshot;
+            const sub = (positional[1] ?? "").toLowerCase();
+            if (sub === "end" || sub === "back") {
+              const ended = endDeepRun(cwd);
+              if (!ended.ok) {
+                notify(ended.errors.join("; "), "warning");
+                return;
+              }
+              notify(
+                [
+                  "Left the deep run — the project is back on the sweep.",
+                  "",
+                  "The sweep is still PAUSED where `deep` left it. `/loopsec resume` to continue it,",
+                  "or `/loopsec status` to see both.",
+                ].join("\n"),
+                "info",
+              );
+              return;
+            }
+            if (sub === "status") {
+              const deep = snapshot.loop?.deep;
+              notify(
+                deep
+                  ? [
+                      `Deep run active: ${deep.findingId} · ${deep.title}`,
+                      `from ${deep.parentDir === "." ? "the main run" : deep.parentDir}`,
+                      `${snapshot.surfaces.length} sub-question(s) · ${snapshot.findings.length} new finding(s) · round ${snapshot.loop?.round ?? 0}/${snapshot.loop?.maxRounds || "∞"}`,
+                      `folder: \`.pi-loopsec/deep/${deep.findingId}/\``,
+                    ].join("\n")
+                  : "No deep run is active. `/loopsec deep F-0001` starts one from a finding of the sweep.",
+                "info",
+              );
+              return;
+            }
+            const findingId = positional[1];
+            if (!findingId) {
+              const available = snapshot.findings
+                .filter((f) => !!f.severity)
+                .slice(0, 20)
+                .map((f) => `  ${f.id}  [${f.severity}]  ${f.category}  ${clip(f.title, 70)}`)
+                .join("\n");
+              notify(
+                [
+                  "Usage: `/loopsec deep <F-id> [maxRounds]` — work ONE finding in its own folder.",
+                  "",
+                  snapshot.findings.length > 0
+                    ? `Findings of this sweep:\n${available}`
+                    : "This sweep has no findings yet. A deep run starts FROM a finding: run `/loopsec` until there is one.",
+                  "",
+                  "`/loopsec deep end` leaves the deep run and hands the project back to the sweep.",
+                ].join("\n"),
+                snapshot.findings.length > 0 ? "info" : "warning",
+              );
+              return;
+            }
+            const maxRoundsRaw = positional[2];
+            const maxRounds = maxRoundsRaw !== undefined ? Number(maxRoundsRaw) : 0;
+            if (maxRoundsRaw !== undefined && (!Number.isFinite(maxRounds) || maxRounds < 0)) {
+              notify(`maxRounds must be a number >= 0 (0 = until the plateau stops it), got "${maxRoundsRaw}"`, "warning");
+              return;
+            }
+            const started = startDeepRun(cwd, findingId.toUpperCase(), {
+              ...(maxRounds > 0 ? { maxRounds: Math.floor(maxRounds) } : {}),
+              plateauWindow: flags.plateau ? Number(flags.plateau) || undefined : undefined,
+            });
+            if (!started.ok) {
+              notify(started.errors.join("\n"), "warning");
+              return;
+            }
+            refreshWidget(ctx);
+            notify(
+              [
+                `Deep run opened: ${findingId.toUpperCase()} → \`.pi-loopsec/${started.dir}/\``,
+                "",
+                "The sweep is paused and its log is untouched. Everything from here — findings,",
+                "sub-questions, the report — lands in the new folder.",
+                "",
+                "Report: `/loopsec report` · back: `/loopsec deep end`",
+              ].join("\n"),
+              "info",
+            );
             return;
           }
 

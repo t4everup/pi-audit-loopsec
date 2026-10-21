@@ -16,9 +16,10 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { loadSec } from "../extensions/loop-sec/store.ts";
+import { loadSec, secStateDir, setActiveRun } from "../extensions/loop-sec/store.ts";
 import { DEPTH_RATIO_WINDOW, MAX_CONSECUTIVE_DEPTH, MAX_DEPTH_RATIO, depthAllowed, renderFocus } from "../extensions/loop-sec/loop.ts";
 import { evaluateRound, pauseAfterRounds, pauseLoop, resumeLoop, startLoop, stopLoop, tickLoop } from "../extensions/loop-sec/loop.ts";
+import { endDeepRun, startDeepRun } from "../extensions/loop-sec/loop.ts";
 import { loadSettings, saveSettings } from "../extensions/loop-sec/settings.ts";
 import { loopCommandName, type SecFindingStep } from "../extensions/loop-sec/types.ts";
 import {
@@ -48,6 +49,7 @@ import {
   nextPursuit,
   reconNotePath,
   reconPhaseOver,
+  reconSections,
   reconSections,
   submitSecRecon,
   verifyFinding,
@@ -114,6 +116,33 @@ function startSec(cwd: string, objective = "挖掘认证前rce漏洞", plateauWi
 }
 
 /** Recon + a small surface list, the state every analyze test starts from. */
+/**
+ * A sweep that has already recorded one exploitable finding — the state `deep` is opened FROM.
+ *
+ * The finding is deliberately POST-AUTH with a call chain and a PoC: that is the measured case, and it
+ * is the one where a sweep stops (three pursuit rounds) while a deep run has work left.
+ */
+function withSweepFinding(cwd: string): void {
+  startSec(cwd);
+  assert.equal(submitSecRecon(cwd, NOTE).ok, true);
+  recordSurface(cwd, { title: "POST /expr/parse", kind: "entrypoint", file: "src/api.py", line: 1, categories: ["rce"] });
+  recordFinding(cwd, {
+    title: "表达式注入 RCE",
+    category: "rce",
+    severity: "critical",
+    file: "src/expr.py",
+    line: 42,
+    evidence: "exec(expr)",
+    preAuth: false,
+    reasoning: "用户提交的表达式直接进 exec。",
+    path: [
+      { detail: "解析入口", file: "src/expr.py", line: 10 },
+      { detail: "拼进表达式后执行", file: "src/expr.py", line: 42 },
+    ],
+    poc: 'POST /expr/parse {"e":"..."}',
+  });
+}
+
 function withSurface(cwd: string, items = 3): void {
   startSec(cwd);
   assert.equal(submitSecRecon(cwd, NOTE).ok, true);
@@ -2714,4 +2743,172 @@ test("`unproven` appears only when probes are actually allowed", () => {
   // Never run and nothing recorded, so no depth reason at all — the finding block is bare.
   const off = renderSecReport(snapshot, snapshot.loop, { probesAllowed: false, pursuitBudget: 3 });
   assert.equal(off.includes("为什么在深挖"), false, "no probes, no unproven reason, no line");
+});
+
+// =================================================================
+// DEEP RUNS — one finding, its own folder, sub-questions instead of a sweep
+// =================================================================
+
+test("a deep run lives in its own folder and leaves the sweep's log untouched", () => {
+  const cwd = seeded();
+  withSweepFinding(cwd);
+  const before = loadSec(cwd).snapshot;
+  assert.equal(before.findings.length, 1);
+
+  const started = startDeepRun(cwd, "F-0001", { maxRounds: 20 });
+  assert.equal(started.ok, true, started.errors.join("; "));
+  assert.equal(started.dir, "deep/F-0001");
+  assert.equal(secStateDir(cwd), path.join(cwd, ".pi-loopsec", "deep", "F-0001"), "every write now resolves here");
+
+  const deep = loadSec(cwd).snapshot;
+  assert.equal(deep.findings.length, 0, "the deep run does not inherit the sweep's findings as its own");
+  assert.equal(deep.loop?.deep?.findingId, "F-0001");
+  assert.equal(deep.loop?.deep?.parentDir, ".", "the parent is named, so the two can be related later");
+});
+
+test("starting a deep run PAUSES the sweep, and ending one does not silently restart it", () => {
+  const cwd = seeded();
+  withSweepFinding(cwd);
+  assert.equal(startDeepRun(cwd, "F-0001").ok, true);
+  assert.equal(endDeepRun(cwd).ok, true);
+  const sweep = loadSec(cwd).snapshot;
+  assert.equal(sweep.loop?.status, "paused", "a loop that restarts itself spends rounds nobody asked for");
+  assert.equal(sweep.findings.length, 1, "and its record is exactly what it was");
+});
+
+test("a deep run refuses to start while a round is in flight", () => {
+  // The tools resolve the active run when they are CALLED, so switching mid-round would write that
+  // turn's findings into the deep log. This is the one way the design can corrupt a record.
+  const cwd = seeded();
+  withSweepFinding(cwd);
+  tickLoop(cwd, loadSec(cwd).snapshot); // leaves round 1 awaiting completion
+  assert.equal(loadSec(cwd).snapshot.loop?.awaitingRound, 1);
+  const refused = startDeepRun(cwd, "F-0001");
+  assert.equal(refused.ok, false);
+  assert.match(refused.errors.join(" "), /still in flight/);
+  assert.equal(secStateDir(cwd), path.join(cwd, ".pi-loopsec"), "and nothing moved");
+});
+
+test("a deep run needs a finding that exists, and says which ones do", () => {
+  const cwd = seeded();
+  withSweepFinding(cwd);
+  const missing = startDeepRun(cwd, "F-9999");
+  assert.equal(missing.ok, false);
+  assert.match(missing.errors.join(" "), /F-0001/, "the refusal lists what was actually recorded");
+});
+
+test("a deep run will not nest inside another one", () => {
+  const cwd = seeded();
+  withSweepFinding(cwd);
+  assert.equal(startDeepRun(cwd, "F-0001").ok, true);
+  const nested = startDeepRun(cwd, "F-0001");
+  assert.equal(nested.ok, false);
+  assert.match(nested.errors.join(" "), /IS a deep run/);
+});
+
+test("the deep seed is assembled from the parent's own fields, and says what it does NOT have", () => {
+  // Written mechanically, so it cannot contain anything the parent did not record: a seed that
+  // embellished would be the deep run inheriting an assertion nobody made.
+  const cwd = seeded();
+  withSweepFinding(cwd);
+  startDeepRun(cwd, "F-0001");
+  const note = loadSec(cwd).snapshot.secNote ?? "";
+  assert.match(note, /深挖目标：F-0001 · critical · rce/);
+  assert.match(note, /src\/expr\.py:42/, "the location");
+  assert.match(note, /需要已认证会话/, "the implicit gate, stated as the reason for the run");
+  assert.match(note, /2\. src\/expr\.py:42 — /, "the parent's call chain, numbered");
+  assert.match(note, /每一步都要重新对一眼源码/, "and told it is a conclusion, not evidence");
+  assert.match(note, /没有跑过任何验证命令/, "an absent verification is stated, never omitted");
+  assert.match(note, /一个子问题是一个\*\*疑问\*\*/, "and what the first round has to produce");
+});
+
+test("a deep run skips the recon phase — it was opened FROM a finding, not from a map of the project", () => {
+  const cwd = seeded();
+  withSweepFinding(cwd);
+  startDeepRun(cwd, "F-0001");
+  const ticked = tickLoop(cwd, loadSec(cwd).snapshot);
+  assert.equal(loadSec(cwd).snapshot.roundRecords.at(-1)?.kind, "surface", "round 1 is NOT recon");
+  assert.match(ticked.brief!.split("\n")[0]!, /SUB-QUESTIONS/);
+  assert.match(ticked.brief!, /A sub-question is a QUESTION THAT ONE ACTION CAN ANSWER/);
+  assert.ok(!ticked.brief!.includes("ATTACK SURFACE"), "and it does not ask for a sweep");
+});
+
+test("the deep seed does not pretend to be a recon section", () => {
+  // `submitSecRecon` numbers sections and `reconSections` counts the markers, so a seed written
+  // through it would claim a reconnaissance round that never happened.
+  const cwd = seeded();
+  withSweepFinding(cwd);
+  startDeepRun(cwd, "F-0001");
+  const snapshot = loadSec(cwd).snapshot;
+  assert.ok(!(snapshot.secNote ?? "").includes("## RECON ROUND"), "no recon-round marker");
+  assert.equal(reconSections(snapshot), 0, "so the count stays honest");
+});
+
+test("the deep report says it is a deep run, and stops reporting a recon phase it never had", () => {
+  const cwd = seeded();
+  withSweepFinding(cwd);
+  startDeepRun(cwd, "F-0001");
+  const snapshot = loadSec(cwd).snapshot;
+  const report = renderSecReport(snapshot, snapshot.loop);
+  assert.match(report, /这是一次深挖运行（不是扫描）/);
+  assert.match(report, /F-0001/, "naming the finding it came from");
+  assert.match(report, /种子上下文/, "the seed row replaces the recon-round row");
+  assert.ok(!report.includes("侦察轮次"), "there is no recon phase to report");
+});
+
+test("sub-questions are ordinary surface items — answer one and the next is assigned", () => {
+  // This is what makes depth COMPOUND rather than repeat: answering a sub-question costs a round and
+  // narrows the next one, instead of the same four-move playbook being printed again.
+  const cwd = seeded();
+  withSweepFinding(cwd);
+  startDeepRun(cwd, "F-0001");
+  recordSurface(cwd, { title: "守卫读哪个参数？", kind: "boundary", file: "src/guard.py", line: 8 });
+  recordSurface(cwd, { title: "有没有入口跳过守卫？", kind: "entrypoint", file: "src/api.py", line: 3 });
+  assert.equal(nextOpenSurface(loadSec(cwd).snapshot)!.id, "S-0001");
+  clearSurface(cwd, "S-0001", "守卫读 request.getParameter(id)，处理器读 @RequestBody.id", {
+    file: "src/guard.py",
+    line: 8,
+  });
+  assert.equal(nextOpenSurface(loadSec(cwd).snapshot)!.id, "S-0002", "the next question is now the target");
+  const snapshot = loadSec(cwd).snapshot;
+  const report = renderSecReport(snapshot, snapshot.loop);
+  assert.match(report, /守卫位置：src\/guard\.py:8/, "and the answered question is a result in the deep report");
+});
+
+test("a deep run inherits its parent's settings and overrides only what it sets", () => {
+  // Reading only the first file that exists would silently forbid sec_verify inside every deep run —
+  // a setting nobody changed and nobody could see.
+  const cwd = seeded();
+  withSweepFinding(cwd);
+  saveSettings(cwd, { allowCommandProbes: true, pursuitRounds: 4 });
+  startDeepRun(cwd, "F-0001");
+  const deepSettings = path.join(cwd, ".pi-loopsec", "deep", "F-0001", "settings.json");
+  fs.writeFileSync(deepSettings, JSON.stringify({ reconRounds: 1 }), "utf-8");
+  const s = loadSettings(cwd).settings;
+  assert.equal(s.reconRounds, 1, "the deep layer wins");
+  assert.equal(s.allowCommandProbes, true, "and the parent's probe permission is inherited, not lost");
+  assert.equal(s.pursuitRounds, 4, "as is every other inherited value");
+});
+
+test("the active-run pointer cannot be steered outside .pi-loopsec", () => {
+  // The pointer file lives in the AUDITED project, so it is attacker-influenced: a repository that
+  // ships one pointing at `../../..` would redirect every write. An audit tool that the thing it is
+  // auditing can steer is worse than a useless one.
+  const cwd = seeded();
+  fs.mkdirSync(path.join(cwd, ".pi-loopsec"), { recursive: true });
+  for (const dir of ["../../etc", "/etc", "..", ".", "deep/../../x"]) {
+    const r = setActiveRun(cwd, { dir });
+    assert.equal(r.ok, false, `"${dir}" must be refused`);
+  }
+  assert.equal(secStateDir(cwd), path.join(cwd, ".pi-loopsec"), "and the main run stays the active one");
+});
+
+test("a stale pointer falls back to the main run instead of starting a fresh empty one", () => {
+  const cwd = seeded();
+  withSweepFinding(cwd);
+  startDeepRun(cwd, "F-0001");
+  const deepDir = path.join(cwd, ".pi-loopsec", "deep", "F-0001");
+  fs.rmSync(deepDir, { recursive: true, force: true });
+  assert.equal(secStateDir(cwd), path.join(cwd, ".pi-loopsec"), "the sweep is reachable again");
+  assert.equal(loadSec(cwd).snapshot.findings.length, 1, "with its own recorded finding");
 });

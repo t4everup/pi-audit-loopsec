@@ -50,7 +50,7 @@ import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import { SEC_STATE_DIR_NAME, appendSecEvent, loadSec, nowIso } from "./store.js";
+import { SEC_STATE_DIR_NAME, appendSecEvent, loadSec, nowIso, secStateDir } from "./store.js";
 import { type Result } from "./types.js";
 import { coverageGaps, coverageHeadline, type CoverageReport } from "./coverage.js";
 import { allowCommandProbesOf, fenceLanguageOf, loadSettings, pursuitRoundsOf, reportLanguageOf } from "./settings.js";
@@ -126,11 +126,11 @@ export const SEC_REPORT_FILE = "SEC-REPORT.md";
 export const SEC_LEDGER_FILE = "SEC-FINDINGS.md";
 
 export function secReportPath(projectRoot: string): string {
-  return path.join(projectRoot, SEC_STATE_DIR_NAME, SEC_REPORT_FILE);
+  return path.join(secStateDir(projectRoot), SEC_REPORT_FILE);
 }
 
 export function secLedgerPath(projectRoot: string): string {
-  return path.join(projectRoot, SEC_STATE_DIR_NAME, SEC_LEDGER_FILE);
+  return path.join(secStateDir(projectRoot), SEC_LEDGER_FILE);
 }
 
 // -----------------------------------------------------------------
@@ -456,7 +456,7 @@ export function verifyFinding(
 }
 
 export function reconNotePath(projectRoot: string): string {
-  return path.join(projectRoot, SEC_STATE_DIR_NAME, "recon.md");
+  return path.join(secStateDir(projectRoot), "recon.md");
 }
 
 /**
@@ -473,6 +473,36 @@ export function reconNotePath(projectRoot: string): string {
  * The floor applies to the NEW section, not to the total: "the note is 900 chars" is not a
  * reason to accept `\"also check /admin\"` as a recon round.
  */
+/**
+ * Write a deep run's SEED note.
+ *
+ * A separate function from `submitSecRecon`, not a flag on it, because the heading is the difference:
+ * `submitSecRecon` numbers its sections (`## RECON ROUND 1`) and `reconSections` counts those markers.
+ * A deep run performs NO recon pass — its note was assembled mechanically from the parent finding — and
+ * labelling it "RECON ROUND 1" would put a claim in the record that no round produced, and would make
+ * the report say the run spent a round mapping a project it was handed a target from.
+ */
+export function submitDeepSeed(projectRoot: string, note: string, at = nowIso()): Result<string> {
+  const text = (note ?? "").trim();
+  if (text.length < 200) {
+    return { ok: false, errors: [`a deep seed must be at least 200 characters (got ${text.length})`] };
+  }
+  // Append-only, like every other note: a second seed adds to the record rather than replacing the
+  // context the earlier rounds already worked from.
+  const existing = loadSec(projectRoot).snapshot.secNote;
+  const combined = existing === null ? text : `${existing}\n\n${text}`;
+  if (!appendSecEvent(projectRoot, { type: "sec_recon_submitted", at, note: combined })) {
+    return { ok: false, errors: ["the deep seed could not be written to the log"] };
+  }
+  try {
+    fs.mkdirSync(secStateDir(projectRoot), { recursive: true });
+    fs.writeFileSync(reconNotePath(projectRoot), `${combined}\n`, "utf-8");
+  } catch {
+    // The mirror is a convenience; the event is the record.
+  }
+  return { ok: true, value: combined, warnings: [] };
+}
+
 export function submitSecRecon(projectRoot: string, note: string, at = nowIso()): Result<string> {
   const text = (note ?? "").trim();
   if (text.length < 200) {
@@ -503,7 +533,7 @@ export function submitSecRecon(projectRoot: string, note: string, at = nowIso())
   // memory of it. The durable record is the event above; this file is for the model and the
   // operator, and it is rewritten rather than appended (it is a mirror, not the log).
   try {
-    fs.mkdirSync(path.join(projectRoot, SEC_STATE_DIR_NAME), { recursive: true });
+    fs.mkdirSync(secStateDir(projectRoot), { recursive: true });
     fs.writeFileSync(reconNotePath(projectRoot), `${combined}\n`, "utf-8");
   } catch {
     // The mirror is a convenience; the event is the record.
@@ -963,6 +993,10 @@ export function reconSections(snapshot: TreeSnapshot): number {
  * the plateau counts the two kinds differently.
  */
 export function reconPhaseOver(snapshot: TreeSnapshot, reconRounds: number): boolean {
+  // A DEEP RUN HAS NO RECON PHASE. It was opened FROM a finding, so the project is already mapped
+  // enough to name a target — spending its first two rounds re-mapping the project would be the
+  // sweep it exists to avoid. Its first round enumerates SUB-QUESTIONS instead.
+  if (snapshot.loop?.deep) return true;
   return reconSections(snapshot) >= reconRounds;
 }
 
@@ -1109,6 +1143,136 @@ export const PURSUIT_MIN_SEVERITY: Severity = "high";
  * it" is not "needs a session", and treating it as gated would spend depth rounds on findings whose
  * reachability was never even asserted.
  */
+// -----------------------------------------------------------------
+// DEEP RUNS — one finding, worked until it gives or the budget ends
+// -----------------------------------------------------------------
+//
+// A sweep and a deep run answer different questions. The sweep asks "what is on this project", and
+// its work list is the ATTACK SURFACE. A deep run asks "can THIS be made exploitable", and its work
+// list is a set of SUB-QUESTIONS: what has to be true for the finding to land, and which of those is
+// still unknown. Each answered sub-question narrows the next one, which is the whole difference
+// between ten rounds of progress and ten rounds of the same playbook.
+//
+// The number that made this necessary: `pursuitRounds` is 3, so a sweep gives a finding three rounds
+// over its lifetime and then `nextPursuit` never returns it again. The measured case — a critical
+// post-auth RCE that became a critical PRE-auth RCE only after the operator asked one question in
+// chat — took more than three rounds of real work (enumerate the unauthenticated entrypoints, query
+// the live DB for a usable record, question the premise, find the parameter-source confusion).
+
+/** What a deep run is FOR, in one line. Shown as the run's objective. */
+export function deepObjectiveOf(f: SecFinding): string {
+  const gates = gatesOfFinding(f);
+  const aim = gates.length > 0 ? "打开它的前提" : "推到可复现";
+  // The title is carried because the objective is what the report prints as the run's purpose, and
+  // "deepen F-0001" alone tells a later reader nothing about what was being deepened.
+  return `深挖 ${f.id} · ${aim} · ${clip(f.title, 60)}`;
+}
+
+/**
+ * The seed note a deep run starts from: what the PARENT run already established, and what is left.
+ *
+ * Written mechanically from the parent finding's own fields, so it cannot contain anything the parent
+ * did not record — a seed that embellished would be the deep run inheriting an assertion nobody made.
+ * Empty sections say so instead of being omitted: "the parent recorded no PoC" is information, and a
+ * missing section reads as "nobody looked".
+ */
+export function renderDeepSeedNote(f: SecFinding, parentDir: string): string {
+  const out: string[] = [];
+  out.push(`# 深挖目标：${f.id} · ${f.severity ?? "未定级"} · ${f.category}`);
+  out.push("");
+  out.push(
+    `本次运行不是扫描。它只做一件事：把 ${f.id}（在 ${parentDir === "." ? "主运行" : parentDir} 记录的）推到结论。`,
+  );
+  out.push("");
+  out.push("## 已知事实（来自父运行，不要重新求证）");
+  out.push("");
+  out.push(`- 标题：${f.title}`);
+  if (f.location) out.push(`- 位置：${f.location.file}:${f.location.line}`);
+  out.push(
+    `- 认证：${
+      f.preAuth === true ? "认证前可达" : f.preAuth === false ? "需要已认证会话" : "未判断（父运行没有下这个结论）"
+    }`,
+  );
+  out.push(`- 严重度：${f.severity ?? "未定级"}（这是模型自己的判断，没有任何机制校验）`);
+  out.push(`- 类别：${f.category}`);
+  if (f.surfaceId) out.push(`- 来自攻击面项：${f.surfaceId}`);
+  if (f.round) out.push(`- 父运行的第 ${f.round} 轮记录`);
+  out.push("");
+
+  if (f.reasoning && f.reasoning.trim()) {
+    out.push("## 父运行的推理（它的结论，不是你的任务）");
+    out.push("");
+    out.push(f.reasoning.trim());
+    out.push("");
+  }
+
+  if (f.path && f.path.length > 0) {
+    out.push("## 父运行的调用链");
+    out.push("");
+    f.path.forEach((step, i) => {
+      out.push(`${i + 1}. ${step.file ? `${step.file}${step.line ? `:${step.line}` : ""} — ` : ""}${step.detail}`);
+    });
+    out.push("");
+    out.push("**每一步都要重新对一眼源码。** 一份父运行写的调用链是结论，不是证据。");
+    out.push("");
+  }
+
+  const gates = gatesOfFinding(f);
+  if (gates.length > 0) {
+    out.push("## 前提（要利用它还需要什么成立）");
+    out.push("");
+    for (const g of gates) out.push(`- ${g}`);
+    out.push("");
+    out.push("这就是本次运行要打开的东西。先把每一条拆成能回答的子问题。");
+    out.push("");
+  }
+
+  out.push("## 已有的 PoC 与验证");
+  out.push("");
+  if (f.poc && f.poc.trim()) {
+    out.push("父运行记录的 PoC：");
+    out.push("");
+    out.push("```");
+    for (const l of f.poc.split("\n")) out.push(l);
+    out.push("```");
+  } else {
+    out.push("_父运行没有记录 PoC。_");
+  }
+  out.push("");
+  if (f.verification) {
+    const v = f.verification;
+    out.push(`验证：${v.confirmed ? "已复现" : "跑了，但不符合预期"} —— \`${v.command}\`（退出码 ${v.exitCode ?? "超时"}）`);
+  } else {
+    out.push("_没有跑过任何验证命令。**静态结论。**_");
+  }
+  out.push("");
+  if ((f.pursuitSpent ?? 0) > 0 || f.pursuitClosed) {
+    out.push("## 父运行追索过的角度（不要原地重跑）");
+    out.push("");
+    out.push(`已花 ${f.pursuitSpent ?? 0} 轮。${f.pursuitClosed ? `已结束：${f.pursuitClosed}` : "仍在追索中。"}`);
+    out.push("");
+  }
+
+  out.push("## 这一轮要做的（不是侦察）");
+  out.push("");
+  out.push("把「要把它变成可利用的」拆成**能回答的子问题**，每条用 `sec_surface` 记录：");
+  out.push("");
+  out.push("- 一个子问题是一个**疑问**，不是一句结论。写「守卫读的是哪个参数，处理器读的是哪个？」不是写「守卫有缺陷」。");
+  out.push("- 子问题要能**用一个动作回答**：读一个文件、跑一条查询、发一个请求。回答不了的不是子问题，是猜测。");
+  out.push("- 最便宜、最能定性的先列。**一个否掉了整条链的前提，第一轮就该问。**");
+  out.push("- 已经由父运行确认过的事实不要再列（上面「已知事实」那节），那里重复一次就浪费一轮。");
+  out.push("");
+  out.push("参考形状（不是模板，要看这个发现实际缺什么）：");
+  out.push("");
+  out.push("```");
+  out.push("门是什么，检查真的在读它吗          → 读那个守卫和那个处理器，两个参数名对得上吗");
+  out.push("有没有入口跳过了这个检查              → 列出所有到同一 sink 的路由，哪条没走守卫");
+  out.push("要利用它的那条数据，项目里存在吗      → 查种子数据/迁移/默认配置");
+  out.push("sink 的输入真的流到这里吗              → 从 source 到 sink 逐跳读");
+  out.push("```");
+  return out.join("\n");
+}
+
 export function gatesOfFinding(f: SecFinding): string[] {
   const explicit = f.blockers ?? [];
   if (explicit.length > 0) return explicit;
@@ -1414,6 +1578,55 @@ function renderSecLadder(category: string): string {
  * writes it in IS the plan — which is why the brief says so, and why the loop does not
  * re-sort it afterwards.
  */
+/**
+ * The SURFACE round of a DEEP run: enumerate SUB-QUESTIONS, not an attack surface.
+ *
+ * This is the round that makes depth compound instead of repeat. A sweep's surface is a list of places
+ * ("look here, then here"); a deep run already has its place — it has one finding — so the round after
+ * the seed has to produce the next question, and the round after that the question after that.
+ *
+ * The instruction that matters most is the third bullet: a sub-question must be answerable by ONE
+ * action. Without it the model writes "the guard may be bypassable" — which is not a question, cannot
+ * be closed, and produces rounds that end with nothing recorded.
+ */
+export function renderSecDeepQuestionBrief(snapshot: TreeSnapshot, objective: string, round: number): string {
+  const lines: string[] = [];
+  const deep = snapshot.loop?.deep;
+  lines.push(`[SEC ROUND ${round} — SUB-QUESTIONS]`);
+  lines.push("");
+  lines.push(`Objective: ${objective}`);
+  lines.push("");
+  lines.push("--- WHAT THE SWEEP ALREADY ESTABLISHED ---");
+  lines.push(snapshot.secNote ?? "(the seed note is missing — record the sub-questions from the finding itself)");
+  lines.push("--- END ---");
+  lines.push("");
+  lines.push("This run has ONE target and no attack surface to sweep. What it needs from you now is");
+  lines.push("the next questions, not a list of places.");
+  lines.push("");
+  lines.push("**A sub-question is a QUESTION THAT ONE ACTION CAN ANSWER.** Not a suspicion, not a");
+  lines.push("hypothesis about what might be wrong — a thing you can go and find out this round:");
+  lines.push("");
+  lines.push("  - \"which parameter does the guard read, and which does the handler read?\"  → read both");
+  lines.push("  - \"do any of the routes to this sink skip the check?\"  → list the routes, read the wiring");
+  lines.push("  - \"does the shipped seed data contain a record that reaches it?\"  → read the migrations");
+  lines.push("  - \"does the value survive the cast at line 88?\"  → read the cast");
+  lines.push("");
+  lines.push("  NOT \"the guard may be bypassable\" — nothing can close that, so the round ends with");
+  lines.push("  nothing recorded and the next round starts from the same place.");
+  lines.push("");
+  lines.push("Record each with `sec_surface`, one per question, and **order them by what they would");
+  lines.push("settle**: a question whose answer kills the whole path goes first, because finding out");
+  lines.push("it does not hold four rounds in is the most expensive way to learn it.");
+  lines.push("");
+  lines.push("Pass `categories` when the class is obvious. Do NOT re-list what the seed note already");
+  lines.push("records as established — every line you repeat costs a round on a question somebody");
+  lines.push("already answered.");
+  lines.push("");
+  lines.push("Aim for 4-12 questions. Fewer, sharper, answerable ones are worth more here than a");
+  lines.push("complete-sounding list nobody can finish.");
+  return lines.join("\n");
+}
+
 export function renderSecSurfaceBrief(snapshot: TreeSnapshot, objective: string, round: number): string {
   const lines: string[] = [];
   lines.push(`[SEC ROUND ${round} — SURFACE]`);
@@ -1887,6 +2100,14 @@ export function renderSecReport(
   lines.push("");
   lines.push(t.generatedFrom);
   lines.push("");
+  // A DEEP REPORT AND A SWEEP REPORT ARE OTHERWISE ALMOST IDENTICAL — same sections, same finding
+  // format — and the difference is the first thing a reader needs: this run worked ONE finding for
+  // many rounds, so "20 rounds, 1 finding" is not a thin result, it is the shape of the run.
+  const deep = loop?.deep ?? snapshot.loop?.deep;
+  if (deep) {
+    lines.push(t.deepBanner(deep.findingId, deep.title, deep.parentDir));
+    lines.push("");
+  }
   lines.push(`- **${t.objective}**: \`${snapshot.objective || loop?.objective || "(none)"}\``);
   lines.push(`- **${t.generatedAt}**: ${at}`);
   if (loop) {
@@ -1956,7 +2177,12 @@ export function renderSecReport(
   // not fit in one turn. The note itself is not printed here (it is long) — it is at
   // `.pi-loopsec/recon.md`, and a reader who wants to judge the coverage should read it.
   const sections = reconSections(snapshot);
-  if (sections > 0) {
+  if (snapshot.loop?.deep) {
+    // A DEEP RUN HAS NO RECON PHASE, and printing "0 rounds" would read as a gap where there is a
+    // different design: it was opened FROM a finding, so the context is the seed, not a pass over the
+    // project. The count would be misleading in either direction, so the row says what happened.
+    lines.push(`| ${t.rowDeepSeed} | ${snapshot.secNote ? t.yes : t.no} |`);
+  } else if (sections > 0) {
     lines.push(`| ${t.rowReconRounds} | ${sections}（\`${SEC_STATE_DIR_NAME}/recon.md\`） |`);
   }
   lines.push("");
@@ -2390,7 +2616,7 @@ export function writeSecReport(
 ): Result<string> {
   const reportPath = secReportPath(projectRoot);
   try {
-    fs.mkdirSync(path.join(projectRoot, SEC_STATE_DIR_NAME), { recursive: true });
+    fs.mkdirSync(secStateDir(projectRoot), { recursive: true });
     const text = renderSecReport(snapshot, loop, {
       ...opts,
       // Read here rather than taken from the caller, for the same reason
@@ -2456,7 +2682,7 @@ export function appendSecLedger(
   }
   body.push("");
   try {
-    fs.mkdirSync(path.join(projectRoot, SEC_STATE_DIR_NAME), { recursive: true });
+    fs.mkdirSync(secStateDir(projectRoot), { recursive: true });
     fs.appendFileSync(secLedgerPath(projectRoot), body.join("\n"), "utf-8");
     return true;
   } catch {
@@ -2493,9 +2719,14 @@ export function secRoundBrief(
   const depthBlocked = pursuitTarget !== null && opts.pursuitAllowed === false;
   if (pursuitTarget && !depthBlocked) return renderSecPursuitBrief(snapshot, objective, round, pursuitTarget, opts);
   const item = nextOpenSurface(snapshot, opts.digBudget ?? SEC_DIG_BUDGET);
+  // A DEEP RUN WITH AN EMPTY LIST IS NOT A SWEEP SHORT OF PLACES — it is a deep run that needs its
+  // next sub-questions. Same round kind, opposite instruction, so the branch lives here rather than
+  // being inferred by the loop.
   const brief = item
     ? renderSecAnalyzeBrief(snapshot, objective, round, item, opts)
-    : renderSecSurfaceBrief(snapshot, objective, round);
+    : snapshot.loop?.deep
+      ? renderSecDeepQuestionBrief(snapshot, objective, round)
+      : renderSecSurfaceBrief(snapshot, objective, round);
   // A BLOCKED DEPTH TARGET IS SAID OUT LOUD, not silently dropped. Without this line the model
   // cannot tell "there is nothing worth deepening" from "the ratio cap is holding it", and the
   // second one must not read as the first: the finding keeps its budget and comes back.

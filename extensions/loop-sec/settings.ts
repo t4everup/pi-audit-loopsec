@@ -34,7 +34,7 @@ import * as path from "node:path";
 
 import { REPORT_LANGUAGES, type ReportLanguage, isReportLanguage } from "./reportText.js";
 
-import { SEC_STATE_DIR_NAME, STATE_DIR_NAME } from "./store.js";
+import { STATE_DIR_NAME, secBaseDir, secStateDir } from "./store.js";
 
 export const SETTINGS_NAME = "settings.json";
 
@@ -224,12 +224,15 @@ export const PROBE_SKIP_DIRS_NOTE =
   "dependency, build and cache directories are skipped: they are not the audited surface, and walking them spends the file budget before the project's own code is reached";
 
 export function settingsPath(projectRoot: string): string {
-  // Priority: an EXISTING .pi-loopsec/settings.json wins; then an existing
-  // .pi-hypothesis/settings.json (a project that ran the old modes keeps its
-  // settings readable); otherwise the sec path — this extension's only writes
-  // belong beside its own state, and a settings save must not create a
-  // .pi-hypothesis/ in a project that never had one.
-  const secFile = path.join(projectRoot, SEC_STATE_DIR_NAME, SETTINGS_NAME);
+  // The WRITE target belongs to the ACTIVE run: a deep run's `config` must not rewrite the parent's
+  // file. On the main run the old precedence still holds — an EXISTING .pi-loopsec/settings.json wins,
+  // then an existing .pi-hypothesis/settings.json (a project that ran the old modes keeps its settings
+  // readable), otherwise the sec path, because this extension's only writes belong beside its own
+  // state and a settings save must not create a .pi-hypothesis/ in a project that never had one.
+  const activeDir = secStateDir(projectRoot);
+  const baseDir = secBaseDir(projectRoot);
+  if (path.resolve(activeDir) !== path.resolve(baseDir)) return path.join(activeDir, SETTINGS_NAME);
+  const secFile = path.join(baseDir, SETTINGS_NAME);
   try {
     if (fs.existsSync(secFile)) return secFile;
     const hypFile = path.join(projectRoot, STATE_DIR_NAME, SETTINGS_NAME);
@@ -238,6 +241,38 @@ export function settingsPath(projectRoot: string): string {
     /* fall through to the sec path */
   }
   return secFile;
+}
+
+/**
+ * The settings files to read, LOWEST priority first.
+ *
+ * A DEEP RUN OVERRIDES ITS PARENT, IT DOES NOT REPLACE IT. `deep/F-0008/settings.json` may set
+ * `reconRounds: 1` and must still inherit `allowCommandProbes`, the probe timeout, the output bound and
+ * the language from `.pi-loopsec/settings.json`. Reading only the first file that exists would silently
+ * forbid `sec_verify` inside every deep run — a setting nobody changed and nobody could see.
+ */
+function settingsLayers(projectRoot: string): string[] {
+  const baseDir = secBaseDir(projectRoot);
+  const activeDir = secStateDir(projectRoot);
+  const layers: string[] = [];
+  const secBase = path.join(baseDir, SETTINGS_NAME);
+  const legacy = path.join(projectRoot, STATE_DIR_NAME, SETTINGS_NAME);
+  try {
+    // `.pi-loopsec` wins over `.pi-hypothesis`; they are alternatives for the SAME layer, never stacked.
+    if (fs.existsSync(secBase)) layers.push(secBase);
+    else if (fs.existsSync(legacy)) layers.push(legacy);
+  } catch {
+    /* nothing readable — the defaults stand */
+  }
+  if (path.resolve(activeDir) !== path.resolve(baseDir)) {
+    const own = path.join(activeDir, SETTINGS_NAME);
+    try {
+      if (fs.existsSync(own)) layers.push(own);
+    } catch {
+      /* the parent layer still applies */
+    }
+  }
+  return layers;
 }
 
 export interface LoadedSettings {
@@ -308,35 +343,43 @@ export function pursuitRoundsOf(projectRoot: string): number {
 }
 
 export function loadSettings(projectRoot: string): LoadedSettings {
-  const file = settingsPath(projectRoot);
-  let text: string;
-  try {
-    if (!fs.existsSync(file)) return { settings: { ...DEFAULT_SETTINGS }, source: "defaults" };
-    text = fs.readFileSync(file, "utf-8");
-  } catch (error) {
-    return {
-      settings: { ...DEFAULT_SETTINGS },
-      source: "defaults",
-      error: error instanceof Error ? error.message : String(error),
-    };
-  }
-
-  let raw: unknown;
-  try {
-    raw = JSON.parse(text);
-  } catch (error) {
-    return {
-      settings: { ...DEFAULT_SETTINGS },
-      source: "defaults",
-      error: `settings.json is not valid JSON (${error instanceof Error ? error.message : String(error)}) — using defaults`,
-    };
-  }
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-    return { settings: { ...DEFAULT_SETTINGS }, source: "defaults", error: "settings.json must be a JSON object — using defaults" };
-  }
-
-  const o = raw as Record<string, unknown>;
+  const files = settingsLayers(projectRoot);
   const settings = { ...DEFAULT_SETTINGS };
+  let partial = false;
+  let error: string | undefined;
+  let applied = 0;
+  for (const file of files) {
+    let text: string;
+    try {
+      text = fs.readFileSync(file, "utf-8");
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+      continue;
+    }
+    let raw: unknown;
+    try {
+      raw = JSON.parse(text);
+    } catch (e) {
+      error = `${file} is not valid JSON (${e instanceof Error ? e.message : String(e)})`;
+      continue;
+    }
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      error = `${file} must be a JSON object`;
+      continue;
+    }
+    applied++;
+    if (applySettingsObject(raw as Record<string, unknown>, settings)) partial = true;
+  }
+  // A broken layer is REPORTED and the ones below it still apply: a corrupt deep-run file must not
+  // take the parent's `allowCommandProbes` down with it.
+  const withError = error ? { error } : {};
+  if (applied === 0) return { settings: { ...DEFAULT_SETTINGS }, source: "defaults", ...withError };
+  return { settings, source: partial ? "partial" : "file", ...withError };
+}
+
+/** Apply ONE settings file on top of what is already loaded. Returns true when a field was present
+ *  but unusable, so the caller can report "partial" instead of pretending it was clean. */
+function applySettingsObject(o: Record<string, unknown>, settings: HypothesisSettings): boolean {
   let partial = false;
 
   const bool = (key: keyof HypothesisSettings): void => {
@@ -383,7 +426,7 @@ export function loadSettings(projectRoot: string): LoadedSettings {
   // no longer protects the run because a re-read can still add a sentence.
   num("reconRounds", 1, 5);
 
-  return { settings, source: partial ? "partial" : "file" };
+  return partial;
 }
 
 /**
