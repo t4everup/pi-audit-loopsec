@@ -512,6 +512,8 @@ export interface StartDeepOptions {
   /** Rounds to allow. 0 = unbounded, which the plateau still bounds. */
   maxRounds?: number;
   plateauWindow?: number;
+  /** What the operator asked this run to concentrate on, in their own words. */
+  directive?: string;
   at?: string;
 }
 
@@ -591,7 +593,8 @@ export function startDeepRun(projectRoot: string, findingId: string, opts: Start
     return { ok: false, errors };
   };
 
-  const seeded = submitDeepSeed(projectRoot, renderDeepSeedNote(finding, parentDir), at);
+  const directive = (opts.directive ?? "").trim();
+  const seeded = submitDeepSeed(projectRoot, renderDeepSeedNote(finding, parentDir, directive), at);
   if (!seeded.ok) return back(seeded.errors);
 
   const deep: SecLoopDeep = {
@@ -600,6 +603,7 @@ export function startDeepRun(projectRoot: string, findingId: string, opts: Start
     ...(finding.severity ? { severity: finding.severity } : {}),
     category: finding.category,
     parentDir,
+    ...(directive ? { directive } : {}),
   };
   const started = startLoop(projectRoot, loadSec(projectRoot).snapshot, {
     kind: "sec",

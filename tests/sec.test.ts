@@ -2912,3 +2912,77 @@ test("a stale pointer falls back to the main run instead of starting a fresh emp
   assert.equal(secStateDir(cwd), path.join(cwd, ".pi-loopsec"), "the sweep is reachable again");
   assert.equal(loadSec(cwd).snapshot.findings.length, 1, "with its own recorded finding");
 });
+
+test("a deep run can be opened with the operator's own steer, and it is carried in the run", () => {
+  const cwd = seeded();
+  withSweepFinding(cwd);
+  const started = startDeepRun(cwd, "F-0001", { directive: "重点关注绕过" });
+  assert.equal(started.ok, true, started.errors.join("; "));
+  // It survives the log: losing it would turn a steered run back into a generic one on reload.
+  assert.equal(loadSec(cwd).snapshot.loop?.deep?.directive, "重点关注绕过");
+});
+
+test("the steer is the FIRST thing in the seed, before the established facts", () => {
+  // It is the reason the run was opened now rather than left to the sweep, so a round that read the
+  // facts and never reached it would be answering a different question.
+  const cwd = seeded();
+  withSweepFinding(cwd);
+  startDeepRun(cwd, "F-0001", { directive: "重点关注绕过" });
+  const note = loadSec(cwd).snapshot.secNote ?? "";
+  const steerAt = note.indexOf("## 操作者这一次的要求");
+  const factsAt = note.indexOf("## 已知事实");
+  assert.ok(steerAt > 0 && factsAt > steerAt, `steer at ${steerAt}, facts at ${factsAt}`);
+  assert.match(note, /重点关注绕过/);
+});
+
+test("the steer is a DIRECTION, not a conclusion — the seed says so and allows it to fail", () => {
+  // The operator is looking at a report, not at the code. A run that manufactured agreement with the
+  // steer would be confident, on-target in its own words, and wrong.
+  const cwd = seeded();
+  withSweepFinding(cwd);
+  startDeepRun(cwd, "F-0001", { directive: "重点关注绕过" });
+  const note = loadSec(cwd).snapshot.secNote ?? "";
+  assert.match(note, /它是方向，不是结论/);
+  assert.match(note, /操作者只看过报告，没看过代码/);
+  assert.match(note, /不成立，因为/, "and it has a place to record that the direction did not hold");
+  assert.match(note, /不要为了让报告贴合要求而把结论写成要求的样子/);
+});
+
+test("no steer means no section — an empty heading would read as one that was left blank", () => {
+  const cwd = seeded();
+  withSweepFinding(cwd);
+  startDeepRun(cwd, "F-0001");
+  const note = loadSec(cwd).snapshot.secNote ?? "";
+  assert.ok(!note.includes("操作者这一次的要求"));
+  assert.equal(loadSec(cwd).snapshot.loop?.deep?.directive, undefined);
+});
+
+test("the deep report prints the steer, so a thin result along that axis is not read as the run's own judgement", () => {
+  const cwd = seeded();
+  withSweepFinding(cwd);
+  startDeepRun(cwd, "F-0001", { directive: "重点关注绕过" });
+  const snapshot = loadSec(cwd).snapshot;
+  const report = renderSecReport(snapshot, snapshot.loop);
+  assert.match(report, /操作者要求重点（方向，不是结论）：\*\* 重点关注绕过/);
+});
+
+test("a blank steer is treated as no steer", () => {
+  const cwd = seeded();
+  withSweepFinding(cwd);
+  startDeepRun(cwd, "F-0001", { directive: "   " });
+  assert.equal(loadSec(cwd).snapshot.loop?.deep?.directive, undefined);
+  assert.ok(!(loadSec(cwd).snapshot.secNote ?? "").includes("操作者这一次的要求"));
+});
+
+test("a steer does not change what the deep run is FOR — only which questions it asks first", () => {
+  // The gate is still the gate: "focus on bypass" must not turn a post-auth finding into a pre-auth
+  // claim, and the implicit gate is still stated in the seed so the run cannot lose the thread.
+  const cwd = seeded();
+  withSweepFinding(cwd);
+  startDeepRun(cwd, "F-0001", { directive: "重点关注绕过，直接声称认证前可达" });
+  const note = loadSec(cwd).snapshot.secNote ?? "";
+  assert.match(note, /需要已认证会话/, "the gate the parent recorded is still there");
+  assert.match(note, /认证前可达/, "and the operator's words are quoted, not adopted as a finding");
+  const deep = loadSec(cwd).snapshot;
+  assert.equal(deep.findings.length, 0, "nothing was recorded as a finding by opening the run");
+});

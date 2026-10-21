@@ -56,7 +56,7 @@ Plateau: `plateau=8` (default) consecutive unproductive rounds stop the run.
 /loopsec "<objective>" [maxRounds=0] [plateau=8] [focus=a,b]
 /loopsec status | pause [n] | resume [n] | stop | next
 /loopsec tree | log | report | note <text> | context <text> | notes
-/loopsec deep <F-id> [maxRounds] | deep status | deep end
+/loopsec deep <F-id> [maxRounds] [说明…] | deep status | deep end
 /loopsec dismiss | show | help
 ```
 
@@ -70,7 +70,9 @@ A sweep gives a finding three rounds (`pursuitRounds`) and then never returns it
 When that is not enough:
 
 ```text
-/loopsec deep F-0008 [maxRounds]   # work ONE finding, in .pi-loopsec/deep/F-0008/
+/loopsec deep F-0008               # work ONE finding, in .pi-loopsec/deep/F-0008/
+/loopsec deep F-0008 30             # with a round cap
+/loopsec deep F-0008 重点关注绕过     # with the operator's own steer
 /loopsec deep status               # sub-questions, new findings, budget
 /loopsec deep end                  # hand the project back to the sweep
 ```
@@ -81,6 +83,11 @@ round after the seed has to produce the *next* question. Repeating the same play
 for twenty rounds is what the sweep already did for three.
 
 - The sweep is **paused**, not stopped, and its log is never touched.
+- A trailing sentence is the operator's **steer** (`/loopsec deep F-0008 重点关注绕过`).
+  `maxRounds`, if given, must come FIRST — the rest of the line is your words, verbatim.
+  The steer is a DIRECTION, not a conclusion: the seed tells the run that if the axis turns
+  out wrong it must say so ("按 X 方向查了，不成立，因为 …") rather than shape the finding
+  to match it. Steer later with `/loopsec context <text>`.
 - The seed is assembled **mechanically** from the parent finding's own fields. Nothing
   the parent did not record can appear in it.
 - There is **no recon phase**: the run was opened FROM a finding, not from a map.

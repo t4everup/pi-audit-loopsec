@@ -187,7 +187,7 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
                       : v === "config"
                       ? "show or set project settings (allowCommandProbes, reportLanguage, …)"
                       : v === "deep"
-                        ? "deep <F-id> [maxRounds] | deep end — work ONE finding in its own folder under .pi-loopsec/deep/"
+                        ? "deep <F-id> [maxRounds] [说明] | deep end — work ONE finding in its own folder under .pi-loopsec/deep/"
                       : v === "start"
                         ? "start an audit, or resume the paused one if there is one"
                         : v === "dismiss"
@@ -342,7 +342,7 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
                 `  /${loopCommandName(kind)} context <text>      a standing fact, carried by EVERY round`,
                 `  /${loopCommandName(kind)} notes               what has been recorded and what has landed`,
                 `  /${loopCommandName(kind)} config [k=v]        show or set settings — allowCommandProbes gates sec_verify`,
-                `  /${loopCommandName(kind)} deep <F-id> [max]    work ONE finding in its own folder`,
+                `  /${loopCommandName(kind)} deep <F-id> [max] [说明]  work ONE finding in its own folder`,
                 `  /${loopCommandName(kind)} deep status         the deep run, its sub-questions, its budget`,
                 `  /${loopCommandName(kind)} deep end            leave the deep run, back to the sweep`,
                 "",
@@ -640,6 +640,7 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
                   ? [
                       `Deep run active: ${deep.findingId} · ${deep.title}`,
                       `from ${deep.parentDir === "." ? "the main run" : deep.parentDir}`,
+                      ...(deep.directive ? [`重点（操作者）：${deep.directive}`] : []),
                       `${snapshot.surfaces.length} sub-question(s) · ${snapshot.findings.length} new finding(s) · round ${snapshot.loop?.round ?? 0}/${snapshot.loop?.maxRounds || "∞"}`,
                       `folder: \`.pi-loopsec/deep/${deep.findingId}/\``,
                     ].join("\n")
@@ -657,7 +658,12 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
                 .join("\n");
               notify(
                 [
-                  "Usage: `/loopsec deep <F-id> [maxRounds]` — work ONE finding in its own folder.",
+                  "Usage: `/loopsec deep <F-id> [maxRounds] [说明…]` — work ONE finding in its own folder.",
+                  "",
+                  "  /loopsec deep F-0008                  work it, open-ended",
+                  "  /loopsec deep F-0008 30               30 rounds max",
+                  "  /loopsec deep F-0008 重点关注绕过       steer it; maxRounds must come FIRST",
+                  "  /loopsec deep F-0008 30 重点关注绕过    both",
                   "",
                   snapshot.findings.length > 0
                     ? `Findings of this sweep:\n${available}`
@@ -669,14 +675,18 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
               );
               return;
             }
-            const maxRoundsRaw = positional[2];
-            const maxRounds = maxRoundsRaw !== undefined ? Number(maxRoundsRaw) : 0;
-            if (maxRoundsRaw !== undefined && (!Number.isFinite(maxRounds) || maxRounds < 0)) {
-              notify(`maxRounds must be a number >= 0 (0 = until the plateau stops it), got "${maxRoundsRaw}"`, "warning");
-              return;
-            }
+            // THE TAIL IS THE OPERATOR'S STEER, and it has to be separable from the round cap without
+            // guessing. The rule is positional and stated in the usage: if the FIRST word after the id
+            // is a non-negative integer it is `maxRounds`, and everything after it is the directive;
+            // otherwise the whole tail is the directive. No token-sniffing for numbers later in the
+            // sentence — "重点关注绕过 30" would otherwise silently lose its words.
+            const tail = positional.slice(2).filter((p) => p !== "");
+            const looksNumeric = tail.length > 0 && /^\d+$/.test(tail[0]!);
+            const maxRounds = looksNumeric ? Number(tail[0]) : 0;
+            const directive = (looksNumeric ? tail.slice(1) : tail).join(" ").trim();
             const started = startDeepRun(cwd, findingId.toUpperCase(), {
               ...(maxRounds > 0 ? { maxRounds: Math.floor(maxRounds) } : {}),
+              ...(directive ? { directive } : {}),
               plateauWindow: flags.plateau ? Number(flags.plateau) || undefined : undefined,
             });
             if (!started.ok) {
@@ -687,6 +697,7 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
             notify(
               [
                 `Deep run opened: ${findingId.toUpperCase()} → \`.pi-loopsec/${started.dir}/\``,
+                ...(directive ? ["", `重点：${directive}`, "（已写入种子笔记，每一轮都会读到；想改就用 `/loopsec context <新方向>`。）"] : []),
                 "",
                 "The sweep is paused and its log is untouched. Everything from here — findings,",
                 "sub-questions, the report — lands in the new folder.",

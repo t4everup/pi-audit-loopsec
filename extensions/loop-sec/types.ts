@@ -1142,6 +1142,14 @@ export interface SecLoopDeep {
   category: string;
   /** The parent's state dir relative to `.pi-loopsec` — `.` for the main run. */
   parentDir: string;
+  /**
+   * What the operator asked this run to concentrate on, in their own words.
+   *
+   * Carried as a FIRST-CLASS field rather than only pasted into the seed: it is what the run was
+   * opened to do, so `deep status`, the report header and the seed all have to agree about it, and a
+   * reader has to be able to see that this deep run was STEERED rather than generic.
+   */
+  directive?: string;
 }
 
 export interface AuditLoopState {

@@ -1244,6 +1244,9 @@ function normalizeSecLoopDeep(value: unknown): SecLoopDeep | null {
       : {}),
     category,
     parentDir: typeof o.parentDir === "string" && o.parentDir ? o.parentDir : ".",
+    // The operator's steer survives the log. Losing it would turn a steered deep run back into a
+    // generic one on the next reload — silently, and with no way to tell it had happened.
+    ...(typeof o.directive === "string" && o.directive.trim() ? { directive: o.directive.trim() } : {}),
   };
 }
 

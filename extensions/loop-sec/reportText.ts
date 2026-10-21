@@ -125,6 +125,8 @@ export interface SecStrings {
   rowDeepSeed: string;
   /** The banner that says this report is a DEEP run, naming the finding it came from. */
   deepBanner: (findingId: string, title: string, parentDir: string) => string;
+  /** The operator's steer, when the deep run was opened with one. Printed under the banner. */
+  deepDirective: (text: string) => string;
   noFindings: string;
   /** The verification split — the one thing that tells a reader which lines were RUN. */
   rowVerified: string;
@@ -280,6 +282,7 @@ const SEC_ZH: SecStrings = {
   rowNote: "已记录侦察笔记",
   rowReconRounds: (recorded, planned) => `侦察轮次（决定了本次能看到什么）`,
   rowDeepSeed: "种子上下文（来自父发现的记录，不是一次侦察）",
+  deepDirective: (text) => `> **操作者要求重点（方向，不是结论）：** ${text}`,
   deepBanner: (findingId, title, parentDir) =>
     "> **这是一次深挖运行（不是扫描）。** 全部工作围绕 `" +
     findingId +
@@ -425,6 +428,7 @@ const SEC_EN: SecStrings = {
   rowNote: "Recon note recorded",
   rowReconRounds: (recorded, planned) => `Recon rounds (what this run can see)`,
   rowDeepSeed: "Seed context (the parent finding record, not a recon pass)",
+  deepDirective: (text) => `> **The operator asked for this to be the focus (a direction, not a conclusion):** ${text}`,
   deepBanner: (findingId, title, parentDir) =>
     "> **This is a DEEP run, not a sweep.** Every round works one finding: `" +
     findingId +

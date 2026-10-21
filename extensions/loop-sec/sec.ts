@@ -1176,7 +1176,7 @@ export function deepObjectiveOf(f: SecFinding): string {
  * Empty sections say so instead of being omitted: "the parent recorded no PoC" is information, and a
  * missing section reads as "nobody looked".
  */
-export function renderDeepSeedNote(f: SecFinding, parentDir: string): string {
+export function renderDeepSeedNote(f: SecFinding, parentDir: string, directive?: string): string {
   const out: string[] = [];
   out.push(`# 深挖目标：${f.id} · ${f.severity ?? "未定级"} · ${f.category}`);
   out.push("");
@@ -1184,6 +1184,25 @@ export function renderDeepSeedNote(f: SecFinding, parentDir: string): string {
     `本次运行不是扫描。它只做一件事：把 ${f.id}（在 ${parentDir === "." ? "主运行" : parentDir} 记录的）推到结论。`,
   );
   out.push("");
+  // THE OPERATOR'S STEER GOES FIRST, before even the established facts.
+  //
+  // It is the reason this run was opened NOW rather than left to the sweep, so a round that read the
+  // facts and never reached it would be answering a different question. But it is stated as a
+  // DIRECTION TO TEST, not a conclusion to confirm: the operator is looking at a report, not at the
+  // code, and a run that manufactured agreement with the steer would be the worst kind of useless —
+  // confident, on-target in its own words, and wrong.
+  if (directive && directive.trim()) {
+    out.push("## 操作者这一次的要求（优先于下面的默认形状）");
+    out.push("");
+    out.push(directive.trim());
+    out.push("");
+    out.push("把子问题往这个方向拆。但**它是方向，不是结论**：操作者只看过报告，没看过代码。");
+    out.push(
+      "如果沿着这个方向读完发现真正的缺口在别处，就在那一轮把子问题改成实际方向，并在发现里写清楚：" +
+        "「按 X 方向查了，不成立，因为 ……；真正的缺口在 Y」。**不要为了让报告贴合要求而把结论写成要求的样子。**",
+    );
+    out.push("");
+  }
   out.push("## 已知事实（来自父运行，不要重新求证）");
   out.push("");
   out.push(`- 标题：${f.title}`);
@@ -2106,6 +2125,13 @@ export function renderSecReport(
   const deep = loop?.deep ?? snapshot.loop?.deep;
   if (deep) {
     lines.push(t.deepBanner(deep.findingId, deep.title, deep.parentDir));
+    // The steer is printed because a reader of a deep report has to know whether the run chose its
+    // direction or was pointed at one — otherwise a thin result along the operator's axis reads as the
+    // run's own judgement.
+    if (deep.directive) {
+      lines.push(">");
+      lines.push(t.deepDirective(deep.directive));
+    }
     lines.push("");
   }
   lines.push(`- **${t.objective}**: \`${snapshot.objective || loop?.objective || "(none)"}\``);
