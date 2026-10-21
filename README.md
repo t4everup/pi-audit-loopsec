@@ -83,6 +83,14 @@ round after the seed has to produce the *next* question. Repeating the same play
 for twenty rounds is what the sweep already did for three.
 
 - The sweep is **paused**, not stopped, and its log is never touched.
+- `deep <F-id>` on a finding that already has a run **REOPENS** it — round, sub-questions and
+  findings kept, and resumed if it had stopped. `deep <F-id> <n>` raises a reached round cap in
+  the same act.
+- Both directions refuse while a round is **in flight**: the tools resolve the active run when
+  they are *called*, so switching either way would write that turn into the wrong log. Use
+  `/loopsec cancel` to clear it.
+- `deep end` also releases a **half-built** run (pointer set, no run state — the crash window),
+  because otherwise the project can only be recovered by deleting a file by hand.
 - A trailing sentence is the operator's **steer** (`/loopsec deep F-0008 重点关注绕过`).
   `maxRounds`, if given, must come FIRST — the rest of the line is your words, verbatim.
   The steer is a DIRECTION, not a conclusion: the seed tells the run that if the axis turns

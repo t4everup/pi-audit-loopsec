@@ -619,16 +619,27 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
             if (sub === "end" || sub === "back") {
               const ended = endDeepRun(cwd);
               if (!ended.ok) {
-                notify(ended.errors.join("; "), "warning");
+                notify(ended.errors.join("\n"), "warning");
                 return;
               }
+              refreshWidget(ctx);
               notify(
-                [
-                  "Left the deep run — the project is back on the sweep.",
-                  "",
-                  "The sweep is still PAUSED where `deep` left it. `/loopsec resume` to continue it,",
-                  "or `/loopsec status` to see both.",
-                ].join("\n"),
+                ended.released === "pointer"
+                  ? [
+                      `Released a HALF-BUILT deep run${ended.dir ? ` (${ended.dir})` : ""} — the pointer was set but that directory holds no run state.`,
+                      "",
+                      "Nothing was in it to lose, and the sweep is reachable again. A crash between creating the",
+                      `directory and writing the run's first event leaves exactly this: check \`.pi-loopsec/${ended.dir ?? "deep/*"}/\` and remove it if it is empty.`,
+                      "",
+                      "The sweep is still PAUSED. `/loopsec resume` to continue it.",
+                    ].join("\n")
+                  : [
+                      "Left the deep run — the project is back on the sweep.",
+                      "",
+                      "The sweep is still PAUSED where `deep` left it. `/loopsec resume` to continue it,",
+                      "or `/loopsec status` to see both. The deep run's log and report are kept; rerunning",
+                      "`deep` on the same finding REOPENS it at the round it stopped on.",
+                    ].join("\n"),
                 "info",
               );
               return;
@@ -694,6 +705,23 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
               return;
             }
             refreshWidget(ctx);
+            // A REOPENED RUN IS A DIFFERENT EVENT FROM A NEW ONE, and must not report "opened" — the
+            // operator would think their earlier rounds were discarded. Same rule as `start`, which
+            // separates "started" from "resumed" for the same reason.
+            if (started.resumed) {
+              notify(
+                [
+                  `Reopened the deep run on ${findingId.toUpperCase()} at round ${started.round ?? 0} — nothing reset.`,
+                  `  folder: \`.pi-loopsec/${started.dir}/\``,
+                  `  ${loadSec(cwd).snapshot.surfaces.length} sub-question(s) and ${loadSec(cwd).snapshot.findings.length} finding(s) carried over.`,
+                  "",
+                  "The sweep is paused again. To change direction: `/loopsec context <新方向>`.",
+                ].join("\n"),
+                "info",
+              );
+              runRound();
+              return;
+            }
             notify(
               [
                 `Deep run opened: ${findingId.toUpperCase()} → \`.pi-loopsec/${started.dir}/\``,
@@ -706,6 +734,11 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
               ].join("\n"),
               "info",
             );
+            // OPENING A RUN IS NOT THE SAME AS DRIVING IT. `start` ends with `runRound()`, and without
+            // it here the deep run would sit there — created, announced, and doing nothing until the
+            // operator happened to type something that makes the agent settle. A command that looks
+            // like it worked and then does nothing is the failure this whole file keeps fixing.
+            runRound();
             return;
           }
 

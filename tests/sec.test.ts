@@ -16,7 +16,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { loadSec, secStateDir, setActiveRun } from "../extensions/loop-sec/store.ts";
+import { appendSecEvent, loadSec, loadSecIn, secStateDir, setActiveRun } from "../extensions/loop-sec/store.ts";
 import { DEPTH_RATIO_WINDOW, MAX_CONSECUTIVE_DEPTH, MAX_DEPTH_RATIO, depthAllowed, renderFocus } from "../extensions/loop-sec/loop.ts";
 import { evaluateRound, pauseAfterRounds, pauseLoop, resumeLoop, startLoop, stopLoop, tickLoop } from "../extensions/loop-sec/loop.ts";
 import { endDeepRun, startDeepRun } from "../extensions/loop-sec/loop.ts";
@@ -2985,4 +2985,110 @@ test("a steer does not change what the deep run is FOR — only which questions 
   assert.match(note, /认证前可达/, "and the operator's words are quoted, not adopted as a finding");
   const deep = loadSec(cwd).snapshot;
   assert.equal(deep.findings.length, 0, "nothing was recorded as a finding by opening the run");
+});
+
+// ---- the four defects the review of `deep` found ---------------------------------------------
+
+test("deep end REFUSES while a round is in flight — the mirror of the entry guard", () => {
+  // Guarding only the way in and not the way out left the identical window: the in-flight turn's
+  // findings would land in the sweep's log instead of the deep one.
+  const cwd = seeded();
+  withSweepFinding(cwd);
+  assert.equal(startDeepRun(cwd, "F-0001").ok, true);
+  tickLoop(cwd, loadSec(cwd).snapshot);
+  assert.equal(loadSec(cwd).snapshot.loop?.awaitingRound, 1);
+
+  const refused = endDeepRun(cwd);
+  assert.equal(refused.ok, false);
+  assert.match(refused.errors.join(" "), /still in flight/);
+  assert.match(refused.errors.join(" "), /\/loopsec cancel/, "and names the way out");
+  assert.equal(secStateDir(cwd), path.join(cwd, ".pi-loopsec", "deep", "F-0001"), "the pointer did not move");
+});
+
+test("deep end RELEASES a half-built run instead of locking the project out of its own sweep", () => {
+  // `startDeepRun` points the project at the new directory before writing anything into it, so a crash
+  // in that window leaves a pointer to a run with no loop state. Insisting on `loop.deep` there made the
+  // project unrecoverable except by deleting a file by hand.
+  const cwd = seeded();
+  withSweepFinding(cwd);
+  const half = path.join(cwd, ".pi-loopsec", "deep", "F-0009");
+  fs.mkdirSync(half, { recursive: true });
+  assert.equal(setActiveRun(cwd, { dir: "deep/F-0009" }).ok, true);
+  assert.equal(loadSec(cwd).snapshot.loop, null, "a directory with no log has no run");
+  assert.equal(secStateDir(cwd), half, "and the project is pointed at it");
+
+  const released = endDeepRun(cwd);
+  assert.equal(released.ok, true, released.errors.join("; "));
+  assert.equal(released.released, "pointer", "it says WHICH kind of release it was, not that a run ended");
+  assert.equal(released.dir, "deep/F-0009", "and names the directory it abandoned");
+  assert.equal(secStateDir(cwd), path.join(cwd, ".pi-loopsec"), "the sweep is reachable again");
+  assert.equal(loadSec(cwd).snapshot.findings.length, 1, "with its record intact");
+});
+
+test("deep end on the sweep itself refuses, rather than pretending it left something", () => {
+  const cwd = seeded();
+  withSweepFinding(cwd);
+  const r = endDeepRun(cwd);
+  assert.equal(r.ok, false);
+  assert.match(r.errors.join(" "), /there is no deep run to leave/);
+});
+
+test("rerunning deep on the same finding REOPENS it and RESUMES it — round, questions and findings kept", () => {
+  // A deep run that cannot be continued is a run whose rounds are evidence nobody can build on. The old
+  // refusal told the operator to `show` it "after pointing at it" and named no way to point.
+  const cwd = seeded();
+  withSweepFinding(cwd);
+  assert.equal(startDeepRun(cwd, "F-0001").ok, true);
+  recordSurface(cwd, { title: "守卫读哪个参数？", kind: "boundary", file: "src/guard.py", line: 8 });
+  tickLoop(cwd, loadSec(cwd).snapshot);
+  assert.equal(loadSec(cwd).snapshot.loop?.round, 1);
+  // Clear the fence the way `cancel`/`stop` does; `endDeepRun` refuses while a round is in flight.
+  assert.equal(stopLoop(cwd, loadSec(cwd).snapshot, "test").ok, true);
+  assert.equal(endDeepRun(cwd).ok, true);
+
+  const reopened = startDeepRun(cwd, "F-0001");
+  assert.equal(reopened.ok, true, reopened.errors.join("; "));
+  assert.equal(reopened.resumed, true, "reported as a REOPEN, so nobody thinks their work was discarded");
+  assert.equal(reopened.round, 1, "at the round it stopped on");
+  const after = loadSec(cwd).snapshot;
+  assert.equal(after.loop?.round, 1, "nothing was reset");
+  assert.equal(after.loop?.status, "running", "and it was RESUMED — a reopened stopped run that never ticks is a lie");
+  assert.equal(after.surfaces.length, 1, "the sub-questions carried over");
+  assert.equal(after.loop?.deep?.findingId, "F-0001");
+  assert.equal(secStateDir(cwd), path.join(cwd, ".pi-loopsec", "deep", "F-0001"));
+});
+
+test("reopening with a new directive is refused, and points at the mechanism that works", () => {
+  // Two ways to steer one deep run would mean two places to look and neither of them authoritative.
+  const cwd = seeded();
+  withSweepFinding(cwd);
+  assert.equal(startDeepRun(cwd, "F-0001", { directive: "重点关注绕过" }).ok, true);
+  assert.equal(endDeepRun(cwd).ok, true);
+  const refused = startDeepRun(cwd, "F-0001", { directive: "改看参数源错位" });
+  assert.equal(refused.ok, false);
+  assert.match(refused.errors.join(" "), /\/loopsec context/, "names the verb that actually reaches every round");
+  // Read the DEEP run explicitly: the active run is the sweep again, which has no `deep` field.
+  const deep = loadSecIn(cwd, "deep/F-0001")!.snapshot.loop;
+  assert.equal(deep?.deep?.directive, "重点关注绕过", "and the original steer is untouched");
+});
+
+test("a deep directory holding another finding's run is not reopened under this name", () => {
+  const cwd = seeded();
+  withSweepFinding(cwd);
+  assert.equal(startDeepRun(cwd, "F-0001").ok, true);
+  assert.equal(endDeepRun(cwd).ok, true);
+  // Point at it and rewrite its loop state as if the directory had been copied from elsewhere.
+  assert.equal(setActiveRun(cwd, { dir: "deep/F-0001" }).ok, true);
+  const loop = loadSec(cwd).snapshot.loop!;
+  appendSecEvent(cwd, {
+    type: "loop_updated",
+    at: new Date().toISOString(),
+    loop: { ...loop, deep: { ...loop.deep!, findingId: "F-0002" } },
+  } as never);
+  assert.equal(setActiveRun(cwd, null).ok, true);
+
+  const refused = startDeepRun(cwd, "F-0001");
+  assert.equal(refused.ok, false);
+  assert.match(refused.errors.join(" "), /holds a run for F-0002/);
+  assert.equal(secStateDir(cwd), path.join(cwd, ".pi-loopsec"), "and the pointer stayed on the sweep");
 });

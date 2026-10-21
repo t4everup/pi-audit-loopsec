@@ -1756,6 +1756,20 @@ export function loadSec(projectRoot: string): LoadResult {
   return loadFrom(secTreeLogPath(projectRoot));
 }
 
+/**
+ * Load a SPECIFIC run by its directory, relative to `.pi-loopsec`.
+ *
+ * `loadSec` follows the pointer, so a run you are ABOUT to activate cannot be read through it — and
+ * `deep` has to look at an existing deep run before pointing the project at it, to decide between
+ * reopening it and creating one. Returns null for a path that escapes the state directory, the same
+ * rule as `setActiveRun` and for the same reason.
+ */
+export function loadSecIn(projectRoot: string, dir: string): LoadResult | null {
+  const resolved = resolveActiveDir(projectRoot, dir);
+  if (!resolved) return null;
+  return loadFrom(path.join(resolved, TREE_LOG_NAME));
+}
+
 function loadFrom(file: string): LoadResult {
   let text: string;
   try {

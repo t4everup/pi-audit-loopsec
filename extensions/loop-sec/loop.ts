@@ -89,7 +89,9 @@ import {
   appendSecEvent,
   load,
   loadSec,
+  loadSecIn,
   nowIso,
+  readActiveRun,
   secBaseDir,
   secStateDir,
   secTreeLogPath,
@@ -522,6 +524,10 @@ export interface StartDeepResult {
   errors: string[];
   dir?: string;
   loop?: AuditLoopState;
+  /** True when an existing deep run was REOPENED rather than created. */
+  resumed?: boolean;
+  /** The round the reopened run is on — so the operator is told where they are coming back to. */
+  round?: number;
 }
 
 export function startDeepRun(projectRoot: string, findingId: string, opts: StartDeepOptions = {}): StartDeepResult {
@@ -551,6 +557,72 @@ export function startDeepRun(projectRoot: string, findingId: string, opts: Start
       ],
     };
   }
+
+  const dir = `deep/${id}`;
+  const targetDir = path.join(secBaseDir(projectRoot), dir);
+
+  // ---- REOPEN, DO NOT REFUSE -------------------------------------------------------
+  //
+  // A deep run that cannot be continued is a run whose twenty rounds are evidence nobody can build on.
+  // The refusal this replaces told the operator to `show` it "after pointing at it" — which named no way
+  // to point, so the only way back was deleting the directory. Reopening keeps the log, the
+  // sub-questions, the findings and the round number, because that is what a second pass actually needs.
+  const existing = loadSecIn(projectRoot, dir);
+  const prior = existing?.snapshot.loop;
+  if (prior?.deep) {
+    if (prior.deep.findingId !== id) {
+      // Cannot happen through the CLI (the dir is derived from the id), but a hand-edited or copied
+      // directory would otherwise silently reopen somebody else's run under this finding's name.
+      return {
+        ok: false,
+        errors: [
+          `${SEC_STATE_DIR_NAME}/${dir}/ holds a run for ${prior.deep.findingId}, not ${id}.`,
+          "Refusing to reopen it under a different finding's name — move the directory aside to start fresh.",
+        ],
+      };
+    }
+    if (opts.directive && opts.directive.trim()) {
+      // ONE mechanism for steering a live deep run, not two. The seed section is written at creation and
+      // the note is append-only, so a second one on reopen would sit above the first and contradict it
+      // in a way neither of them records. `/loopsec context` already reaches every round.
+      return {
+        ok: false,
+        errors: [
+          `${id} is already open as a deep run at round ${prior.round ?? 0} — reopen it without a directive, or start a new run.`,
+          "To steer the ONE that exists: `/loopsec deep end`, then this again if you want to keep the log",
+          "as it stands — or just `/loopsec context <新方向>`, which every later round reads.",
+        ],
+      };
+    }
+    const pausedForResume = parentLoop
+      ? parentLoop.status === "running"
+        ? pauseLoop(projectRoot, parentSnapshot, `被深挖运行重新接管（${dir}）`, at)
+        : { ok: true, errors: [] as string[] }
+      : { ok: true, errors: [] as string[] };
+    if (!pausedForResume.ok) return { ok: false, errors: pausedForResume.errors };
+    const repointed = setActiveRun(projectRoot, { dir, label: `deep ${id}`, at });
+    if (!repointed.ok) return { ok: false, errors: repointed.errors };
+    // A RUN THAT STOPPED MUST BE RESUMED, or "reopened at round N" is a lie: `tickLoop` on a paused loop
+    // sends nothing, so the command would report success and the run would sit there. A deep run stops
+    // for the ordinary reasons — plateau, round cap, an explicit `stop` — and every one of them is
+    // recoverable by resuming. `maxRounds` is passed through so `deep F-0001 60` can RAISE a reached cap
+    // in the same act; without it, resume refuses (rightly) rather than pretending to restart.
+    if (prior.status !== "running") {
+      const resumed = resumeLoop(
+        projectRoot,
+        loadSec(projectRoot).snapshot,
+        { ...(opts.maxRounds !== undefined ? { maxRounds: opts.maxRounds } : {}) },
+        at,
+      );
+      if (!resumed.ok) {
+        setActiveRun(projectRoot, null);
+        return { ok: false, errors: [...resumed.errors, "(the pointer was put back on the sweep)"] };
+      }
+    }
+    const reopened = loadSec(projectRoot).snapshot;
+    return { ok: true, errors: [], dir, resumed: true, round: reopened.loop?.round, loop: reopened.loop ?? undefined };
+  }
+
   const finding = parentSnapshot.findings.find((f) => f.id === id);
   if (!finding) {
     const known = parentSnapshot.findings.map((f) => f.id).join(", ") || "(none recorded yet)";
@@ -558,17 +630,6 @@ export function startDeepRun(projectRoot: string, findingId: string, opts: Start
   }
 
   const parentDir = path.relative(secBaseDir(projectRoot), secStateDir(projectRoot)).split(path.sep).join("/") || ".";
-  const dir = `deep/${finding.id}`;
-  const targetDir = path.join(secBaseDir(projectRoot), dir);
-  if (fs.existsSync(path.join(targetDir, TREE_LOG_NAME))) {
-    return {
-      ok: false,
-      errors: [
-        `${SEC_STATE_DIR_NAME}/${dir}/ already holds a run.`,
-        `Read it with \`/loopsec show\` after pointing at it, or remove that directory to start over.`,
-      ],
-    };
-  }
 
   // 2. The parent stops BEFORE the pointer moves.
   const paused = parentLoop
@@ -623,13 +684,47 @@ export function startDeepRun(projectRoot: string, findingId: string, opts: Start
  * Does NOT auto-resume the sweep: the operator paused it deliberately (or `deep` did, naming this
  * run), and a loop that restarts itself is a loop that spends rounds nobody asked for.
  */
-export function endDeepRun(projectRoot: string): { ok: boolean; errors: string[]; resumed?: boolean } {
+export function endDeepRun(projectRoot: string): {
+  ok: boolean;
+  errors: string[];
+  /** `deep` = a real deep run was left; `pointer` = a half-built run was released. */
+  released?: "deep" | "pointer";
+  /** For `pointer`: which directory was abandoned, so the message can name it. */
+  dir?: string;
+} {
   const snapshot = loadSec(projectRoot).snapshot;
   const deep = snapshot.loop?.deep;
-  if (!deep) return { ok: false, errors: ["the active run is not a deep run — nothing to leave"] };
+  const pointer = readActiveRun(projectRoot);
+  const active = deep !== undefined || pointer !== null;
+  if (!active) return { ok: false, errors: ["the active run is the sweep — there is no deep run to leave"] };
+
+  // THE SAME CORRUPTION `startDeepRun` REFUSES ON THE WAY IN.
+  //
+  // A round in flight belongs to the deep run, and the eight tools resolve the active run when they are
+  // CALLED — so releasing now would send that turn's findings into the sweep's log. Guarding only the
+  // entry and not the exit was an asymmetry, not a guard: the window it leaves open is identical.
+  if (snapshot.loop?.awaitingRound !== null && snapshot.loop?.awaitingRound !== undefined) {
+    return {
+      ok: false,
+      errors: [
+        `round ${snapshot.loop.awaitingRound} of the deep run is still in flight.`,
+        "Its tools resolve the active run when they are CALLED, so releasing now would write that round's",
+        "findings into the SWEEP's log. Finish the round, or `/loopsec cancel` it and then run `deep end`.",
+      ],
+    };
+  }
+
   const pointed = setActiveRun(projectRoot, null);
   if (!pointed.ok) return { ok: false, errors: pointed.errors };
-  return { ok: true, errors: [], resumed: false };
+  if (deep) return { ok: true, errors: [], released: "deep" };
+
+  // ---- THE HALF-BUILT RUN -----------------------------------------------------
+  //
+  // `startDeepRun` creates the directory and points the project at it BEFORE writing anything into it,
+  // so a crash in that window leaves a pointer to a run with no loop state. A `deep end` that insisted
+  // on finding `loop.deep` would lock the project out of its own sweep with no way back except deleting
+  // a file by hand — the exact trap a recovery verb exists to remove.
+  return { ok: true, errors: [], released: "pointer", ...(pointer ? { dir: pointer.dir } : {}) };
 }
 
 export interface LoopControlResult {
