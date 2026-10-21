@@ -21,7 +21,7 @@ import { DEPTH_RATIO_WINDOW, MAX_CONSECUTIVE_DEPTH, MAX_DEPTH_RATIO, depthAllowe
 import { evaluateRound, pauseAfterRounds, pauseLoop, resumeLoop, startLoop, stopLoop, tickLoop } from "../extensions/loop-sec/loop.ts";
 import { endDeepRun, startDeepRun } from "../extensions/loop-sec/loop.ts";
 import { loadSettings, saveSettings } from "../extensions/loop-sec/settings.ts";
-import { parseArgs, tailAfterVerb } from "../extensions/loop-sec/index.ts";
+import { parseArgs, tailAfterVerb } from "../extensions/loop-sec/args.ts";
 import { loopCommandName, type SecFindingStep } from "../extensions/loop-sec/types.ts";
 import {
   appendSecLedger,
