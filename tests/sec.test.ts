@@ -21,6 +21,7 @@ import { DEPTH_RATIO_WINDOW, MAX_CONSECUTIVE_DEPTH, MAX_DEPTH_RATIO, depthAllowe
 import { evaluateRound, pauseAfterRounds, pauseLoop, resumeLoop, startLoop, stopLoop, tickLoop } from "../extensions/loop-sec/loop.ts";
 import { endDeepRun, startDeepRun } from "../extensions/loop-sec/loop.ts";
 import { loadSettings, saveSettings } from "../extensions/loop-sec/settings.ts";
+import { parseArgs, tailAfterVerb } from "../extensions/loop-sec/index.ts";
 import { loopCommandName, type SecFindingStep } from "../extensions/loop-sec/types.ts";
 import {
   appendSecLedger,
@@ -3091,4 +3092,70 @@ test("a deep directory holding another finding's run is not reopened under this 
   assert.equal(refused.ok, false);
   assert.match(refused.errors.join(" "), /holds a run for F-0002/);
   assert.equal(secStateDir(cwd), path.join(cwd, ".pi-loopsec"), "and the pointer stayed on the sweep");
+});
+
+// ---- the two the previous review left, plus the dangling reference they uncovered --------
+
+test("a `word=value` inside the deep directive survives — it is not eaten as a flag", () => {
+  // `parseArgs` moves `focus=rce` into `flags`, so the directive arrived as "用 这类思路": the words the
+  // operator typed were gone, silently, and the run was steered by a sentence they did not write.
+  const parsed = parseArgs('deep F-0008 用 focus=rce 这类思路');
+  assert.deepEqual(parsed.flags, { focus: "rce" }, "the flag map still parses it, for callers that want it");
+  const tail = tailAfterVerb(parsed.tokens, "deep", 1).map((t) => t.replace(/^["']|["']$/g, ""));
+  assert.deepEqual(tail, ["用", "focus=rce", "这类思路"], "and the raw tail keeps it verbatim");
+});
+
+test("the deep tail survives quotes, a number later in the sentence, and a flag before the verb", () => {
+  const run = (s: string) => {
+    const p = parseArgs(s);
+    const raw = tailAfterVerb(p.tokens, "deep", 1)
+      .map((t) => t.replace(/^["']|["']$/g, ""))
+      .filter((x) => x !== "");
+    const numeric = raw.length > 0 && /^\d+$/.test(raw[0]!);
+    return { maxRounds: numeric ? Number(raw[0]) : 0, directive: (numeric ? raw.slice(1) : raw).join(" ").trim() };
+  };
+  assert.deepEqual(run("deep F-0008 30 重点关注绕过"), { maxRounds: 30, directive: "重点关注绕过" });
+  assert.deepEqual(run('deep F-0008 重点关注 "参数源错位"'), { maxRounds: 0, directive: "重点关注 参数源错位" });
+  // `30` later in the sentence stays in the sentence: only the FIRST word can be the cap.
+  assert.deepEqual(run("deep F-0008 重点关注绕过 30"), { maxRounds: 0, directive: "重点关注绕过 30" });
+  assert.deepEqual(run("plateau=9 deep F-0008 重点方向"), { maxRounds: 0, directive: "重点方向" });
+  assert.deepEqual(run("deep F-0008"), { maxRounds: 0, directive: "" });
+});
+
+test("a deep report prints SUB-QUESTIONS, not an attack surface", () => {
+  // The same table, but the unit is different — and calling a sub-question an attack-surface item made
+  // the report describe a sweep it was not doing.
+  const cwd = seeded();
+  withSweepFinding(cwd);
+  startDeepRun(cwd, "F-0001");
+  recordSurface(cwd, { title: "守卫读哪个参数？", kind: "boundary", file: "src/guard.py", line: 8 });
+  const snapshot = loadSec(cwd).snapshot;
+  const report = renderSecReport(snapshot, snapshot.loop);
+  assert.match(report, /## 子问题/);
+  assert.ok(!report.includes("## 攻击面"), "and not the sweep heading");
+});
+
+test("a deep report does not print a never-read list — the run never claimed to sweep", () => {
+  const cwd = seeded();
+  withSweepFinding(cwd);
+  startDeepRun(cwd, "F-0001");
+  // A directory the run will never touch, so the sweep's coverage walk would report it.
+  fs.mkdirSync(path.join(cwd, "src", "untouched"), { recursive: true });
+  fs.writeFileSync(path.join(cwd, "src", "untouched", "a.c"), "int x;\n");
+  const snapshot = loadSec(cwd).snapshot;
+  const report = renderSecReport(snapshot, snapshot.loop);
+  assert.ok(!report.includes("## 未读"), "no never-read section in a deep report");
+});
+
+test("with no findings, a deep report does not point at the section it no longer prints", () => {
+  // The shared sentence ended "see the unread list below" — which a deep report does not print. A
+  // dangling reference is the same class of defect as a refusal naming a command that does not exist.
+  const cwd = seeded();
+  withSweepFinding(cwd);
+  startDeepRun(cwd, "F-0001");
+  const snapshot = loadSec(cwd).snapshot;
+  const report = renderSecReport(snapshot, snapshot.loop);
+  assert.equal(snapshot.findings.length, 0, "the deep run starts with no findings of its own");
+  assert.ok(!report.includes("见下面的「未读」"), "so the pointer must not be there");
+  assert.match(report, /本次运行只围绕它一个/, "the honest version states the limit without the pointer");
 });

@@ -63,9 +63,22 @@ import { loadSettings, saveSettings, settingsPath, DEFAULT_SETTINGS } from "./se
  * tolerate an ASSERTION as the positional argument — full of quotes, colons,
  * parentheses and arrows — and a generic CLI parser would mangle it.
  */
-export function parseArgs(input: string): { positional: string[]; flags: Record<string, string> } {
+export function parseArgs(input: string): {
+  positional: string[];
+  flags: Record<string, string>;
+  /**
+   * Every token EXACTLY as written, in order.
+   *
+   * `positional` throws the exact text of a flag away (`focus=rce` becomes key + value), so a caller
+   * that wants a free-text TAIL cannot rebuild it at all — the words are simply not there. `deep`
+   * needs exactly that: its trailing sentence is the operator's own, and must survive a
+   * `word=value` in the middle of it.
+   */
+  tokens: string[];
+} {
   const positional: string[] = [];
   const flags: Record<string, string> = {};
+  const tokens: string[] = [];
   let i = 0;
   const text = input ?? "";
 
@@ -97,18 +110,43 @@ export function parseArgs(input: string): { positional: string[]; flags: Record<
     while (i < text.length && /\s/.test(text[i]!)) i++;
     if (i >= text.length) break;
 
+    const tokenStart = i;
     // Look ahead for `key=` at the current token start.
     const keyMatch = /^([A-Za-z][A-Za-z0-9_-]*)=/.exec(text.slice(i));
     if (keyMatch) {
       const key = keyMatch[1]!;
       i += keyMatch[0].length;
       flags[key] = readToken(true);
+      tokens.push(text.slice(tokenStart, i));
       continue;
     }
     const token = readToken(false);
-    if (token) positional.push(token);
+    if (token) {
+      positional.push(token);
+      tokens.push(text.slice(tokenStart, i));
+    }
   }
-  return { positional, flags };
+  return { positional, flags, tokens };
+}
+
+/**
+ * The trailing free text of a command, exactly as the operator typed it.
+ *
+ * Skips up to and including the command word plus `skipAfter` further tokens (the finding id), then
+ * returns the raw tokens. Built from `tokens`, not `positional`, so a `word=value` in the sentence is
+ * not eaten as a flag and a quoted phrase keeps its words in order.
+ */
+export function tailAfterVerb(tokens: readonly string[], verb: string, skipAfter = 1): string[] {
+  const bare = (s: string): string => s.replace(/^["']|["']$/g, "");
+  let at = -1;
+  for (let k = 0; k < tokens.length; k++) {
+    if (bare(tokens[k]!).toLowerCase() === verb.toLowerCase()) {
+      at = k;
+      break;
+    }
+  }
+  if (at < 0) return [];
+  return tokens.slice(at + 1 + skipAfter);
 }
 
 /** Wrap a value in quotes for a round-trip through `parseArgs` (used in the
@@ -199,7 +237,8 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
                               : `the ${loopCommandName(kind)} ${v}`,
           })),
       handler: async (args: string, ctx: ExtensionCommandContext) => {
-        const { positional, flags } = parseArgs(args ?? "");
+        const parsed = parseArgs(args ?? "");
+        const { positional, flags } = parsed;
         const first = (positional[0] ?? "").toLowerCase();
         const verb = verbs.includes(first) ? first : null;
         const rest = verb ? positional.slice(1).join(" ").trim() : positional.join(" ").trim();
@@ -691,7 +730,14 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
             // is a non-negative integer it is `maxRounds`, and everything after it is the directive;
             // otherwise the whole tail is the directive. No token-sniffing for numbers later in the
             // sentence — "重点关注绕过 30" would otherwise silently lose its words.
-            const tail = positional.slice(2).filter((p) => p !== "");
+            //
+            // Taken from `tokens` (raw text), NOT from `positional`: `parseArgs` moves `word=value` into
+            // `flags`, so "用 focus=rce 这类思路" used to arrive here as "用 这类思路" — the words the
+            // operator typed were gone, silently, and the run was steered by a sentence they did not
+            // write.
+            const tail = tailAfterVerb(parsed.tokens, "deep", 1)
+              .map((t) => t.replace(/^["']|["']$/g, ""))
+              .filter((p) => p !== "");
             const looksNumeric = tail.length > 0 && /^\d+$/.test(tail[0]!);
             const maxRounds = looksNumeric ? Number(tail[0]) : 0;
             const directive = (looksNumeric ? tail.slice(1) : tail).join(" ").trim();

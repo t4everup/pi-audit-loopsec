@@ -128,6 +128,8 @@ export interface SecStrings {
   /** The operator's steer, when the deep run was opened with one. Printed under the banner. */
   deepDirective: (text: string) => string;
   noFindings: string;
+  /** Deep runs only: the same statement WITHOUT the pointer to the section they do not print. */
+  noFindingsDeep: string;
   /** The verification split — the one thing that tells a reader which lines were RUN. */
   rowVerified: string;
   rowUnverified: string;
@@ -147,6 +149,9 @@ export interface SecStrings {
 
   // The attack surface — the work list, and how far the run got with it.
   surfaceTitle: string;
+  /** Deep runs only: the same table, but the unit is a sub-question rather than an attack surface. */
+  questionTitle: string;
+  questionIntro: string;
   surfaceIntro: string;
   rowSurfaceTotal: string;
   rowSurfaceExamined: string;
@@ -302,6 +307,10 @@ const SEC_ZH: SecStrings = {
   verifyNotConfirmed: "**未复现** —— 跑过了，但结果**不符合**跑之前声明的预期：要么发现是错的，要么预期是错的",
   noFindings:
     "**没有记录任何发现。** 这是合法结果——一轮为了看起来有产出而编造发现，比空手而归更糟——但它**不是**项目干净的证据。见下面的「未读」。",
+  // No 「未读」 in a deep report, so the pointer to it would dangle. The honest version states the
+  // limit WITHOUT pointing at a section that does not exist: one finding was the target.
+  noFindingsDeep:
+    "**没有记录任何发现。** 这是合法结果——一轮为了看起来有产出而编造发现，比空手而归更糟——但它**不是**这条发现不成立的证据：本次运行只围绕它一个，其余部分没有按扫描方式覆盖。",
 
   coverageTitle: "## 覆盖",
   rowCited: "**被某条发现引用过的文件**",
@@ -314,6 +323,9 @@ const SEC_ZH: SecStrings = {
   coverageGapLine: (dir, files) => `- \`${dir}\` — ${files} 个文件，没有记录到任何东西`,
 
   surfaceTitle: "## 攻击面",
+  questionTitle: "## 子问题",
+  questionIntro:
+    "这次深挖拆出的子问题，以及每一条答到了哪一步。**「已确认有防护 / 已确定为假」是一个结果** —— 它把这一条从「还没查」变成了「查过，不成立」，而后者才是深挖能往下走的原因。",
   surfaceIntro:
     "这次运行枚举的攻击面，以及它每一项做到了哪一步。**「已分析并确认有防护」是一个结果** —— 它是「这部分有人看过并确认没问题」的唯一证据。",
   rowSurfaceTotal: "**攻击面上的项**",
@@ -448,6 +460,10 @@ const SEC_EN: SecStrings = {
   verifyNotConfirmed: "**NOT REPRODUCED** — it was run and did NOT match the pre-stated expectation: either the finding is wrong or the expectation was",
   noFindings:
     "**No findings were recorded.** That is a legitimate outcome — a run that invents findings to look productive is worse than one that comes back empty — but it is not evidence that the project is clean. See the unread list below.",
+  // No unread list in a deep report, so the pointer to it would dangle. The honest version states the
+  // limit WITHOUT pointing at a section that does not exist.
+  noFindingsDeep:
+    "**No findings were recorded.** That is a legitimate outcome — a run that invents findings to look productive is worse than one that comes back empty — but it is not evidence that THIS finding does not hold: the run was scoped to it alone, and nothing else was covered the way a sweep covers it.",
 
   coverageTitle: "## Coverage",
   rowCited: "**Files cited by a finding**",
@@ -460,6 +476,9 @@ const SEC_EN: SecStrings = {
   coverageGapLine: (dir, files) => `- \`${dir}\` — ${files} file(s), nothing recorded from it`,
 
   surfaceTitle: "## Attack surface",
+  questionTitle: "## Sub-questions",
+  questionIntro:
+    "What this deep run split the finding into, and how far it got with each. **\"Answered\" is a RESULT** — it is what turns \"not yet looked at\" into \"checked, it does not hold\", and that is what lets the run move on.",
   surfaceIntro:
     "What this run decided was worth looking at, and how far it got with each item. **\"Examined and guarded\" is a RESULT** — it is the only evidence that a part of the project was looked at and found sound.",
   rowSurfaceTotal: "**Items on the surface**",

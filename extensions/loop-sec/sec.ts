@@ -2236,7 +2236,7 @@ export function renderSecReport(
     lines.push("");
   }
   if (findings.length === 0) {
-    lines.push(t.noFindings);
+    lines.push(deep ? t.noFindingsDeep : t.noFindings);
     lines.push("");
   }
 
@@ -2268,13 +2268,13 @@ export function renderSecReport(
   // with no denominator reads as "this is what there is"; with one it reads as "this is
   // what was found in the part that was looked at".
   const progress = surfaceProgress(snapshot);
-  lines.push(t.surfaceTitle);
+  lines.push(deep ? t.questionTitle : t.surfaceTitle);
   lines.push("");
   if (progress.total === 0) {
     lines.push(t.surfaceNone);
     lines.push("");
   } else {
-    lines.push(t.surfaceIntro);
+    lines.push(deep ? t.questionIntro : t.surfaceIntro);
     lines.push("");
     lines.push("| | |");
     lines.push("|---|---|");
@@ -2390,7 +2390,14 @@ export function renderSecReport(
     }
     lines.push("");
   }
-  if (coverage && coverage.gaps.length > 0) {
+  // A DEEP RUN DOES NOT PRINT THE COVERAGE-GAP LIST.
+  //
+  // "These directories were never read" is a statement about a SWEEP — it answers "how much of this
+  // project did the run analyse". A deep run has one target and never claimed to read the rest, so the
+  // list is a category error: it reads as a gap where there is a different design, and on a large
+  // project it buries the single finding the report is about. The deep banner already says the run is
+  // scoped to one finding, which is the honest version of the same fact.
+  if (coverage && coverage.gaps.length > 0 && !deep) {
     lines.push(t.notReadTitle);
     lines.push("");
     lines.push(t.notReadNote);
