@@ -142,7 +142,7 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
                       : v === "config"
                       ? "show or set project settings (allowCommandProbes, reportLanguage, …)"
                       : v === "deep"
-                        ? "deep <F-id> [maxRounds] [说明] | deep end — work ONE finding in its own folder under .pi-loopsec/deep/"
+                        ? "deep <F-id> [maxRounds] [说明] | deep end — work ONE finding in its own folder under .pi-loopsec/runs/"
                       : v === "start"
                         ? "start an audit, or resume the paused one if there is one"
                         : v === "dismiss"
@@ -327,7 +327,7 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
                 `  /${loopCommandName(kind)} config [k=v]        show or set settings — allowCommandProbes gates sec_verify`,
                 `  /${loopCommandName(kind)} deep <F-id> [max] [说明]  work ONE finding in its own folder`,
                 `  /${loopCommandName(kind)} deep status         the deep run, its sub-questions, its budget`,
-                `  /${loopCommandName(kind)} deep end            leave the deep run, back to the sweep`,
+                `  /${loopCommandName(kind)} deep end            stop the deep run (the others keep running)`,
                 "",
                 "The REPORT is the deliverable: findings grouped by severity, each with its",
                 "怎么打 / 调用链 / 链子分析 / 物证 — plus the surface list and what was never read.",
@@ -354,7 +354,7 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
                 "",
                 "A DEEP RUN is for when that is not enough. A sweep gives a finding three rounds",
                 "(pursuitRounds) and then never returns it; `/loopsec deep F-0008` opens a run whose",
-                "whole job is that finding, in `.pi-loopsec/deep/F-0008/` with its own log and report.",
+                "whole job is that finding, in `.pi-loopsec/runs/secNNN-deep-F0008-<标题>/` with its own log and report.",
                 "Its work list is SUB-QUESTIONS — if one action can answer it, list it — so each round",
                 "narrows the next instead of repeating the same four moves. The sweep is paused while",
                 "it runs and its log is never touched.",
@@ -770,7 +770,7 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
                     ? `Findings of this sweep:\n${available}`
                     : "This sweep has no findings yet. A deep run starts FROM a finding: run `/loopsec` until there is one.",
                   "",
-                  "`/loopsec deep end` leaves the deep run and hands the project back to the sweep.",
+                  "`/loopsec deep end` stops the deep run. The other runs — including the sweep it came from — keep going.",
                 ].join("\n"),
                 snapshot.findings.length > 0 ? "info" : "warning",
               );
