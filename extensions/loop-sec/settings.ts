@@ -30,11 +30,12 @@
  */
 
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 
 import { REPORT_LANGUAGES, type ReportLanguage, isReportLanguage } from "./reportText.js";
 
-import { STATE_DIR_NAME, secBaseDir, secStateDir } from "./store.js";
+import { SEC_STATE_DIR_NAME, STATE_DIR_NAME, secBaseDir, secStateDir } from "./store.js";
 
 export const SETTINGS_NAME = "settings.json";
 
@@ -252,9 +253,20 @@ export function settingsPath(projectRoot: string): string {
  * forbid `sec_verify` inside every deep run — a setting nobody changed and nobody could see.
  */
 function settingsLayers(projectRoot: string): string[] {
+  // THE USER LAYER IS LOWEST PRIORITY, and it exists because three of these settings are worth
+  // setting ONCE: the probe timeout and the output cap have no safety meaning at all, and
+  // `allowCommandProbes` is an operator decision ("on this machine, the audit may execute PoCs")
+  // rather than a per-repository property. A project file still overrides it — a target that must not
+  // be probed says so locally.
+  const layers: string[] = [];
+  try {
+    const userFile = userSettingsPath();
+    if (fs.existsSync(userFile)) layers.push(userFile);
+  } catch {
+    /* no user layer — the project's own settings and the defaults still apply */
+  }
   const baseDir = secBaseDir(projectRoot);
   const activeDir = secStateDir(projectRoot);
-  const layers: string[] = [];
   const secBase = path.join(baseDir, SETTINGS_NAME);
   const legacy = path.join(projectRoot, STATE_DIR_NAME, SETTINGS_NAME);
   try {
@@ -281,6 +293,33 @@ export interface LoadedSettings {
   source: "file" | "defaults" | "partial";
   /** Present when the file exists but could not be used. */
   error?: string;
+  /**
+   * The files that were actually applied, LOWEST priority first.
+   *
+   * Carried so a caller can say WHERE a value came from. That matters for one setting above all:
+   * `allowCommandProbes` means "the audit loop may execute commands on this machine", and an operator
+   * who set it once for every project should still be able to see that this project is running on a
+   * GLOBAL consent rather than its own. A gate nobody can locate is indistinguishable from no gate.
+   */
+  layers?: string[];
+  /** Which file supplied each key — only for keys that differ between layers or come from a file. */
+  provenance?: Partial<Record<keyof HypothesisSettings, string>>;
+}
+
+/**
+ * The USER-level settings directory: one consent for every project.
+ *
+ * `PI_LOOPSC_HOME` overrides it, which exists so tests do not depend on the operator's home directory
+ * (and so a shared machine can keep the audits' consent apart).
+ */
+export function userSettingsDir(): string {
+  const override = process.env.PI_LOOPSC_HOME;
+  if (override && override.trim()) return override.trim();
+  return path.join(os.homedir(), SEC_STATE_DIR_NAME);
+}
+
+export function userSettingsPath(): string {
+  return path.join(userSettingsDir(), SETTINGS_NAME);
 }
 
 /**
@@ -345,6 +384,7 @@ export function pursuitRoundsOf(projectRoot: string): number {
 export function loadSettings(projectRoot: string): LoadedSettings {
   const files = settingsLayers(projectRoot);
   const settings = { ...DEFAULT_SETTINGS };
+  const provenance: Partial<Record<keyof HypothesisSettings, string>> = {};
   let partial = false;
   let error: string | undefined;
   let applied = 0;
@@ -368,13 +408,21 @@ export function loadSettings(projectRoot: string): LoadedSettings {
       continue;
     }
     applied++;
+    const before = { ...settings };
     if (applySettingsObject(raw as Record<string, unknown>, settings)) partial = true;
+    // Record only what this layer actually CHANGED, so provenance answers "who set this" rather than
+    // "who mentioned it". A layer repeating an inherited value is not the source of that value.
+    for (const key of Object.keys(settings) as (keyof HypothesisSettings)[]) {
+      if (settings[key] !== before[key]) provenance[key] = file;
+    }
   }
   // A broken layer is REPORTED and the ones below it still apply: a corrupt deep-run file must not
   // take the parent's `allowCommandProbes` down with it.
   const withError = error ? { error } : {};
-  if (applied === 0) return { settings: { ...DEFAULT_SETTINGS }, source: "defaults", ...withError };
-  return { settings, source: partial ? "partial" : "file", ...withError };
+  if (applied === 0) {
+    return { settings: { ...DEFAULT_SETTINGS }, source: "defaults", layers: files, ...withError };
+  }
+  return { settings, source: partial ? "partial" : "file", layers: files, provenance, ...withError };
 }
 
 /** Apply ONE settings file on top of what is already loaded. Returns true when a field was present
@@ -440,6 +488,7 @@ function applySettingsObject(o: Record<string, unknown>, settings: HypothesisSet
 export function saveSettings(
   projectRoot: string,
   patch: Partial<HypothesisSettings>,
+  opts: { global?: boolean } = {},
 ): { ok: boolean; errors: string[]; settings?: HypothesisSettings } {
   const errors: string[] = [];
   const validated: Partial<HypothesisSettings> = {};
@@ -475,7 +524,9 @@ export function saveSettings(
 
   // Re-read so unknown/extra keys already in the file are preserved verbatim.
   let existing: Record<string, unknown> = {};
-  const file = settingsPath(projectRoot);
+  // `--global` writes the USER layer, so one consent covers every project on this machine. The project
+  // file is not touched: a per-target setting the operator already made stays authoritative.
+  const file = opts.global ? userSettingsPath() : settingsPath(projectRoot);
   try {
     if (fs.existsSync(file)) {
       const parsed: unknown = JSON.parse(fs.readFileSync(file, "utf-8"));

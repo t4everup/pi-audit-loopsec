@@ -159,6 +159,10 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
         const first = (positional[0] ?? "").toLowerCase();
         const verb = verbs.includes(first) ? first : null;
         const rest = verb ? positional.slice(1).join(" ").trim() : positional.join(" ").trim();
+        // `--global` is a TARGET for the `config` verb, not a setting: without stripping it the parser
+        // would look for a setting literally named "--global".
+        const configGlobal = /(^|\s)--global(\s|$)/.test(rest);
+        const configRest = rest.replace(/(^|\s)--global(\s|$)/g, " ").trim();
         const cwd = ctx.cwd;
         const notify = (m: string, t: "info" | "warning" | "error" = "info"): void => ctx.ui.notify(m, t);
 
@@ -255,15 +259,29 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
             //
             // Commas are accepted too, because `a=1, b=2` is how a person writes two settings.
             const pairs =
-              rest === "" ? [] : rest.split(/[\s,]+/).filter((p) => p.includes("="));
+              configRest === "" ? [] : configRest.split(/[\s,]+/).filter((p) => p.includes("="));
             if (pairs.length === 0) {
-              const { settings, source } = loadSettings(cwd);
+              const { settings, source, provenance } = loadSettings(cwd);
+              const probeFrom = provenance?.allowCommandProbes;
               const live = Object.entries(DEFAULT_SETTINGS)
                 .map(([k, v]) => `  ${k} = ${JSON.stringify(settings[k as keyof typeof settings] ?? v)}${source === "defaults" ? "  (default)" : ""}`)
                 .join("\n");
               notify(
-                `Settings (source: ${source}) — set with /loopsec config key=value\n\n${live}\n\nThe one that matters for sec_verify: allowCommandProbes (default false — nothing is executed without it).`,
-                "info",
+                [
+                  `Settings (source: ${source}) — set with /loopsec config key=value, or --global for every project`,
+                  "",
+                  live,
+                  "",
+                  "The one that matters for sec_verify: allowCommandProbes (default false — nothing is executed without it).",
+                  ...(settings.allowCommandProbes
+                    ? [
+                        "",
+                        probeFrom
+                          ? `allowCommandProbes is ON, set by: ${probeFrom}`
+                          : "allowCommandProbes is ON (from the built-in default — it should not be).",
+                      ]
+                    : []),
+                ].join("\n"),
               );
               return;
             }
@@ -281,7 +299,7 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
               else if (typeof value === "string" && value !== "" && !Number.isNaN(Number(value))) value = Number(value);
               patch[key] = value;
             }
-            const saved = saveSettings(cwd, patch as never);
+            const saved = saveSettings(cwd, patch as never, { global: configGlobal });
             if (!saved.ok) {
               notify(`REJECTED: ${saved.errors.join("; ")}`, "warning");
               return;
@@ -325,6 +343,7 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
                 `  /${loopCommandName(kind)} context <text>      a standing fact, carried by EVERY round`,
                 `  /${loopCommandName(kind)} notes               what has been recorded and what has landed`,
                 `  /${loopCommandName(kind)} config [k=v]        show or set settings — allowCommandProbes gates sec_verify`,
+                `  /${loopCommandName(kind)} config --global k=v  ...and apply it to EVERY project on this machine`,
                 `  /${loopCommandName(kind)} deep <F-id> [max] [说明]  work ONE finding in its own folder`,
                 `  /${loopCommandName(kind)} deep status         the deep run, its sub-questions, its budget`,
                 `  /${loopCommandName(kind)} deep end            stop the deep run (the others keep running)`,

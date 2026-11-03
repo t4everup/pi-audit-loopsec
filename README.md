@@ -140,8 +140,35 @@ for twenty rounds is what the sweep already did for three.
 - There is **no recon phase**: the run was opened FROM a finding, not from a map.
 - A round **in flight** blocks `deep`: the tools resolve the active run when they are
   called, so switching mid-round would write that turn into the deep log.
-- Settings **layer**: `deep/F-0008/settings.json` overrides `.pi-loopsec/settings.json`
-  key by key, so `allowCommandProbes` is inherited rather than lost.
+- Settings **layer**: `runs/<run>/settings.json` overrides `.pi-loopsec/settings.json`, which
+  overrides the user layer, key by key — so `allowCommandProbes` is inherited rather than lost.
+
+## Turning probes on — once, not per project
+
+`sec_verify` runs ONE shell command per finding — **the command the model wrote** — inside the
+audited project, as you. That is the only thing here that touches anything outside the source tree,
+so it is gated by `allowCommandProbes` (default **off**; off means the report is entirely static
+claims, and says so).
+
+```text
+/loopsec config --global allowCommandProbes=true commandTimeoutMs=300000 maxOutputChars=20000
+```
+
+Layers, lowest priority first — a project file still overrides the user one, so a target that must
+not be probed says so locally:
+
+```text
+~/.pi-loopsec/settings.json                        # every project (PI_LOOPSC_HOME overrides the dir)
+<project>/.pi-loopsec/settings.json                # this project
+<project>/.pi-loopsec/runs/<run>/settings.json     # this run
+```
+
+`/loopsec config` prints **where** `allowCommandProbes` came from, so a consent inherited from the
+user layer is never silent — a gate nobody can locate is indistinguishable from no gate.
+
+The command itself is bounded (timeout + output cap from settings) and must have its `expect`
+stated BEFORE the run; `confirmed` is computed from the exit code and output, never from the
+model's opinion of what the output means.
 
 ## State — `.pi-loopsec/`
 
