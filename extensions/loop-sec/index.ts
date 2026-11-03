@@ -74,6 +74,40 @@ export { parseArgs, tailAfterVerb } from "./args.js";
 import { parseArgs, tailAfterVerb } from "./args.js";
 
 // -----------------------------------------------------------------
+// The verb list, at module scope so a test can hold it to the help text
+// -----------------------------------------------------------------
+//
+// A VERB THAT IS NOT IN THIS LIST IS NOT AN ERROR — it silently becomes the OBJECTIVE of a new run,
+// because anything the handler cannot match falls through to the start path. `/loopsec ls` therefore
+// created a run whose objective was the word "ls", which looks exactly like success. Keeping the list
+// exported lets a test assert that everything the help text advertises is actually routed.
+export const LOOP_VERBS: readonly string[] = [
+  "start",
+  "status",
+  "pause",
+  "resume",
+  "stop",
+  "cancel",
+  "next",
+  "tree",
+  "log",
+  "report",
+  "note",
+  "context",
+  "notes",
+  "dismiss",
+  "hide",
+  "close",
+  "show",
+  "config",
+  "deep",
+  "ls",
+  "runs",
+  "use",
+  "help",
+];
+
+// -----------------------------------------------------------------
 // Command surface
 // -----------------------------------------------------------------
 
@@ -109,10 +143,7 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
   // The ONLY audit command. Contract flags died with /goal; focus survives as a
   // PREFERENCE — generation and the work list favour those classes, and a finding
   // found outside them is still recorded.
-  const verbs = [
-    "start", "status", "pause", "resume", "stop", "cancel", "next", "tree", "log", "report",
-    "note", "context", "notes", "dismiss", "hide", "close", "show", "config", "deep", "help",
-  ];
+  const verbs = LOOP_VERBS;
   const kind: AuditLoopKind = "sec";
     pi.registerCommand(loopCommandName(kind), {
       description:
@@ -603,6 +634,107 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
           // `.pi-loopsec/active.json` — so a separate command name would buy no isolation, only a
           // second set of `pause`/`status`/`report` verbs to explain. There is exactly one active
           // run, and `deep` swaps which one that is.
+          // ---- LS / USE: several runs, and pointing commands at one of them --------------------
+          //
+          // Runs no longer share one directory, so "which run does `report` mean" has to be answerable
+          // and changeable. `ls` shows them in creation order with how far each got; `use` points the
+          // operator's next command at one.
+          //
+          // BOTH MUST BE IN `verbs`. A verb that is not registered falls through to the START path with
+          // its own name as the objective — `/loopsec ls` was silently creating a run whose objective was
+          // the word "ls", which is the worst kind of wrong: it looks like it worked.
+          case "ls":
+          case "runs": {
+            const runs = listRuns(cwd);
+            if (runs.length === 0) {
+              notify(
+                [
+                  "No runs in this project yet.",
+                  "",
+                  '  /loopsec "挖掘认证前漏洞"     starts one in .pi-loopsec/runs/sec001-挖掘认证前漏洞/',
+                  "  /loopsec deep F-0008        starts one that works a single finding",
+                ].join("\n"),
+                "info",
+              );
+              return;
+            }
+            const activeNow = readActiveRun(cwd);
+            const lines = [`${runs.length} run(s) under ${SEC_STATE_DIR_NAME}/${RUNS_DIR_NAME}/ (creation order):`];
+            for (const r of runs) {
+              const current = activeNow?.dir === r.dir ? "▶" : " ";
+              const state = r.status ?? "no state";
+              const round = typeof r.round === "number" ? `r${r.round}${r.maxRounds ? `/${r.maxRounds}` : ""}` : "r-";
+              const deep = r.deepOf ? `  [deep ${r.deepOf}]` : "";
+              lines.push(
+                `${current} ${r.run.padEnd(30)} ${state.padEnd(8)} ${round.padEnd(8)} ${r.findings ?? 0}F ${r.surfaces ?? 0}Q${deep}`,
+              );
+              if (r.objective) lines.push(`    ${clip(r.objective, 100)}`);
+            }
+            lines.push("");
+            lines.push("`use <name>` points your next command at one. Rounds pick their own run, so this");
+            lines.push("only changes what /loopsec status|report|note mean when you type them.");
+            notify(lines.join("\n"), "info");
+            return;
+          }
+
+          case "use": {
+            const needle = positional[1];
+            if (!needle) {
+              const runs = listRuns(cwd);
+              notify(
+                [
+                  "Usage: `/loopsec use <name>` — point your next command at one run.",
+                  "",
+                  runs.length > 0 ? runs.map((r) => `  ${r.run}`).join("\n") : "  (no runs yet)",
+                ].join("\n"),
+                runs.length > 0 ? "info" : "warning",
+              );
+              return;
+            }
+            const found = findRun(cwd, needle);
+            if (!found) {
+              // An ambiguous prefix is the case worth naming: silently picking one would send the next
+              // `report` to a run the operator did not mean.
+              const all = listRuns(cwd).filter((r) => r.run.toLowerCase().startsWith(needle.toLowerCase()));
+              notify(
+                [
+                  all.length > 1
+                    ? `"${needle}" matches ${all.length} runs — say which:`
+                    : `no run matches "${needle}".`,
+                  "",
+                  (all.length > 1 ? all : listRuns(cwd)).map((r) => `  ${r.run}`).join("\n"),
+                ].join("\n"),
+                "warning",
+              );
+              return;
+            }
+            if (readTurnClaim(cwd)) {
+              notify(
+                "A round is in flight. Its tools resolve the run when they are CALLED, so switching now would\n" +
+                  "send that round's findings to the wrong log. Wait for it to settle, or `/loopsec cancel` first.",
+                "warning",
+              );
+              return;
+            }
+            const claimedSwitch = setActiveRun(cwd, { dir: found.dir, run: found.run });
+            if (!claimedSwitch.ok) {
+              notify(claimedSwitch.errors.join("; "), "warning");
+              return;
+            }
+            refreshWidget(ctx);
+            notify(
+              [
+                `Now pointing at ${found.run}${found.status ? ` (${found.status}, round ${found.round ?? 0})` : ""}.`,
+                `  ${found.objective ? clip(found.objective, 100) : "(no objective recorded)"}`,
+                `  ${found.findings ?? 0} finding(s), ${found.surfaces ?? 0} sub-question(s)/surface item(s)`,
+                "",
+                "`status`, `report`, `note`, `pause`, `resume`, `log` now mean this run.",
+              ].join("\n"),
+              "info",
+            );
+            return;
+          }
+
           case "deep": {
             const snapshot = loadSec(cwd).snapshot;
             const sub = (positional[1] ?? "").toLowerCase();

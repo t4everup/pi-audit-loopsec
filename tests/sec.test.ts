@@ -36,6 +36,7 @@ import { evaluateRound, pauseAfterRounds, pauseLoop, resumeLoop, startLoop, stop
 import { advanceRuns, endDeepRun, parkOnSendFailure, startDeepRun } from "../extensions/loop-sec/loop.ts";
 import { loadSettings, saveSettings } from "../extensions/loop-sec/settings.ts";
 import { parseArgs, tailAfterVerb } from "../extensions/loop-sec/args.ts";
+import { LOOP_VERBS } from "../extensions/loop-sec/index.ts";
 import { loopCommandName, type SecFindingStep } from "../extensions/loop-sec/types.ts";
 import {
   appendSecLedger,
@@ -3458,4 +3459,20 @@ test("a report written without runDir still follows the claim (unchanged for sin
   const written = writeSecReport(cwd, snapshot, snapshot.loop);
   assert.equal(written.ok, true);
   assert.equal(written.value, path.join(cwd, ".pi-loopsec", "SEC-REPORT.md"));
+});
+
+test("every verb the help text advertises is actually ROUTED", () => {
+  // The failure this prevents: a verb missing from the list is not rejected — it falls through to the
+  // START path with its own name as the objective. `/loopsec ls` created a run called "ls" and looked
+  // like it had worked.
+  for (const v of ["ls", "runs", "use", "deep", "report", "status", "pause", "resume", "stop", "config"]) {
+    assert.ok(LOOP_VERBS.includes(v), `${v} must be routed, not treated as an objective`);
+  }
+  // And the reverse mistake: a verb the switch handles but the list omits is equally unroutable.
+  const src = fs.readFileSync("extensions/loop-sec/index.ts", "utf-8");
+  const handled = new Set([...src.matchAll(/case "([a-z]+)":/g)].map((m) => m[1]!));
+  for (const c of handled) {
+    if (["runs", "hide", "close"].includes(c)) continue; // aliases of a registered verb
+    assert.ok(LOOP_VERBS.includes(c), `case "${c}" exists but "${c}" is not in LOOP_VERBS`);
+  }
 });
