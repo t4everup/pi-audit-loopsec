@@ -198,7 +198,7 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
           const snapshot = loadAudit().snapshot;
           // Same pre-migration guard for the command-driven path: /loopsec next
           // or a fresh start must not scatter a legacy run's writes.
-          const legacyLog = snapshot.loop?.awaitingRound !== null && !fs.existsSync(secTreeLogPath(cwd));
+          const legacyLog = snapshot.loop?.awaitingRound != null && !fs.existsSync(secTreeLogPath(cwd));
           if (legacyLog) {
             notify(
               `This /loopsec run's log is still in .pi-hypothesis/ (pre-migration).` +
@@ -207,8 +207,20 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
             );
             return;
           }
-          const result = tickLoop(cwd, snapshot);
+          // THROUGH THE SCHEDULER, like a settle. `tickLoop` here bypassed the turn claim, so the tool
+          // calls in the turn this brief starts resolved to whatever the operator's commands pointed at —
+          // which in a several-run project is a different log. It also skipped the rotation, so `next`
+          // and the automatic first round after `start`/`deep` always fed the run that answered.
+          const advanced = advanceRuns(cwd);
           refreshWidget(ctx);
+          if (advanced.settled?.summary) notify(advanced.settled.summary.join("\n"), "info");
+          if (advanced.sent) notify(`${advanced.sent.run} · round ${advanced.sent.round}`, "info");
+          const result: TickResult = {
+            action: advanced.sent ? "sent" : "idle",
+            reason: advanced.idleReason ?? "settled",
+            ...(advanced.sent ? { round: advanced.sent.round, brief: advanced.sent.brief } : {}),
+            ...(advanced.sent?.summary ? { summary: advanced.sent.summary } : {}),
+          };
           if (result.summary) notify(result.summary.join("\n"), "info");
           if (result.brief) {
             try {
@@ -236,7 +248,15 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
             // only way to turn allowCommandProbes on was to hand-edit that file — and the
             // sec_verify refusal NAMED a command (/hypothesis config) that had been removed with the hypothesis modes,
             // which is a refusal that sends the operator to a dead end.
-            const pairs = rest === "" ? [] : rest.split(/s+/).filter((p) => p.includes("="));
+            // SPLIT ON WHITESPACE, NOT ON THE LETTER "s". This was written `/s+/` — a missing
+            // backslash — so EVERY key containing an "s" was torn in half: `allowCommandProbes=true`
+            // arrived as ["=true"], the key became the empty string, and the refusal said "unknown
+            // setting" while naming nothing. That verb is the only documented way to turn
+            // `allowCommandProbes` on, which is the consent gate for `sec_verify` itself.
+            //
+            // Commas are accepted too, because `a=1, b=2` is how a person writes two settings.
+            const pairs =
+              rest === "" ? [] : rest.split(/[\s,]+/).filter((p) => p.includes("="));
             if (pairs.length === 0) {
               const { settings, source } = loadSettings(cwd);
               const live = Object.entries(DEFAULT_SETTINGS)
@@ -251,7 +271,11 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
             const patch: Record<string, unknown> = {};
             for (const pair of pairs) {
               const eq = pair.indexOf("=");
-              const key = pair.slice(0, eq);
+              const key = pair.slice(0, eq).trim();
+              if (key === "") {
+                notify(`REJECTED: "${pair}" has no setting name before the "=" — write key=value.`, "warning");
+                return;
+              }
               let value: unknown = pair.slice(eq + 1);
               if (value === "true") value = true;
               else if (value === "false") value = false;
@@ -927,7 +951,11 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
           : loadAuditState(ctx.cwd);
         // The REPORT is the deliverable, so it is written the moment the run
         // ends — not left for the user to remember to ask for.
-        const written = writeSecReport(ctx.cwd, after, after.loop, { language: reportLanguageOf(ctx.cwd) });
+        const written = writeSecReport(ctx.cwd, after, after.loop, {
+          language: reportLanguageOf(ctx.cwd),
+          // The run that just ended, NOT the one the operator's commands point at.
+          ...(settledDir ? { runDir: settledDir } : {}),
+        });
         const reportNote = written.ok ? `\n\nReport: ${written.value}` : `\n\n(The report could not be written: ${written.errors.join("; ")})`;
         const examined = after.surfaces.filter((s) => s.status === "examined" || s.status === "cleared").length;
         const tail =

@@ -511,12 +511,28 @@ export function releaseTurnClaim(projectRoot: string): { ok: boolean; errors: st
     : { ok: false, errors: [`could not write ${ACTIVE_RUN_NAME}`] };
 }
 
-/** Is a round in flight anywhere in this project? The driver uses it as the anti-stacking fence. */
+/**
+ * Is a round in flight anywhere in this project? The driver uses it as the anti-stacking fence.
+ *
+ * A CLAIM IS ONLY LIVE IF THE RUN IT NAMES IS ACTUALLY WAITING FOR IT. The claim records a round
+ * number, and the run's own `awaitingRound` is the authority on whether that round is in flight —
+ * which makes this an exact staleness rule rather than a timeout: a claim written for round 7 whose
+ * run has already settled or been stopped is provably dead, and treating it as live would brick the
+ * project (every command would resolve to it, and `use` refuses while a claim exists).
+ *
+ * The dead claim is RELEASED, not merely ignored, so the next read does not have to reason about it.
+ */
 export function readTurnClaim(projectRoot: string): (RunRef & { round?: number }) | null {
   const claims = readClaims(projectRoot);
   if (!claims?.turn) return null;
   const resolved = resolveRunDir(projectRoot, claims.turn.dir);
   if (!resolved || !fs.existsSync(resolved)) return null;
+  const loop = loadFrom(path.join(resolved, TREE_LOG_NAME)).snapshot.loop;
+  const fenced = loop?.awaitingRound ?? null;
+  if (fenced === null || (claims.turn.round !== undefined && fenced !== claims.turn.round)) {
+    releaseTurnClaim(projectRoot);
+    return null;
+  }
   return claims.turn;
 }
 

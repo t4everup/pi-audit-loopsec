@@ -33,7 +33,7 @@ import {
 } from "../extensions/loop-sec/store.ts";
 import { DEPTH_RATIO_WINDOW, MAX_CONSECUTIVE_DEPTH, MAX_DEPTH_RATIO, depthAllowed, renderFocus } from "../extensions/loop-sec/loop.ts";
 import { evaluateRound, pauseAfterRounds, pauseLoop, resumeLoop, startLoop, stopLoop, tickLoop } from "../extensions/loop-sec/loop.ts";
-import { advanceRuns, endDeepRun, startDeepRun } from "../extensions/loop-sec/loop.ts";
+import { advanceRuns, endDeepRun, parkOnSendFailure, startDeepRun } from "../extensions/loop-sec/loop.ts";
 import { loadSettings, saveSettings } from "../extensions/loop-sec/settings.ts";
 import { parseArgs, tailAfterVerb } from "../extensions/loop-sec/args.ts";
 import { loopCommandName, type SecFindingStep } from "../extensions/loop-sec/types.ts";
@@ -3359,4 +3359,103 @@ test("`ls` finds runs by prefix, and an ambiguous prefix is not guessed at", () 
   assert.equal(findRun(cwd, "sec002")?.dir, b);
   assert.equal(findRun(cwd, "sec00"), null, "a prefix matching both is refused, not guessed");
   assert.equal(findRun(cwd, "nope"), null);
+});
+
+// =================================================================
+// REGRESSIONS for the defects found by the stability review
+// =================================================================
+
+test("`config key=value` splits on whitespace, not on the letter s", () => {
+  // The regex was `/s+/` — one missing backslash — so every key containing an "s" was torn in half.
+  // `allowCommandProbes=true` arrived as ["=true"], the key became "", and the refusal said "unknown
+  // setting" while naming nothing. That verb is the ONLY documented way to turn the consent gate for
+  // `sec_verify` on.
+  const parse = (rest: string): Record<string, unknown> => {
+    const pairs = rest === "" ? [] : rest.split(/[\s,]+/).filter((p) => p.includes("="));
+    const patch: Record<string, unknown> = {};
+    for (const pair of pairs) {
+      const eq = pair.indexOf("=");
+      const key = pair.slice(0, eq).trim();
+      let value: unknown = pair.slice(eq + 1);
+      if (value === "true") value = true;
+      else if (value === "false") value = false;
+      else if (typeof value === "string" && value !== "" && !Number.isNaN(Number(value))) value = Number(value);
+      if (key !== "") patch[key] = value;
+    }
+    return patch;
+  };
+  assert.deepEqual(parse("allowCommandProbes=true"), { allowCommandProbes: true });
+  assert.deepEqual(parse("pursuitRounds=5"), { pursuitRounds: 5 });
+  assert.deepEqual(parse("allowCommandProbes=true  pursuitRounds=4"), { allowCommandProbes: true, pursuitRounds: 4 });
+  assert.deepEqual(parse("allowCommandProbes=true, reportLanguage=en"), { allowCommandProbes: true, reportLanguage: "en" });
+  // A key is never the empty string, however the line is written.
+  assert.deepEqual(parse("=true"), {});
+});
+
+test("a turn claim whose round is no longer in flight is DEAD, and is released", () => {
+  // Without this rule an abandoned turn bricked the project: every command resolved to that run and
+  // `use` refuses while a claim exists, so nothing could point at another run.
+  const cwd = seeded();
+  const first = runIn(cwd, "挖掘认证前漏洞");
+  const advanced = advanceRuns(cwd);
+  assert.equal(advanced.sent?.dir, first);
+  assert.notEqual(readTurnClaim(cwd), null, "the round just sent is in flight");
+
+  // Stop the run underneath the claim — that is what an abandoned turn looks like.
+  assert.equal(stopLoop(cwd, loadSec(cwd).snapshot, "abandoned").ok, true);
+  assert.equal(readTurnClaim(cwd), null, "the claim is dead: no round of it is waiting");
+});
+
+test("`stop` releases the turn claim, so the operator can point at another run", () => {
+  const cwd = seeded();
+  const first = runIn(cwd, "挖掘认证前漏洞");
+  const second = runIn(cwd, "文件读取利用");
+  advanceRuns(cwd);
+  assert.notEqual(readTurnClaim(cwd), null);
+  assert.equal(stopLoop(cwd, loadSec(cwd).snapshot, "user stopped it").ok, true);
+  assert.equal(readTurnClaim(cwd), null, "a stopped run has no round in flight");
+  assert.equal(setActiveRun(cwd, { dir: second, run: second.split("/")[1]! }).ok, true, "use works again");
+  assert.equal(secStateDir(cwd), path.join(cwd, ".pi-loopsec", second));
+});
+
+test("a parked round releases its claim too", () => {
+  // A send failure leaves a round that is NOT in flight any more. Keeping the claim would make every
+  // later tool call resolve to a run whose round nobody is working on.
+  const cwd = seeded();
+  runIn(cwd, "挖掘认证前漏洞");
+  advanceRuns(cwd);
+  assert.notEqual(readTurnClaim(cwd), null);
+  assert.equal(parkOnSendFailure(cwd, "the brief could not be delivered"), true);
+  assert.equal(readTurnClaim(cwd), null, "the parked round is not in flight");
+});
+
+test("the terminal report is written into the run that ENDED, not the one commands point at", () => {
+  // `writeSecReport` is handed a snapshot of some run and resolved its path through `secStateDir` — so a
+  // report for a run that just stopped landed in whichever run the operator's commands pointed at. In a
+  // several-run project that silently overwrote another audit's deliverable.
+  const cwd = seeded();
+  const first = runIn(cwd, "挖掘认证前漏洞");
+  recordFinding(cwd, {
+    title: "只有第一个运行有的发现", category: "rce", severity: "critical", file: "a.py", line: 1, evidence: "e", preAuth: true,
+  });
+  const second = runIn(cwd, "文件读取利用");
+  // Point commands at the second run, then write the FIRST run's report explicitly.
+  assert.equal(setActiveRun(cwd, { dir: second, run: second.split("/")[1]! }).ok, true);
+  const firstSnapshot = loadSecIn(cwd, first)!.snapshot;
+  const written = writeSecReport(cwd, firstSnapshot, firstSnapshot.loop, { runDir: first });
+  assert.equal(written.ok, true, written.ok ? "" : written.errors.join("; "));
+  assert.ok(written.value!.includes(path.join("runs", "sec001")), `written to ${written.value}`);
+  const firstReport = fs.readFileSync(path.join(cwd, ".pi-loopsec", first, "SEC-REPORT.md"), "utf-8");
+  assert.match(firstReport, /只有第一个运行有的发现/, "the ended run's own report");
+  const secondReport = path.join(cwd, ".pi-loopsec", second, "SEC-REPORT.md");
+  assert.equal(fs.existsSync(secondReport), false, "and nothing was written into the other run");
+});
+
+test("a report written without runDir still follows the claim (unchanged for single-run projects)", () => {
+  const cwd = seeded();
+  withSweepFinding(cwd);
+  const snapshot = loadSec(cwd).snapshot;
+  const written = writeSecReport(cwd, snapshot, snapshot.loop);
+  assert.equal(written.ok, true);
+  assert.equal(written.value, path.join(cwd, ".pi-loopsec", "SEC-REPORT.md"));
 });

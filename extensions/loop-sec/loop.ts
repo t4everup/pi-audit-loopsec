@@ -1084,6 +1084,11 @@ export function parkOnSendFailure(projectRoot: string, reason: string, at = nowI
   // The run's own log, whichever mode it belongs to: a /loopsec run whose brief
   // could not be delivered must park in .pi-loopsec, not be invisible.
   const loop = loadSec(projectRoot).snapshot.loop ?? load(projectRoot).snapshot.loop;
+  // THE CLAIM MUST NOT OUTLIVE THE FAILED TURN. A parked round is not in flight any more, so leaving the
+  // turn claim behind would make every later tool call (and every operator command) resolve to a run
+  // whose round nobody is working on — and `use` refuses while a claim exists, so the project would be
+  // stuck on it until some later settle happened to clear it.
+  releaseTurnClaim(projectRoot);
   if (!loop) return false;
   return appendLoopEvent(projectRoot, loop.kind, { type: "loop_updated", at, loop: { ...loop, status: "paused", awaitingRound: null, pausedReason: reason, updatedAt: at } });
 }
@@ -1094,6 +1099,10 @@ export function stopLoop(projectRoot: string, snapshot: TreeSnapshot, reason: st
   if (loop.status === "stopped" || loop.status === "complete") return { ok: false, errors: [`the /${loopCommandName(loop.kind)} audit is already ${loop.status}`] };
   // `endedAt` freezes the clock. Without it a stopped loop's elapsed time would
   // keep growing every time the status was printed.
+  // A STOPPED RUN HAS NO ROUND IN FLIGHT, so its turn claim is stale by definition. Releasing it here is
+  // what makes `stop`/`cancel` an escape hatch: without it, an abandoned turn left a claim that `use`
+  // refuses to overrule, and the project could not be pointed at another run at all.
+  releaseTurnClaim(projectRoot);
   const next: AuditLoopState = { ...loop, status: "stopped", stopReason: reason, awaitingRound: null, endedAt: at };
   if (!writeLoop(projectRoot, next, at)) return { ok: false, errors: ["the loop state could not be written"] };
   return { ok: true, errors: [], loop: next, message: `Stopped at round ${loop.round} after ${formatDuration(loopTiming(next)?.activeMs ?? 0)}: ${reason}` };

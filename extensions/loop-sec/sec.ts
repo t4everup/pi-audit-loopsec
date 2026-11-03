@@ -2086,6 +2086,16 @@ export interface SecReportOptions {
   probesAllowed?: boolean;
   /** The depth budget per finding, so `已花 N/M 轮` can print the M. See settings.pursuitRounds. */
   pursuitBudget?: number;
+  /**
+   * Which run to write into, relative to `.pi-loopsec` (`.` for the legacy root run).
+   *
+   * WITHOUT THIS THE REPORT FOLLOWS THE CLAIM, NOT THE SNAPSHOT. `writeSecReport` is handed a snapshot
+   * of some run — often one that is no longer claimed — and `secReportPath` resolves through
+   * `secStateDir`, so the report for a run that just STOPPED was written into whichever run the
+   * operator's commands happened to point at. In a several-run project that is a silent overwrite of a
+   * different audit's deliverable.
+   */
+  runDir?: string;
 }
 
 /** Findings grouped by severity, worst first, with the unrated last. */
@@ -2647,7 +2657,9 @@ export function writeSecReport(
   loop: AuditLoopState | null,
   opts: SecReportOptions = {},
 ): Result<string> {
-  const reportPath = secReportPath(projectRoot);
+  const reportPath = opts.runDir
+    ? path.join(projectRoot, SEC_STATE_DIR_NAME, opts.runDir, SEC_REPORT_FILE)
+    : secReportPath(projectRoot);
   try {
     fs.mkdirSync(secStateDir(projectRoot), { recursive: true });
     const text = renderSecReport(snapshot, loop, {

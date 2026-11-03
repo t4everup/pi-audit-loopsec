@@ -38,6 +38,9 @@ git clone https://github.com/t4everup/pi-audit-loopsec
 Plateau: `plateau=8` (default) consecutive unproductive rounds stop the run.
 `maxRounds=0` (default) is unbounded. Never two surface-side rounds in a row.
 
+See **[STABILITY.md](STABILITY.md)** for the known-defect list, the remaining work, and the
+acceptance checklist for a version that is safe to run unattended.
+
 ## The tools
 
 | tool | what it does |
