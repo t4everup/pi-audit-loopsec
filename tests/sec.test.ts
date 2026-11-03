@@ -29,13 +29,14 @@ import {
   nextRunName,
   readActiveRun,
   readTurnClaim,
+  releaseTurnClaim,
   secStateDir,
   setActiveRun,
   slugifyRunName,
 } from "../extensions/loop-sec/store.ts";
 import { DEPTH_RATIO_WINDOW, MAX_CONSECUTIVE_DEPTH, MAX_DEPTH_RATIO, depthAllowed, renderFocus } from "../extensions/loop-sec/loop.ts";
 import { evaluateRound, pauseAfterRounds, pauseLoop, resumeLoop, startLoop, stopLoop, tickLoop } from "../extensions/loop-sec/loop.ts";
-import { advanceRuns, endDeepRun, parkOnSendFailure, startDeepRun } from "../extensions/loop-sec/loop.ts";
+import { advanceRuns, endDeepRun, parkOnSendFailure, pickNextRun, startDeepRun } from "../extensions/loop-sec/loop.ts";
 import { loadSettings, saveSettings } from "../extensions/loop-sec/settings.ts";
 import { LOOP_VERBS, parseArgs, tailAfterVerb } from "../extensions/loop-sec/args.ts";
 
@@ -3561,4 +3562,49 @@ test("with several runs, the control verb names the run it acted on — and can 
   assert.equal(readCurrentClaim(cwd)?.dir, b, "the operator's choice is unchanged");
   // What a control verb will hit is the TURN claim — the fact the message has to disclose.
   assert.equal(secStateDir(cwd), path.join(cwd, ".pi-loopsec", a));
+});
+
+test("PAUSE clears the in-flight fence — a paused run has no round to judge", () => {
+  // The measured failure: `pause` left `awaitingRound` set, `resume` did not clear it either, and once
+  // the turn claim was gone NOTHING could settle the round again. The run reported `running`, every tick
+  // said "no run is due", and `resume` refused because it WAS already running — unrecoverable without
+  // hand-editing the log.
+  const cwd = seeded();
+  runIn(cwd, "挖掘认证前rce");
+  const dispatched = advanceRuns(cwd);
+  assert.equal(dispatched.sent?.round, 1, "round 1 is in flight");
+  assert.equal(loadSec(cwd).snapshot.loop?.awaitingRound, 1);
+
+  assert.equal(pauseLoop(cwd, loadSec(cwd).snapshot, "operator paused").ok, true);
+  const paused = loadSec(cwd).snapshot.loop!;
+  assert.equal(paused.status, "paused");
+  assert.equal(paused.awaitingRound, null, "the fence is cleared, not left set");
+  assert.equal(readTurnClaim(cwd), null, "and the claim goes with it");
+
+  // Resume works and the run advances again.
+  assert.equal(resumeLoop(cwd, loadSec(cwd).snapshot, {}).ok, true);
+  assert.equal(loadSec(cwd).snapshot.loop?.awaitingRound, null);
+  const next = advanceRuns(cwd);
+  assert.equal(next.sent?.round, 2, "round 2 is dispatched — the run is schedulable again");
+});
+
+test("a fence with NO turn claim is settled automatically — the run is not stuck forever", () => {
+  // The second half of the same failure: `pickNextRun` skips a fenced run (that is what stops two briefs
+  // stacking), and only settling clears the fence — but settling was driven by the turn claim. A run whose
+  // claim was lost therefore had no path back. Reproduced by fencing a run and dropping its claim.
+  const cwd = seeded();
+  runIn(cwd, "挖掘认证前rce");
+  advanceRuns(cwd);
+  assert.equal(loadSec(cwd).snapshot.loop?.awaitingRound, 1);
+
+  // Lose the claim without touching the fence — a crash, or a pause from an older build.
+  assert.equal(releaseTurnClaim(cwd).ok, true);
+  assert.equal(readTurnClaim(cwd), null, "no claim");
+  assert.equal(loadSec(cwd).snapshot.loop?.awaitingRound, 1, "but the fence is still set");
+  assert.equal(pickNextRun(cwd), null, "so the run is not due — the stuck state");
+
+  const recovered = advanceRuns(cwd);
+  assert.match(recovered.settled?.reason ?? "", /ORPHANED round 1/, "it reports the recovery rather than doing it silently");
+  assert.equal(recovered.sent?.round, 2, "and the run moves again");
+  assert.equal(loadSec(cwd).snapshot.loop?.round, 2);
 });

@@ -853,6 +853,38 @@ export function advanceRuns(projectRoot: string, opts: { at?: string; dryRun?: b
     }
   }
 
+  // 1b. A FENCE WITH NO CLAIM IS AN ORPHAN, and it must be settled or the run is stuck forever.
+  //
+  // `pickNextRun` skips a run with a fence (that is what stops two briefs stacking), but the only path
+  // that clears a fence is settling it — and settling is driven by the turn claim. A run whose claim was
+  // lost (a crash, or a `pause` from a build that did not clear the fence) therefore had no way back:
+  // it reported `running` and every tick said "no run is due". Measured exactly that on a real project.
+  //
+  // Settling it here is safe: the round record exists, so the evaluation is the same one a normal settle
+  // would do, and the worst case is that a round which was really in flight is counted as produced
+  // nothing — which is what an abandoned round is.
+  if (!out.idleReason) {
+    for (const run of listRuns(projectRoot).filter((r) => r.status === "running")) {
+      if (out.settled?.dir === run.dir) continue;
+      const log = loadSecIn(projectRoot, run.dir);
+      const fence = log?.snapshot.loop?.awaitingRound ?? null;
+      if (fence === null) continue;
+      const reclaimed = claimTurn(projectRoot, { dir: run.dir, run: run.run }, fence);
+      if (!reclaimed.ok) continue;
+      const settled = tickLoop(projectRoot, loadSec(projectRoot).snapshot, { evaluateOnly: true, at });
+      releaseTurnClaim(projectRoot);
+      out.settled = out.settled ?? {
+        run: run.run,
+        dir: run.dir,
+        round: fence,
+        action: settled.action,
+        reason: `settled an ORPHANED round ${fence} — the run was fenced with no turn claim (recovered)`,
+        ...(settled.summary ? { summary: settled.summary } : {}),
+      };
+      break;
+    }
+  }
+
   // 2. Give the next round away.
   const next = pickNextRun(projectRoot);
   if (!next) {
@@ -949,9 +981,34 @@ export function pauseLoop(projectRoot: string, snapshot: TreeSnapshot, reason: s
   // `pausedAt` opens a pause interval. It is CLOSED by resumeLoop (banking the
   // span into pausedMs) or, if the loop is stopped while paused, by `endedAt`
   // in loopTiming — so a pause that is never resumed is still counted.
-  const next: AuditLoopState = { ...loop, status: "paused", pausedReason: reason, pausedAt: at };
+  //
+  // THE FENCE IS CLEARED HERE TOO. `awaitingRound` means "a turn for this round is in flight"; after a
+  // pause there is no turn the loop will ever judge, so leaving it set made the run UNSCHEDULABLE:
+  // `pickNextRun` skips a run with a fence, `resumeLoop` did not clear it, and once the turn claim was
+  // gone nothing could settle the round again. Measured on a real project: `running / round 10 /
+  // awaitingRound 10` with no claim, and every later tick reported "no run is due".
+  //
+  // The claim is released with it, because a claim whose fence is gone is already treated as dead by
+  // `readTurnClaim` — and a pause is the operator overriding the loop, so abandoning the in-flight round
+  // is the expected cost. The message says so rather than discarding it quietly.
+  const abandoned = loop.awaitingRound;
+  releaseTurnClaim(projectRoot);
+  const next: AuditLoopState = {
+    ...loop,
+    status: "paused",
+    awaitingRound: null,
+    pausedReason: reason,
+    pausedAt: at,
+  };
   if (!writeLoop(projectRoot, next, at)) return { ok: false, errors: ["the loop state could not be written"] };
-  return { ok: true, errors: [], loop: next, message: `Paused at round ${loop.round}.` };
+  return {
+    ok: true,
+    errors: [],
+    loop: next,
+    message:
+      `Paused at round ${loop.round}.` +
+      (abandoned !== null ? ` Round ${abandoned} was in flight and has been abandoned — /resume starts the next one.` : ""),
+  };
 }
 
 /**
@@ -1045,6 +1102,10 @@ export function resumeLoop(
     ...restWithoutHidden,
     status: "running",
     stallRounds: 0,
+    // A RESUMED RUN HAS NO ROUND IN FLIGHT. Clearing it here also HEALS a run that an earlier `pause`
+    // left fenced (the fence used to survive a pause), and that is the only thing which makes such a
+    // project schedulable again without hand-editing the log.
+    awaitingRound: null,
     // A spent budget must not survive a resume, or the loop pauses again
     // immediately. A new one is set below when asked for.
     pauseAfterRound: null,
