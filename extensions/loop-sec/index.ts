@@ -17,12 +17,27 @@
  * the modes that read it.
  */
 import * as fs from "node:fs";
+import * as path from "node:path";
 
 import { type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 
 import { HYPOTHESIS_CATEGORIES, clip, loopCommandName, type AuditLoopKind, type TreeSnapshot } from "./types.js";
 import { load } from "./store.js";
-import { loadSec, secTreeLogPath, type LoadResult } from "./store.js";
+import {
+  RUNS_DIR_NAME,
+  SEC_STATE_DIR_NAME,
+  type LoadResult,
+  findRun,
+  listRuns,
+  loadSec,
+  nextRunName,
+  readActiveRun,
+  readTurnClaim,
+  secBaseDir,
+  secTreeLogPath,
+  loadSecIn,
+  setActiveRun,
+} from "./store.js";
 import {
   loopLogPath,
   parkOnSendFailure,
@@ -33,11 +48,13 @@ import {
   renderLoopStatus,
   renderWidget,
   resumeLoop,
+  advanceRuns,
   startDeepRun,
   endDeepRun,
   startLoop,
   stopLoop,
   tickLoop,
+  type TickResult,
   reportLanguageOf,
 } from "./loop.js";
 import {
@@ -263,7 +280,8 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
               [
                 "/loopsec — the audit round engine (triage mode, state in .pi-loopsec/)",
                 "",
-                '  /loopsec "<objective>" [maxRounds=0] [plateau=8] [focus=a,b]',
+                '  /loopsec "<objective>" [maxRounds=0] [plateau=8] [focus=a,b]   STARTS A NEW RUN',
+                '  /loopsec                       continues the run your commands point at',
                 `  /${loopCommandName(kind)} status              the run, the surface progress, the findings`,
                 `  /${loopCommandName(kind)} pause               pause NOW`,
                 `  /${loopCommandName(kind)} pause <n>           run n MORE rounds, then pause`,
@@ -276,6 +294,8 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
                 `  /${loopCommandName(kind)} tree                render the findings (this mode has no tree)`,
                 `  /${loopCommandName(kind)} log                 the per-round journal`,
                 `  /${loopCommandName(kind)} report              regenerate + print the SEC report`,
+                `  /${loopCommandName(kind)} ls                  every run in this project, and how far each got`,
+                `  /${loopCommandName(kind)} use <name>          point your next command at one run`,
                 "",
                 "Steering a run that is already going:",
                 `  /${loopCommandName(kind)} note <text>         info for the NEXT round only (an instruction)`,
@@ -302,6 +322,12 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
                 "with a playbook (verify it, complete the path, follow the root cause, chain it) — and",
                 "only returns to the work list when its depth budget is spent or you close it with",
                 "`sec_update <id> pursuitClosed=\"<why>\"`.",
+                "",
+                "SEVERAL RUNS AT ONCE. Every objective gets its own directory — .pi-loopsec/runs/secNNN-<目标>/",
+                "with its own log, findings and report — and the loop advances whichever run is due, one round",
+                "at a time, least-recently-advanced first. So a sweep can keep running while a second audit",
+                "chases what the first one surfaced. `ls` shows them, `use` points your commands at one;",
+                "rounds pick their own run, so `use` only changes what YOU mean when you type a command.",
                 "",
                 "A DEEP RUN is for when that is not enough. A sweep gives a finding three rounds",
                 "(pursuitRounds) and then never returns it; `/loopsec deep F-0008` opens a run whose",
@@ -734,13 +760,60 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
           return;
         }
 
-        const started = startLoop(cwd, snapshot, {
-          kind,
-          objective,
+        // A NEW OBJECTIVE STARTS A NEW RUN.
+        //
+        // This is the change that makes several audits possible: typing `/loopsec "<objective>"` used to
+        // resume-or-refuse against the single run, so a second audit could not exist without stopping
+        // the first. Now a GIVEN objective creates `runs/secNNN-<objective>/` and points your commands at
+        // it; the other runs keep going, because the scheduler advances whichever run is due and each
+        // round claims its own run for the duration of its turn.
+        //
+        // A bare `/loopsec` / `/loopsec start` still means "the run my commands point at" — the resume
+        // path — so the old behaviour survives exactly where it was useful.
+        let started: ReturnType<typeof startLoop>;
+        if (rest.trim()) {
+          const runName = nextRunName(cwd, rest.trim());
+          const dir = `${RUNS_DIR_NAME}/${runName}`;
+          try {
+            fs.mkdirSync(path.join(secBaseDir(cwd), dir), { recursive: true });
+          } catch (error) {
+            notify(`could not create ${SEC_STATE_DIR_NAME}/${dir}: ${(error as Error).message}`, "error");
+            return;
+          }
+          const claimedNew = setActiveRun(cwd, { dir, run: runName, label: clip(rest.trim(), 60) });
+          if (!claimedNew.ok) {
+            notify(claimedNew.errors.join("; "), "warning");
+            return;
+          }
+          // Re-read through the new claim, so the loop state and the first round land in the NEW run
+          // rather than in whichever run answered a moment ago.
+          started = startLoop(cwd, loadSec(cwd).snapshot, {
+            kind,
+            objective: rest.trim(),
+            ...(flags.maxRounds !== undefined && Number.isInteger(Number(flags.maxRounds)) ? { maxRounds: Number(flags.maxRounds) } : {}),
+            ...(flags.plateau !== undefined && Number.isInteger(Number(flags.plateau)) ? { plateauWindow: Number(flags.plateau) } : {}),
+            ...(focus.length > 0 ? { focus } : {}),
+          });
+          if (started.ok) {
+            notify(
+              [
+                `New run: ${runName}`,
+                `  ${clip(rest.trim(), 120)}`,
+                `  folder: ${SEC_STATE_DIR_NAME}/${dir}/`,
+                `  /loopsec ls to see them all · /loopsec use <name> to point your commands at one`,
+              ].join("\n"),
+              "info",
+            );
+          }
+        } else {
+          started = startLoop(cwd, snapshot, {
+            kind,
+            objective,
           ...(flags.maxRounds !== undefined && Number.isInteger(Number(flags.maxRounds)) ? { maxRounds: Number(flags.maxRounds) } : {}),
           ...(flags.plateau !== undefined && Number.isInteger(Number(flags.plateau)) ? { plateauWindow: Number(flags.plateau) } : {}),
-          ...(focus.length > 0 ? { focus } : {}),
-        });
+            ...(focus.length > 0 ? { focus } : {}),
+          });
+        }
         if (!started.ok) {
           notify(`REJECTED: ${started.errors.join("; ")}`, "warning");
           return;
@@ -795,13 +868,17 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
   let ticking = false;
   pi.on("agent_settled", async (_event, ctx) => {
     if (ticking) return;
-    const snapshot = loadAuditState(ctx.cwd);
-    const loop = snapshot.loop;
-    if (!loop || loop.status !== "running" || loop.awaitingRound === null) return;
+    // SEVERAL RUNS, ONE CONVERSATION. A settle no longer means "advance the loop"; it means "settle
+    // whatever round was in flight, then give the next one to the run that most deserves it". Reading a
+    // single snapshot here was the shape of the one-run design and would have pinned every settle to
+    // whichever run answered.
+    const pending = readTurnClaim(ctx.cwd);
+    const anyRunning = listRuns(ctx.cwd).some((r) => r.status === "running");
+    if (!pending && !anyRunning) return;
     // A PRE-MIGRATION sec loop lives in .pi-hypothesis but the driver writes to
     // .pi-loopsec — ticking it would scatter one run across two directories.
     // Park the run and name the one-line migration instead.
-    if (loop.awaitingRound !== null && !fs.existsSync(secTreeLogPath(ctx.cwd))) {
+    if (pending && !fs.existsSync(secTreeLogPath(ctx.cwd))) {
       const message = `This /loopsec run was started before the state directory moved to .pi-loopsec/ — its log is still in .pi-hypothesis/.` +
         `\n  To migrate: rename .pi-hypothesis to .pi-loopsec in this project, then /loopsec resume.` +
         `\n  The loop was NOT ticked; nothing was written to either directory.`;
@@ -810,7 +887,18 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
     }
     ticking = true;
     try {
-      const result = tickLoop(ctx.cwd, snapshot);
+      const advanced = advanceRuns(ctx.cwd);
+      if (advanced.settled?.summary) ctx.ui.notify(advanced.settled.summary.join("\n"), "info");
+      // One shape for the rest of this handler: what it used to do with a single tick's result.
+      const result: TickResult = {
+        action: advanced.sent ? "sent" : "idle",
+        reason: advanced.idleReason ?? "settled",
+        ...(advanced.sent ? { round: advanced.sent.round, brief: advanced.sent.brief } : {}),
+        ...(advanced.sent?.summary ? { summary: advanced.sent.summary } : {}),
+      };
+      if (advanced.sent) {
+        ctx.ui.notify(`${advanced.sent.run} · round ${advanced.sent.round}`, "info");
+      }
       if (result.summary) ctx.ui.notify(result.summary.join("\n"), "info");
       if (result.brief) {
         try {
@@ -831,7 +919,12 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
         // A terminal tick produces neither a summary nor a brief, so without
         // this branch the goal ends SILENTLY: the only signal is the widget
         // glyph changing. Say what happened and why, and what is still open.
-        const after = loadAuditState(ctx.cwd);
+        // The run that was settled, NOT whichever run the operator's commands point at now: the turn
+        // claim is released by the settle, so re-reading through it would describe a different run.
+        const settledDir = advanced.settled?.dir ?? null;
+        const after = settledDir
+          ? (loadSecIn(ctx.cwd, settledDir)?.snapshot ?? loadAuditState(ctx.cwd))
+          : loadAuditState(ctx.cwd);
         // The REPORT is the deliverable, so it is written the moment the run
         // ends — not left for the user to remember to ask for.
         const written = writeSecReport(ctx.cwd, after, after.loop, { language: reportLanguageOf(ctx.cwd) });

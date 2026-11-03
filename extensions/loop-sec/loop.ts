@@ -88,8 +88,16 @@ import {
   appendEvent,
   appendSecEvent,
   load,
+  RUNS_DIR_NAME,
+  type RunInfo,
+  claimTurn,
+  listRuns,
+  nextRunName,
+  slugifyRunName,
   loadSec,
   loadSecIn,
+  readTurnClaim,
+  releaseTurnClaim,
   nowIso,
   readActiveRun,
   secBaseDir,
@@ -523,6 +531,8 @@ export interface StartDeepResult {
   ok: boolean;
   errors: string[];
   dir?: string;
+  /** The run's short name, e.g. `sec002-deep-F0008-...`. */
+  run?: string;
   loop?: AuditLoopState;
   /** True when an existing deep run was REOPENED rather than created. */
   resumed?: boolean;
@@ -558,8 +568,21 @@ export function startDeepRun(projectRoot: string, findingId: string, opts: Start
     };
   }
 
-  const dir = `deep/${id}`;
+  // A DEEP RUN IS A RUN, like any other: its own directory under `runs/`, numbered by the same
+  // sequence so `ls` reads chronologically and `use` can point at it. It used to take the project over
+  // (one active run), which made it impossible to keep a sweep going while chasing a finding.
+  const parentTitle = parentSnapshot.findings.find((f) => f.id === id)?.title ?? "";
+  // FIND THE EXISTING RUN BY THE FINDING, not by recomputing its name.
+  //
+  // `nextRunName` always returns the NEXT free number, so looking the run up under a freshly computed
+  // name could never find it: `deep F-0001` twice created a SECOND run instead of reopening the first,
+  // and the operator's earlier rounds were silently orphaned.
+  const priorRun = listRuns(projectRoot).find((r) => r.dir !== "." && r.deepOf === id) ?? null;
+  const dir = priorRun
+    ? priorRun.dir
+    : `${RUNS_DIR_NAME}/${nextRunName(projectRoot, `deep-${id}${parentTitle ? `-${parentTitle}` : ""}`)}`;
   const targetDir = path.join(secBaseDir(projectRoot), dir);
+  const runName = path.basename(dir);
 
   // ---- REOPEN, DO NOT REFUSE -------------------------------------------------------
   //
@@ -594,13 +617,10 @@ export function startDeepRun(projectRoot: string, findingId: string, opts: Start
         ],
       };
     }
-    const pausedForResume = parentLoop
-      ? parentLoop.status === "running"
-        ? pauseLoop(projectRoot, parentSnapshot, `被深挖运行重新接管（${dir}）`, at)
-        : { ok: true, errors: [] as string[] }
-      : { ok: true, errors: [] as string[] };
-    if (!pausedForResume.ok) return { ok: false, errors: pausedForResume.errors };
-    const repointed = setActiveRun(projectRoot, { dir, label: `deep ${id}`, at });
+    // NO MORE TAKEOVER. A deep run is just another run now, so the sweep keeps running while it
+    // chases the finding — which is the entire reason several runs exist. The only thing that changes
+    // is which run the OPERATOR'S next command refers to.
+    const repointed = setActiveRun(projectRoot, { dir, run: runName, label: `deep ${id}`, at });
     if (!repointed.ok) return { ok: false, errors: repointed.errors };
     // A RUN THAT STOPPED MUST BE RESUMED, or "reopened at round N" is a lie: `tickLoop` on a paused loop
     // sends nothing, so the command would report success and the run would sit there. A deep run stops
@@ -616,11 +636,11 @@ export function startDeepRun(projectRoot: string, findingId: string, opts: Start
       );
       if (!resumed.ok) {
         setActiveRun(projectRoot, null);
-        return { ok: false, errors: [...resumed.errors, "(the pointer was put back on the sweep)"] };
+        return { ok: false, errors: [...resumed.errors, "(the operator's command now refers to the default run again)"] };
       }
     }
     const reopened = loadSec(projectRoot).snapshot;
-    return { ok: true, errors: [], dir, resumed: true, round: reopened.loop?.round, loop: reopened.loop ?? undefined };
+    return { ok: true, errors: [], dir, run: runName, resumed: true, round: reopened.loop?.round, loop: reopened.loop ?? undefined };
   }
 
   const finding = parentSnapshot.findings.find((f) => f.id === id);
@@ -631,21 +651,15 @@ export function startDeepRun(projectRoot: string, findingId: string, opts: Start
 
   const parentDir = path.relative(secBaseDir(projectRoot), secStateDir(projectRoot)).split(path.sep).join("/") || ".";
 
-  // 2. The parent stops BEFORE the pointer moves.
-  const paused = parentLoop
-    ? parentLoop.status === "running"
-      ? pauseLoop(projectRoot, parentSnapshot, `被深挖运行接管（${dir}）`, at)
-      : { ok: true, errors: [] as string[] }
-    : { ok: true, errors: [] as string[] };
-  if (!paused.ok) return { ok: false, errors: paused.errors };
-
-  // 3/4. Directory, pointer, then the run itself.
+  // 2. THE SWEEP IS NOT PAUSED. It keeps running while this run chases the finding — that is the whole
+  //    point of several runs, and pausing it would be the old takeover wearing a new directory name.
+  // 3/4. Directory, claim, then the run itself.
   try {
     fs.mkdirSync(targetDir, { recursive: true });
   } catch (error) {
     return { ok: false, errors: [`could not create ${SEC_STATE_DIR_NAME}/${dir}: ${(error as Error).message}`] };
   }
-  const pointed = setActiveRun(projectRoot, { dir, label: `deep ${finding.id}`, at });
+  const pointed = setActiveRun(projectRoot, { dir, run: runName, label: `deep ${finding.id}`, at });
   if (!pointed.ok) {
     return { ok: false, errors: pointed.errors };
   }
@@ -675,7 +689,7 @@ export function startDeepRun(projectRoot: string, findingId: string, opts: Start
     at,
   });
   if (!started.ok || !started.loop) return back(started.errors);
-  return { ok: true, errors: [], dir, loop: started.loop };
+  return { ok: true, errors: [], dir, run: runName, loop: started.loop };
 }
 
 /**
@@ -687,44 +701,191 @@ export function startDeepRun(projectRoot: string, findingId: string, opts: Start
 export function endDeepRun(projectRoot: string): {
   ok: boolean;
   errors: string[];
-  /** `deep` = a real deep run was left; `pointer` = a half-built run was released. */
+  /** `deep` = a deep run was left; `pointer` = a claim to a run with no state was released. */
   released?: "deep" | "pointer";
-  /** For `pointer`: which directory was abandoned, so the message can name it. */
+  /** Which directory was left or abandoned, so the message can name it. */
   dir?: string;
+  run?: string;
 } {
-  const snapshot = loadSec(projectRoot).snapshot;
-  const deep = snapshot.loop?.deep;
-  const pointer = readActiveRun(projectRoot);
-  const active = deep !== undefined || pointer !== null;
-  if (!active) return { ok: false, errors: ["the active run is the sweep — there is no deep run to leave"] };
+  const active = readActiveRun(projectRoot);
+  const pending = readTurnClaim(projectRoot);
+  if (!active && !pending) {
+    return {
+      ok: false,
+      errors: ["nothing is claimed in this project — there is no run to leave. `/loopsec ls` lists them."],
+    };
+  }
+  const dir = active?.dir ?? pending!.dir;
+  const run = active?.run ?? pending!.run;
 
   // THE SAME CORRUPTION `startDeepRun` REFUSES ON THE WAY IN.
   //
-  // A round in flight belongs to the deep run, and the eight tools resolve the active run when they are
-  // CALLED — so releasing now would send that turn's findings into the sweep's log. Guarding only the
-  // entry and not the exit was an asymmetry, not a guard: the window it leaves open is identical.
-  if (snapshot.loop?.awaitingRound !== null && snapshot.loop?.awaitingRound !== undefined) {
+  // A round in flight belongs to a run, and the tools resolve the run when they are CALLED — so
+  // releasing the claim under it would send that turn's findings to whichever run answers next.
+  //
+  // BOTH SIGNALS ARE CHECKED. The turn claim is what `advanceRuns` writes; `awaitingRound` is the
+  // fence on the loop itself, which anything calling `tickLoop` directly also sets. Guarding only the
+  // claim would have left the identical hole open for that path.
+  const fenced = loadSec(projectRoot).snapshot.loop?.awaitingRound ?? null;
+  if (pending || fenced !== null) {
     return {
       ok: false,
       errors: [
-        `round ${snapshot.loop.awaitingRound} of the deep run is still in flight.`,
-        "Its tools resolve the active run when they are CALLED, so releasing now would write that round's",
-        "findings into the SWEEP's log. Finish the round, or `/loopsec cancel` it and then run `deep end`.",
+        `round ${pending?.round ?? fenced} of ${pending?.run ?? run} is still in flight.`,
+        "Its tools resolve the run when they are CALLED, so leaving now would write that round's findings",
+        "into another run's log. Finish the round, or `/loopsec cancel` it and then run `deep end`.",
       ],
     };
   }
 
-  const pointed = setActiveRun(projectRoot, null);
-  if (!pointed.ok) return { ok: false, errors: pointed.errors };
-  if (deep) return { ok: true, errors: [], released: "deep" };
+  const snapshot = loadSec(projectRoot).snapshot;
+  if (!snapshot.loop) {
+    // A claim to a directory with no run state — the crash window between claiming and writing. There
+    // is nothing to stop, so releasing the claim is the whole recovery.
+    setActiveRun(projectRoot, null);
+    return { ok: true, errors: [], released: "pointer", dir, run };
+  }
 
-  // ---- THE HALF-BUILT RUN -----------------------------------------------------
-  //
-  // `startDeepRun` creates the directory and points the project at it BEFORE writing anything into it,
-  // so a crash in that window leaves a pointer to a run with no loop state. A `deep end` that insisted
-  // on finding `loop.deep` would lock the project out of its own sweep with no way back except deleting
-  // a file by hand — the exact trap a recovery verb exists to remove.
-  return { ok: true, errors: [], released: "pointer", ...(pointer ? { dir: pointer.dir } : {}) };
+  // STOP IT, DO NOT JUST FORGET IT. A run left `running` keeps taking scheduler turns, so "I am done
+  // with this one" would silently mean "it keeps spending rounds nobody is reading". Only THIS run is
+  // stopped: the others — including the sweep it came from — are untouched, which is the whole point of
+  // several runs.
+  if (snapshot.loop.status === "running") {
+    const stopped = stopLoop(projectRoot, snapshot, "深挖运行已结束（`deep end`）", nowIso());
+    if (!stopped.ok) return { ok: false, errors: stopped.errors };
+  }
+  setActiveRun(projectRoot, null);
+  return { ok: true, errors: [], released: "deep", dir, run };
+}
+
+// -----------------------------------------------------------------
+// THE MULTI-RUN SCHEDULER
+// -----------------------------------------------------------------
+//
+// One conversation, several runs. A turn is in flight one at a time, so the question each settle
+// answers is not "what else can run in parallel" but "which run gets the next round". The rule here is
+// LEAST-RECENTLY-ADVANCED: the run whose state was updated longest ago goes next.
+//
+// That rule is chosen over round-robin-by-name because it self-corrects. A run that just took three
+// rounds is by definition the most recently updated, so it sinks to the back without anybody counting
+// turns; a run the operator just created is fresh and waits its turn; a run paused for an hour and then
+// resumed comes back at the front, which is what the operator expects after re-engaging with it.
+
+/** A run is DUE when it is running and under its round cap. */
+export function runIsDue(info: RunInfo): boolean {
+  if (!info.exists) return false;
+  if (info.status !== "running") return false;
+  if (typeof info.maxRounds === "number" && info.maxRounds > 0 && (info.round ?? 0) >= info.maxRounds) return false;
+  return true;
+}
+
+/**
+ * The run that should get the next round, or null.
+ *
+ * Each run's OWN `awaitingRound` is read from its OWN snapshot: a run with a round in flight is not due,
+ * and that is what stops the scheduler from stacking a second brief on an unfinished one.
+ */
+export function pickNextRun(projectRoot: string): RunInfo | null {
+  const candidates = listRuns(projectRoot)
+    .filter((r) => runIsDue(r))
+    .filter((r) => {
+      const log = loadSecIn(projectRoot, r.dir);
+      return log !== null && (log.snapshot.loop?.awaitingRound ?? null) === null;
+    });
+  if (candidates.length === 0) return null;
+  return [...candidates].sort((a, b) => {
+    const ta = Date.parse(a.updatedAt ?? "") || 0;
+    const tb = Date.parse(b.updatedAt ?? "") || 0;
+    return ta - tb || a.run.localeCompare(b.run);
+  })[0]!;
+}
+
+export interface AdvanceResult {
+  /** The round that was settled, if one was in flight anywhere. */
+  settled?: {
+    run: string;
+    dir: string;
+    round: number;
+    action: TickResult["action"];
+    reason: string;
+    summary?: string[];
+  };
+  /** The round that was sent, if a run was due. */
+  sent?: { run: string; dir: string; round: number; brief?: string; summary?: string[] };
+  /** Why nothing was sent: every run paused, stopped, at its cap, or a claim that would not write. */
+  idleReason?: string;
+}
+
+/**
+ * Settle the in-flight round, then give the next one to the run that most deserves it.
+ *
+ * THE SETTLE COMES FIRST AND IS NEVER SKIPPED. A turn claim that is not settled keeps its run fenced
+ * and its round unevaluated, and the stall counter — the only thing that stops a loop wandering — would
+ * never see it. Even when the turn produced nothing, settling is what turns "that round happened" into
+ * "that round is known to have produced nothing".
+ */
+export function advanceRuns(projectRoot: string, opts: { at?: string; dryRun?: boolean } = {}): AdvanceResult {
+  const at = opts.at ?? nowIso();
+  const out: AdvanceResult = {};
+
+  // 1. Settle, if a round is in flight. The turn claim names the run, so this reads the RIGHT log even
+  //    when the operator has since pointed `use` somewhere else.
+  const pending = readTurnClaim(projectRoot);
+  if (pending) {
+    const snapshot = loadSec(projectRoot).snapshot;
+    const loop = snapshot.loop;
+    if (!loop) {
+      // The claim points at a directory with no run state (a crash between claiming and writing).
+      // Releasing it is the recovery: keeping it would strand every later tool call.
+      releaseTurnClaim(projectRoot);
+      out.idleReason = `the claimed run ${pending.run} holds no run state — the claim was released`;
+    } else {
+      const settled = tickLoop(projectRoot, snapshot, { evaluateOnly: true, at });
+      releaseTurnClaim(projectRoot);
+      out.settled = {
+        run: pending.run,
+        dir: pending.dir,
+        round: pending.round ?? settled.round ?? 0,
+        action: settled.action,
+        reason: settled.reason,
+        ...(settled.summary ? { summary: settled.summary } : {}),
+      };
+    }
+  }
+
+  // 2. Give the next round away.
+  const next = pickNextRun(projectRoot);
+  if (!next) {
+    out.idleReason =
+      out.idleReason ?? "no run is due — every run is paused, stopped, at its cap, or has a round in flight";
+    return out;
+  }
+  const claimed = claimTurn(projectRoot, { dir: next.dir, run: next.run }, next.round ?? 0);
+  if (!claimed.ok) {
+    out.idleReason = claimed.errors.join("; ");
+    return out;
+  }
+  const result = tickLoop(projectRoot, loadSec(projectRoot).snapshot, {
+    at,
+    ...(opts.dryRun ? { dryRun: true } : {}),
+  });
+  if (result.action === "sent") {
+    // Re-claim with the round the brief was actually sent FOR, so a settle can name it.
+    claimTurn(projectRoot, { dir: next.dir, run: next.run }, result.round ?? next.round ?? 0);
+    out.sent = {
+      run: next.run,
+      dir: next.dir,
+      round: result.round ?? 0,
+      ...(result.brief ? { brief: result.brief } : {}),
+      ...(result.summary ? { summary: result.summary } : {}),
+    };
+    return out;
+  }
+  // Nothing was sent (paused by a budget, stopped by the plateau, nothing left to work). Release the
+  // claim and say why — a silent no-op is indistinguishable from a broken loop.
+  releaseTurnClaim(projectRoot);
+  out.idleReason = `${next.run}: ${result.reason}`;
+  return out;
 }
 
 export interface LoopControlResult {
@@ -1355,6 +1516,13 @@ export function renderFocus(focus: readonly string[]): string {
 export interface TickOptions {
   /** Suppress sending the brief; still evaluates and records. */
   dryRun?: boolean;
+  /**
+   * Evaluate the in-flight round and stop there.
+   *
+   * Used by the multi-run scheduler: settling a round and choosing which run gets the next one are
+   * separate decisions, and collapsing them starves every run but the busiest.
+   */
+  evaluateOnly?: boolean;
   at?: string;
 }
 
@@ -1422,6 +1590,20 @@ export function tickLoop(projectRoot: string, snapshot: TreeSnapshot, opts: Tick
       // the honest move: the round's outcome is unknowable, so do not invent one.
       current = { ...current, awaitingRound: null };
     }
+  }
+
+  // ---- evaluateOnly: SETTLE, DO NOT DISPATCH --------------------------------------------
+  //
+  // Several runs advance in rotation now, so "the round settled" and "which run goes next" are
+  // separate decisions. Doing both in one call gave the next round back to the run that had just
+  // finished, which would starve every other run in the project — the exact failure the scheduler
+  // exists to prevent.
+  //
+  // The state is WRITTEN here, not left in memory: `awaitingRound` has to be cleared on disk or the
+  // run stays fenced forever and no later tick can ever settle it again.
+  if (opts.evaluateOnly) {
+    if (current !== loop) writeLoop(projectRoot, current, at);
+    return { action: "idle", reason: "settled", round: current.round, previous };
   }
 
   // 2. The completion contract (`/goal` only).

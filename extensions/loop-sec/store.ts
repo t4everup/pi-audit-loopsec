@@ -142,30 +142,67 @@ export function treeLogPath(projectRoot: string): string {
 }
 
 // -----------------------------------------------------------------
-// WHICH RUN IS ACTIVE
+// RUNS — several audits in one project, each in its own directory
 // -----------------------------------------------------------------
+//
+// The first design had ONE run per project. That was a correctness property, not a preference: the
+// eight tools only ever see `ctx.cwd`, so they resolve "which run am I writing to" from a single
+// pointer, and two live runs would have written into each other's log.
+//
+// The operator needs what a real hunt needs: keep the pre-auth sweep running WHILE a second audit
+// chases something the first one surfaced. So the pointer became TURN-SCOPED rather than
+// project-scoped — a round claims a run for the duration of its turn, and is released when the round
+// settles. The tools did not change at all: they still ask `secStateDir()`, which now answers "the run
+// this turn belongs to", and the answer is unambiguous because only one turn is ever in flight.
+
+/** The subdirectory every named run lives in, relative to `.pi-loopsec`. */
+export const RUNS_DIR_NAME = "runs";
 
 /**
- * The pointer file naming the run whose directory is live, relative to `.pi-loopsec`.
+ * The pointer file. Holds TWO claims, and `secStateDir` prefers the turn one.
  *
- * A DEEP RUN writes to its own directory (`deep/F-0008/`) instead of the main one. There is only ONE
- * `loadSec(projectRoot)` signature and twenty call sites, and every one of them means "the run I am
- * working on" — so the run is resolved here, once, rather than threaded through all of them. That is
- * also the reason there can only be ONE active run per project: the eight tools read the same
- * pointer, so two live runs would write into each other's log.
+ *   turn    — written when a brief is dispatched, released when the round settles. This is what makes
+ *             a tool call inside a round land in the RIGHT run's log, and it is why several runs can
+ *             advance in rotation without any of them needing to know about the others.
+ *   current — what a COMMAND typed by the operator means when no round is in flight (`report`,
+ *             `status`, `note`). Set by `deep`/`use`, and by starting a run.
+ *
+ * Storing both in one file is what allows the release to be a restore: clearing the turn claim must
+ * put the operator's own choice back, not leave the project pointing at nothing.
  */
 export const ACTIVE_RUN_NAME = "active.json";
 
-/** What the pointer says. `dir` is ALWAYS relative to `.pi-loopsec`. */
-export interface ActiveRun {
+/** The legacy single-run directory. It predates `runs/` and is never migrated (no rename, no move). */
+export const LEGACY_RUN_SLUG = "main";
+
+export interface RunRef {
+  /** The directory, relative to `.pi-loopsec`. `"."` is the legacy root run. */
   dir: string;
+  /** The run's short name, e.g. `sec001-认证前挖掘`. Shown by `ls` and accepted by `use`. */
+  run: string;
   /** Where it came from, for `status` to explain itself: `deep F-0008`. */
   label?: string;
   at?: string;
 }
 
+export interface ActiveRun {
+  /** The effective claim — `turn` when a round is in flight, else `current`. */
+  dir: string;
+  run: string;
+  label?: string;
+  at?: string;
+  /** Which claim answered. Useful for `status` and for the tests. */
+  claim?: "turn" | "current";
+  /** The round the claim was written for, when it is a turn claim. */
+  round?: number;
+}
+
 export function secBaseDir(projectRoot: string): string {
   return path.join(projectRoot, SEC_STATE_DIR_NAME);
+}
+
+export function runsDir(projectRoot: string): string {
+  return path.join(secBaseDir(projectRoot), RUNS_DIR_NAME);
 }
 
 export function activeRunPath(projectRoot: string): string {
@@ -173,33 +210,157 @@ export function activeRunPath(projectRoot: string): string {
 }
 
 /**
- * Resolve a pointer's `dir` to a real directory INSIDE `.pi-loopsec`, or null.
+ * Resolve a run directory to a real path INSIDE `.pi-loopsec`, or null.
  *
  * THE POINTER FILE LIVES IN THE AUDITED PROJECT, so it is attacker-influenced in the only sense that
- * matters here: a repository can ship a `.pi-loopsec/active.json` that points at `../../..` and the
- * next write would land outside the project. An audit tool that can be steered by the thing it is
- * auditing is worse than a useless one, so an absolute path, a `..` escape, or the base itself is
- * refused rather than normalised.
+ * matters here: a repository can ship a `.pi-loopsec/active.json` pointing at `../../..`, and the next
+ * write would land outside the project. An audit tool that can be steered by the thing it is auditing
+ * is worse than a useless one, so an absolute path or a `..` escape is refused rather than normalised.
+ *
+ * `.` IS allowed, and only for the legacy root run: its directory predates `runs/`, and moving it
+ * would need a rename — which this module forbids everywhere for the non-NTFS reason.
  */
-function resolveActiveDir(projectRoot: string, dir: string): string | null {
+function resolveRunDir(projectRoot: string, dir: string): string | null {
   if (typeof dir !== "string") return null;
   const trimmed = dir.trim();
   if (trimmed === "" || path.isAbsolute(trimmed)) return null;
   const base = path.resolve(secBaseDir(projectRoot));
+  if (trimmed === ".") return base;
   const target = path.resolve(base, trimmed);
   const rel = path.relative(base, target);
   if (rel === "" || rel.startsWith("..") || path.isAbsolute(rel)) return null;
   return target;
 }
 
+/** Kept for the callers that already used it (`loadSecIn`, `setActiveRun`). */
+function resolveActiveDir(projectRoot: string, dir: string): string | null {
+  return resolveRunDir(projectRoot, dir);
+}
+
 /**
- * The pointer, if it is well-formed AND its directory exists.
+ * A name a human can point at: `sec001-认证前挖掘`.
  *
- * The existence check is what makes a stale pointer harmless: a deep run whose directory was deleted
- * (or an operator who removed it by hand) falls back to the main run instead of silently starting a
- * fresh empty one under the same name.
+ * Numbered so the ORDER runs were created in is visible, and because two runs on the same objective
+ * would otherwise collide. CJK is KEPT — the operator's objectives are Chinese, and transliterating
+ * them into an ascii slug would produce `sec001-` and nothing else for most of them.
+ *
+ * What is stripped is what a path cannot hold, plus control characters: `/ \ : * ? " < > |` and
+ * anything below 0x20. Separators are collapsed so `a  b` and `a - b` do not both become
+ * indistinguishable names.
  */
-export function readActiveRun(projectRoot: string): ActiveRun | null {
+export function slugifyRunName(objective: string): string {
+  const cleaned = (objective ?? "")
+    .replace(/[/\\:*?"<>|\u0000-\u001f]/g, " ")
+    .replace(/\s+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^[-.]+|[-.]+$/g, "")
+    // 40 is a filesystem-safe length that still holds a readable Chinese objective; longer gets a
+    // stable prefix rather than a truncation that could collide with another run's prefix.
+    .slice(0, 40)
+    .replace(/[-.]+$/g, "");
+  return cleaned || "run";
+}
+
+/** The next free `secNNN-<slug>` in this project. */
+export function nextRunName(projectRoot: string, objective: string): string {
+  let max = 0;
+  for (const run of listRuns(projectRoot)) {
+    const m = /^sec(\d{3})-/.exec(run.run);
+    if (m) max = Math.max(max, Number(m[1]));
+  }
+  const n = String(max + 1).padStart(3, "0");
+  return `sec${n}-${slugifyRunName(objective)}`;
+}
+
+/** A run as `ls` shows it: what it is, how far it got, and whether it is live. */
+export interface RunInfo extends RunRef {
+  exists: boolean;
+  /** `running` / `paused` / `stopped` / `complete`, or absent when the directory holds no run yet. */
+  status?: string;
+  round?: number;
+  maxRounds?: number;
+  objective?: string;
+  findings?: number;
+  surfaces?: number;
+  /** Set for a run opened by `deep`. */
+  deepOf?: string;
+  updatedAt?: string;
+}
+
+/**
+ * Every run in this project, in the order they were created.
+ *
+ * Discovered by SCANNING, not from a registry file: a registry is one more thing that can drift from
+ * the directories it describes, and a directory that exists but is missing from the registry is a run
+ * the operator can see with their own eyes and the tool cannot. Numbering comes from the name, so the
+ * order is stable across restarts.
+ */
+export function listRuns(projectRoot: string): RunInfo[] {
+  const runs: RunInfo[] = [];
+  const base = secBaseDir(projectRoot);
+  // The legacy root run first, so `ls` reads chronologically: it is always the oldest.
+  try {
+    if (fs.existsSync(path.join(base, TREE_LOG_NAME))) {
+      runs.push(describeRun(projectRoot, { dir: ".", run: LEGACY_RUN_SLUG }));
+    }
+  } catch {
+    /* unreadable base — no runs is the honest answer */
+  }
+  const dir = runsDir(projectRoot);
+  let entries: string[] = [];
+  try {
+    if (fs.existsSync(dir)) {
+      entries = fs
+        .readdirSync(dir, { withFileTypes: true })
+        .filter((e) => e.isDirectory())
+        .map((e) => e.name)
+        .sort();
+    }
+  } catch {
+    entries = [];
+  }
+  for (const name of entries) {
+    runs.push(describeRun(projectRoot, { dir: `${RUNS_DIR_NAME}/${name}`, run: name }));
+  }
+  return runs;
+}
+
+function describeRun(projectRoot: string, ref: RunRef): RunInfo {
+  const resolved = resolveRunDir(projectRoot, ref.dir);
+  if (!resolved || !fs.existsSync(resolved)) return { ...ref, exists: false };
+  const loaded = loadFrom(path.join(resolved, TREE_LOG_NAME));
+  const loop = loaded.snapshot.loop;
+  return {
+    ...ref,
+    exists: true,
+    ...(loop?.status ? { status: loop.status } : {}),
+    ...(loop ? { round: loop.round } : {}),
+    ...(loop ? { maxRounds: loop.maxRounds } : {}),
+    ...(loop?.objective ? { objective: loop.objective } : {}),
+    ...(loop?.deep ? { deepOf: loop.deep.findingId } : {}),
+    ...(loop?.updatedAt ? { updatedAt: loop.updatedAt } : {}),
+    findings: loaded.snapshot.findings.length,
+    surfaces: loaded.snapshot.surfaces.length,
+  };
+}
+
+/** Find a run by its directory, its slug, or a unique prefix of either. */
+export function findRun(projectRoot: string, needle: string): RunInfo | null {
+  const want = (needle ?? "").trim().toLowerCase();
+  if (!want) return null;
+  const runs = listRuns(projectRoot);
+  const exact = runs.filter((r) => r.run.toLowerCase() === want || r.dir.toLowerCase() === want);
+  if (exact.length === 1) return exact[0]!;
+  const prefixed = runs.filter((r) => r.run.toLowerCase().startsWith(want) || r.dir.toLowerCase().startsWith(want));
+  return prefixed.length === 1 ? prefixed[0]! : null;
+}
+
+interface ClaimsFile {
+  current?: RunRef;
+  turn?: RunRef & { round?: number };
+}
+
+function readClaims(projectRoot: string): ClaimsFile | null {
   const file = activeRunPath(projectRoot);
   let raw: string;
   try {
@@ -214,66 +375,176 @@ export function readActiveRun(projectRoot: string): ActiveRun | null {
   } catch {
     return null;
   }
-  if (parsed === null || typeof parsed !== "object") return null;
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
   const o = parsed as Record<string, unknown>;
-  const dir = typeof o.dir === "string" ? o.dir : "";
-  const resolved = resolveActiveDir(projectRoot, dir);
-  if (!resolved || !fs.existsSync(resolved)) return null;
+  const ref = (v: unknown): RunRef | undefined => {
+    if (!v || typeof v !== "object") return undefined;
+    const p = v as Record<string, unknown>;
+    const dir = typeof p.dir === "string" ? p.dir.trim() : "";
+    if (!dir) return undefined;
+    return {
+      dir,
+      run: typeof p.run === "string" && p.run ? p.run : dir,
+      ...(typeof p.label === "string" && p.label ? { label: p.label } : {}),
+      ...(typeof p.at === "string" && p.at ? { at: p.at } : {}),
+    };
+  };
+  // THE OLD FORMAT IS A `current` CLAIM. A project that ran the previous version has
+  // `{dir, label, at}` at the top level; reading it as anything else would strand its run.
+  const legacy = ref(parsed);
+  const current = ref(o.current) ?? legacy;
+  const turnRef = ref(o.turn);
+  const turn =
+    turnRef && typeof (o.turn as Record<string, unknown>).round === "number"
+      ? { ...turnRef, round: Math.max(0, Math.floor((o.turn as Record<string, unknown>).round as number)) }
+      : turnRef;
   return {
-    dir: dir.trim(),
-    ...(typeof o.label === "string" && o.label ? { label: o.label } : {}),
-    ...(typeof o.at === "string" && o.at ? { at: o.at } : {}),
+    ...(current ? { current } : {}),
+    ...(turn ? { turn } : {}),
   };
 }
 
-/**
- * Point the project at another run's directory, or back at the main one with `null`.
- *
- * `null` is written as `{"dir": null}` rather than deleting the pointer: nothing in a state directory
- * is ever removed by this module (the append-only rule), and an absent `dir` already reads as "the main
- * run", so the delete bought nothing and cost a destructive operation on the audit record.
- *
- * Refuses a directory that does not exist: setting the pointer first and creating the directory
- * afterwards would leave a window in which every read falls back to the main run while every write
- * that already resolved the deep path lands in a directory nobody is reading.
- */
-export function setActiveRun(projectRoot: string, run: ActiveRun | null): { ok: boolean; errors: string[] } {
+function writeClaims(projectRoot: string, claims: ClaimsFile): boolean {
   const file = activeRunPath(projectRoot);
   try {
-    if (run === null) {
-      // Nothing to do when the project never had a pointer — `.pi-loopsec` must not be created by
-      // the act of going back to a run that is already the default.
-      if (!fs.existsSync(file)) return { ok: true, errors: [] };
-      fs.writeFileSync(file, JSON.stringify({ dir: null, at: nowIso() }, null, 2) + "\n", "utf-8");
-      return { ok: true, errors: [] };
-    }
-    const resolved = resolveActiveDir(projectRoot, run.dir);
-    if (!resolved) {
-      return { ok: false, errors: [`active run dir must be a relative path inside ${SEC_STATE_DIR_NAME}: "${run.dir}"`] };
-    }
-    if (!fs.existsSync(resolved)) {
-      return { ok: false, errors: [`active run dir does not exist: ${run.dir}`] };
-    }
     fs.mkdirSync(secBaseDir(projectRoot), { recursive: true });
-    fs.writeFileSync(file, JSON.stringify({ ...run, at: run.at ?? nowIso() }, null, 2) + "\n", "utf-8");
-    return { ok: true, errors: [] };
-  } catch (error) {
-    return { ok: false, errors: [`could not write ${ACTIVE_RUN_NAME}: ${(error as Error).message}`] };
+    fs.writeFileSync(file, JSON.stringify({ ...claims, at: nowIso() }, null, 2) + "\n", "utf-8");
+    return true;
+  } catch {
+    return false;
   }
+}
+
+/**
+ * The effective run, if it is well-formed AND its directory exists.
+ *
+ * The existence check is what makes a stale claim harmless: a run whose directory was deleted (or
+ * removed by hand) falls through to the next claim instead of silently writing into a directory
+ * nobody reads.
+ */
+export function readActiveRun(projectRoot: string): ActiveRun | null {
+  const claims = readClaims(projectRoot);
+  if (!claims) return null;
+  for (const claim of ["turn", "current"] as const) {
+    const ref = claims[claim];
+    if (!ref) continue;
+    const resolved = resolveRunDir(projectRoot, ref.dir);
+    if (!resolved || !fs.existsSync(resolved)) continue;
+    return {
+      dir: ref.dir,
+      run: ref.run,
+      claim,
+      ...(ref.label ? { label: ref.label } : {}),
+      ...(ref.at ? { at: ref.at } : {}),
+      ...("round" in ref && typeof ref.round === "number" ? { round: ref.round } : {}),
+    };
+  }
+  return null;
+}
+
+/**
+ * Claim a run for the OPERATOR'S next command (the `current` slot).
+ *
+ * `null` clears the slot without deleting the file: nothing in a state directory is removed by this
+ * module, and an absent `current` already means "whichever run answers" — so deleting bought nothing
+ * and cost a destructive operation on the audit record.
+ */
+export function setActiveRun(projectRoot: string, run: RunRef | null): { ok: boolean; errors: string[] } {
+  const claims = readClaims(projectRoot) ?? {};
+  const { current: _drop, ...rest } = claims;
+  void _drop;
+  if (run === null) {
+    if (!readClaims(projectRoot)) return { ok: true, errors: [] };
+    return writeClaims(projectRoot, rest)
+      ? { ok: true, errors: [] }
+      : { ok: false, errors: [`could not write ${ACTIVE_RUN_NAME}`] };
+  }
+  const resolved = resolveRunDir(projectRoot, run.dir);
+  if (!resolved) {
+    return { ok: false, errors: [`run dir must be a relative path inside ${SEC_STATE_DIR_NAME}: "${run.dir}"`] };
+  }
+  if (!fs.existsSync(resolved)) return { ok: false, errors: [`run dir does not exist: ${run.dir}`] };
+  return writeClaims(projectRoot, { ...rest, current: { ...run, at: run.at ?? nowIso() } })
+    ? { ok: true, errors: [] }
+    : { ok: false, errors: [`could not write ${ACTIVE_RUN_NAME}`] };
+}
+
+/**
+ * Claim a run for the round that is about to be sent.
+ *
+ * This is the whole reason several runs can advance in rotation: a tool called during the turn that
+ * follows resolves here, so its writes land in the run it belongs to without the tool knowing that
+ * more than one run exists.
+ */
+export function claimTurn(
+  projectRoot: string,
+  run: RunRef,
+  round: number,
+): { ok: boolean; errors: string[] } {
+  const claims = readClaims(projectRoot) ?? {};
+  const resolved = resolveRunDir(projectRoot, run.dir);
+  if (!resolved || !fs.existsSync(resolved)) {
+    return { ok: false, errors: [`run dir does not exist: ${run.dir}`] };
+  }
+  return writeClaims(projectRoot, {
+    ...claims,
+    turn: { ...run, round: Math.max(0, Math.floor(round)), at: nowIso() },
+  })
+    ? { ok: true, errors: [] }
+    : { ok: false, errors: [`could not write ${ACTIVE_RUN_NAME}`] };
+}
+
+/**
+ * Release the turn claim, putting the operator's own choice back.
+ *
+ * Called when a round settles — INCLUDING when it settles badly (a send failure, a cancelled turn).
+ * A claim that is never released is worse than no claim at all: every later command would resolve to a
+ * run whose round nobody is working on, and the operator's `use` would appear to have been ignored.
+ */
+export function releaseTurnClaim(projectRoot: string): { ok: boolean; errors: string[] } {
+  const claims = readClaims(projectRoot);
+  if (!claims || !claims.turn) return { ok: true, errors: [] };
+  const { turn: _drop, ...rest } = claims;
+  void _drop;
+  return writeClaims(projectRoot, rest)
+    ? { ok: true, errors: [] }
+    : { ok: false, errors: [`could not write ${ACTIVE_RUN_NAME}`] };
+}
+
+/** Is a round in flight anywhere in this project? The driver uses it as the anti-stacking fence. */
+export function readTurnClaim(projectRoot: string): (RunRef & { round?: number }) | null {
+  const claims = readClaims(projectRoot);
+  if (!claims?.turn) return null;
+  const resolved = resolveRunDir(projectRoot, claims.turn.dir);
+  if (!resolved || !fs.existsSync(resolved)) return null;
+  return claims.turn;
 }
 
 /**
  * The `/loopsec` state directory and its event log. Same file format, same
  * append-only rules — a different directory, because it is a different record.
  *
- * Resolves to the ACTIVE run: the main `.pi-loopsec` normally, `deep/<id>/` while a deep run owns
- * the project. Every path in this module and in sec.ts is built from here, so the pointer is the
- * single place that decides which run a write belongs to.
+ * Resolution order, and each step exists for a reason:
+ *   1. the TURN claim — the round being worked right now;
+ *   2. the operator's CURRENT claim — what a typed command means;
+ *   3. the SINGLE runnable run, if there is exactly one (so a project that has one run needs no
+ *      pointer at all, which is every project that ever ran this tool before `runs/` existed);
+ *   4. `.pi-loopsec` itself, so a first `start` has somewhere to write before a run is named.
+ *
+ * Step 3 is what keeps the old behaviour for the old layout: one run, no pointer, path unchanged.
  */
 export function secStateDir(projectRoot: string): string {
   const active = readActiveRun(projectRoot);
-  if (!active) return secBaseDir(projectRoot);
-  return resolveActiveDir(projectRoot, active.dir) ?? secBaseDir(projectRoot);
+  if (active) {
+    const resolved = resolveRunDir(projectRoot, active.dir);
+    if (resolved) return resolved;
+  }
+  const runs = listRuns(projectRoot).filter((r) => r.exists);
+  if (runs.length === 1) {
+    const only = resolveRunDir(projectRoot, runs[0]!.dir);
+    if (only) return only;
+  }
+  return secBaseDir(projectRoot);
 }
 
 export function secTreeLogPath(projectRoot: string): string {

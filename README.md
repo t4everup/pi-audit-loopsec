@@ -53,12 +53,47 @@ Plateau: `plateau=8` (default) consecutive unproductive rounds stop the run.
 ## The command
 
 ```text
-/loopsec "<objective>" [maxRounds=0] [plateau=8] [focus=a,b]
+/loopsec "<objective>" [maxRounds=0] [plateau=8] [focus=a,b]   # STARTS A NEW RUN
+/loopsec ls                     # every run, and how far each got
+/loopsec use <name>             # point your next command at one run
 /loopsec status | pause [n] | resume [n] | stop | next
 /loopsec tree | log | report | note <text> | context <text> | notes
 /loopsec deep <F-id> [maxRounds] [说明…] | deep status | deep end
 /loopsec dismiss | show | help
 ```
+
+An objective that is GIVEN starts a new run; a bare `/loopsec` continues the run your
+commands point at.
+
+## Several runs at once
+
+Every run lives in its own directory, named from the objective:
+
+```text
+.pi-loopsec/
+  runs/
+    sec001-挖掘认证前漏洞/    tree.jsonl  SEC-REPORT.md  recon.md  settings.json
+    sec002-文件读取利用/      tree.jsonl  SEC-REPORT.md  recon.md  settings.json
+  active.json                 which run your COMMANDS mean, and which a ROUND is working
+```
+
+They run **side by side**, not one at a time: starting a second run does not pause the
+first, and `deep` is just another run rather than a takeover.
+
+One conversation, so the rounds are interleaved: each settle settles whatever round was in
+flight and gives the next one to the **least-recently-advanced** run. That rule is
+self-correcting — a run that just took three rounds sinks to the back without anybody
+counting turns, and a run you resume after an hour comes back to the front.
+
+`active.json` holds **two** claims, and the split is what makes this work without touching
+a single tool:
+
+* **turn** — written when a brief is sent, released when the round settles. This is how a
+  `sec_finding` called during that turn lands in the right run's log; the tools only see
+  `ctx.cwd`, and they resolve this.
+* **current** — what **you** mean when you type `report`, `status`, `note`. `use` sets it.
+
+A pre-`runs/` project (one directory, no claim) still resolves with no pointer at all.
 
 `focus=a,b` is a PREFERENCE, not a filter: it REORDERS the work list (an item whose
 `categories` match is assigned before one enumerated earlier), and a finding found
@@ -82,7 +117,8 @@ A deep run is not a sweep with a bigger budget. Its work list is **SUB-QUESTIONS
 round after the seed has to produce the *next* question. Repeating the same playbook
 for twenty rounds is what the sweep already did for three.
 
-- The sweep is **paused**, not stopped, and its log is never touched.
+- The run you came FROM is **not paused** — the whole point is that it keeps going. `deep end`
+  stops the deep run itself (so it stops taking scheduler turns) and leaves everything else alone.
 - `deep <F-id>` on a finding that already has a run **REOPENS** it — round, sub-questions and
   findings kept, and resumed if it had stopped. `deep <F-id> <n>` raises a reached round cap in
   the same act.
@@ -113,13 +149,14 @@ for twenty rounds is what the sweep already did for three.
 | `SEC-FINDINGS.md` | the per-round journal |
 | `OPERATOR.md` | a mirror of what the operator told the run |
 | `settings.json` | optional; `reportLanguage` (zh default), `fenceLanguage` (`c`), `pursuitRounds`, `reconRounds`, `allowCommandProbes` |
-| `active.json` | which run is live. `deep/F-0008` while a deep run owns the project, absent for the sweep |
+| `active.json` | `{current, turn}` — which run your commands mean, and which run the in-flight round is working |
+| `runs/<name>/` | one directory per run: its own `tree.jsonl`, `SEC-REPORT.md`, `recon.md`, `settings.json` |
 | `recon.md` | the recon note mirrored for re-reading (or a deep run's seed) |
 | `deep/<F-id>/` | a deep run's own `tree.jsonl`, `SEC-REPORT.md`, `recon.md`, `settings.json` |
 
-**One active run per project.** The eight tools have no idea which run they belong to —
-they resolve `active.json` — so two live runs would write into each other's log. That
-is why `deep` takes the project over instead of running beside it.
+**One ROUND in flight, many runs live.** The eight tools resolve `active.json`'s turn
+claim, so the round being worked determines where its writes go. That is why several runs
+can advance in rotation without any of them knowing that the others exist.
 
 **exFAT-safe:** only `appendFileSync` and `writeFileSync`. No rename, no link, no
 held descriptor. A torn last line is repaired, never silently swallowed.

@@ -16,10 +16,24 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { appendSecEvent, loadSec, loadSecIn, secStateDir, setActiveRun } from "../extensions/loop-sec/store.ts";
+import {
+  LEGACY_RUN_SLUG,
+  RUNS_DIR_NAME,
+  appendSecEvent,
+  findRun,
+  listRuns,
+  loadSec,
+  loadSecIn,
+  nextRunName,
+  readActiveRun,
+  readTurnClaim,
+  secStateDir,
+  setActiveRun,
+  slugifyRunName,
+} from "../extensions/loop-sec/store.ts";
 import { DEPTH_RATIO_WINDOW, MAX_CONSECUTIVE_DEPTH, MAX_DEPTH_RATIO, depthAllowed, renderFocus } from "../extensions/loop-sec/loop.ts";
 import { evaluateRound, pauseAfterRounds, pauseLoop, resumeLoop, startLoop, stopLoop, tickLoop } from "../extensions/loop-sec/loop.ts";
-import { endDeepRun, startDeepRun } from "../extensions/loop-sec/loop.ts";
+import { advanceRuns, endDeepRun, startDeepRun } from "../extensions/loop-sec/loop.ts";
 import { loadSettings, saveSettings } from "../extensions/loop-sec/settings.ts";
 import { parseArgs, tailAfterVerb } from "../extensions/loop-sec/args.ts";
 import { loopCommandName, type SecFindingStep } from "../extensions/loop-sec/types.ts";
@@ -123,6 +137,21 @@ function startSec(cwd: string, objective = "挖掘认证前rce漏洞", plateauWi
  * The finding is deliberately POST-AUTH with a call chain and a PoC: that is the measured case, and it
  * is the one where a sweep stops (three pursuit rounds) while a deep run has work left.
  */
+/**
+ * Create a NAMED run, the way `/loopsec "<objective>"` does: directory, claim, loop, recon note.
+ * Returns the run's directory, relative to `.pi-loopsec`.
+ */
+function runIn(cwd: string, objective: string): string {
+  const name = nextRunName(cwd, objective);
+  const dir = `${RUNS_DIR_NAME}/${name}`;
+  fs.mkdirSync(path.join(cwd, ".pi-loopsec", dir), { recursive: true });
+  assert.equal(setActiveRun(cwd, { dir, run: name }).ok, true, "claim the new run");
+  const started = startLoop(cwd, loadSec(cwd).snapshot, { kind: "sec", objective, plateauWindow: 99 });
+  assert.equal(started.ok, true, started.ok ? "" : started.errors.join("; "));
+  assert.equal(submitSecRecon(cwd, NOTE).ok, true);
+  return dir;
+}
+
 function withSweepFinding(cwd: string): void {
   startSec(cwd);
   assert.equal(submitSecRecon(cwd, NOTE).ok, true);
@@ -2758,8 +2787,8 @@ test("a deep run lives in its own folder and leaves the sweep's log untouched", 
 
   const started = startDeepRun(cwd, "F-0001", { maxRounds: 20 });
   assert.equal(started.ok, true, started.errors.join("; "));
-  assert.equal(started.dir, "deep/F-0001");
-  assert.equal(secStateDir(cwd), path.join(cwd, ".pi-loopsec", "deep", "F-0001"), "every write now resolves here");
+  assert.match(started.dir!, /^runs\/sec\d{3}-deep-F-0001/, "a named run under runs/, numbered like every other");
+  assert.equal(secStateDir(cwd), path.join(cwd, ".pi-loopsec", started.dir!), "every write now resolves here");
 
   const deep = loadSec(cwd).snapshot;
   assert.equal(deep.findings.length, 0, "the deep run does not inherit the sweep's findings as its own");
@@ -2767,14 +2796,25 @@ test("a deep run lives in its own folder and leaves the sweep's log untouched", 
   assert.equal(deep.loop?.deep?.parentDir, ".", "the parent is named, so the two can be related later");
 });
 
-test("starting a deep run PAUSES the sweep, and ending one does not silently restart it", () => {
+test("starting a deep run does NOT pause the sweep — the two run side by side", () => {
+  // This is the point of several runs: keep the pre-auth sweep going while a second audit chases what
+  // the first one surfaced. Pausing the parent here would be the old takeover under a new directory name.
   const cwd = seeded();
   withSweepFinding(cwd);
+  const sweepDir = secStateDir(cwd);
   assert.equal(startDeepRun(cwd, "F-0001").ok, true);
-  assert.equal(endDeepRun(cwd).ok, true);
-  const sweep = loadSec(cwd).snapshot;
-  assert.equal(sweep.loop?.status, "paused", "a loop that restarts itself spends rounds nobody asked for");
+  assert.notEqual(secStateDir(cwd), sweepDir, "commands now point at the deep run");
+
+  // The sweep itself is untouched and still running.
+  const sweep = loadSecIn(cwd, ".")!.snapshot;
+  assert.equal(sweep.loop?.status, "running", "the sweep keeps running");
   assert.equal(sweep.findings.length, 1, "and its record is exactly what it was");
+
+  // Ending the deep run stops THAT run and leaves the sweep alone.
+  assert.equal(endDeepRun(cwd).ok, true);
+  const deepDir = listRuns(cwd).find((r) => r.deepOf === "F-0001")!;
+  assert.equal(loadSecIn(cwd, deepDir.dir)!.snapshot.loop?.status, "stopped", "the deep run is stopped, not just forgotten");
+  assert.equal(loadSecIn(cwd, ".")!.snapshot.loop?.status, "running", "and the sweep still runs");
 });
 
 test("a deep run refuses to start while a round is in flight", () => {
@@ -2883,7 +2923,8 @@ test("a deep run inherits its parent's settings and overrides only what it sets"
   withSweepFinding(cwd);
   saveSettings(cwd, { allowCommandProbes: true, pursuitRounds: 4 });
   startDeepRun(cwd, "F-0001");
-  const deepSettings = path.join(cwd, ".pi-loopsec", "deep", "F-0001", "settings.json");
+  const deepRun = listRuns(cwd).find((r) => r.deepOf === "F-0001")!;
+  const deepSettings = path.join(cwd, ".pi-loopsec", deepRun.dir, "settings.json");
   fs.writeFileSync(deepSettings, JSON.stringify({ reconRounds: 1 }), "utf-8");
   const s = loadSettings(cwd).settings;
   assert.equal(s.reconRounds, 1, "the deep layer wins");
@@ -2897,8 +2938,8 @@ test("the active-run pointer cannot be steered outside .pi-loopsec", () => {
   // auditing can steer is worse than a useless one.
   const cwd = seeded();
   fs.mkdirSync(path.join(cwd, ".pi-loopsec"), { recursive: true });
-  for (const dir of ["../../etc", "/etc", "..", ".", "deep/../../x"]) {
-    const r = setActiveRun(cwd, { dir });
+  for (const dir of ["../../etc", "/etc", "..", "runs/../../x", "runs/.."]) {
+    const r = setActiveRun(cwd, { dir, run: "x" });
     assert.equal(r.ok, false, `"${dir}" must be refused`);
   }
   assert.equal(secStateDir(cwd), path.join(cwd, ".pi-loopsec"), "and the main run stays the active one");
@@ -2908,8 +2949,8 @@ test("a stale pointer falls back to the main run instead of starting a fresh emp
   const cwd = seeded();
   withSweepFinding(cwd);
   startDeepRun(cwd, "F-0001");
-  const deepDir = path.join(cwd, ".pi-loopsec", "deep", "F-0001");
-  fs.rmSync(deepDir, { recursive: true, force: true });
+  const deepRun = listRuns(cwd).find((r) => r.deepOf === "F-0001")!;
+  fs.rmSync(path.join(cwd, ".pi-loopsec", deepRun.dir), { recursive: true, force: true });
   assert.equal(secStateDir(cwd), path.join(cwd, ".pi-loopsec"), "the sweep is reachable again");
   assert.equal(loadSec(cwd).snapshot.findings.length, 1, "with its own recorded finding");
 });
@@ -3003,7 +3044,7 @@ test("deep end REFUSES while a round is in flight — the mirror of the entry gu
   assert.equal(refused.ok, false);
   assert.match(refused.errors.join(" "), /still in flight/);
   assert.match(refused.errors.join(" "), /\/loopsec cancel/, "and names the way out");
-  assert.equal(secStateDir(cwd), path.join(cwd, ".pi-loopsec", "deep", "F-0001"), "the pointer did not move");
+  assert.match(secStateDir(cwd), /sec\d{3}-deep-F-0001/, "the claim did not move");
 });
 
 test("deep end RELEASES a half-built run instead of locking the project out of its own sweep", () => {
@@ -3012,26 +3053,29 @@ test("deep end RELEASES a half-built run instead of locking the project out of i
   // project unrecoverable except by deleting a file by hand.
   const cwd = seeded();
   withSweepFinding(cwd);
-  const half = path.join(cwd, ".pi-loopsec", "deep", "F-0009");
+  const half = path.join(cwd, ".pi-loopsec", "runs", "sec900-half-built");
   fs.mkdirSync(half, { recursive: true });
-  assert.equal(setActiveRun(cwd, { dir: "deep/F-0009" }).ok, true);
+  assert.equal(setActiveRun(cwd, { dir: "runs/sec900-half-built", run: "sec900-half-built" }).ok, true);
   assert.equal(loadSec(cwd).snapshot.loop, null, "a directory with no log has no run");
   assert.equal(secStateDir(cwd), half, "and the project is pointed at it");
 
   const released = endDeepRun(cwd);
   assert.equal(released.ok, true, released.errors.join("; "));
   assert.equal(released.released, "pointer", "it says WHICH kind of release it was, not that a run ended");
-  assert.equal(released.dir, "deep/F-0009", "and names the directory it abandoned");
+  assert.equal(released.dir, "runs/sec900-half-built", "and names the directory it abandoned");
   assert.equal(secStateDir(cwd), path.join(cwd, ".pi-loopsec"), "the sweep is reachable again");
   assert.equal(loadSec(cwd).snapshot.findings.length, 1, "with its record intact");
 });
 
-test("deep end on the sweep itself refuses, rather than pretending it left something", () => {
+test("deep end with nothing claimed refuses, rather than pretending it left something", () => {
+  // In a multi-run project "leave" needs a subject. Refusing is what stops it from stopping whichever
+  // run happened to answer, which could be the sweep the operator is still using.
   const cwd = seeded();
   withSweepFinding(cwd);
   const r = endDeepRun(cwd);
   assert.equal(r.ok, false);
-  assert.match(r.errors.join(" "), /there is no deep run to leave/);
+  assert.match(r.errors.join(" "), /no run to leave/);
+  assert.equal(loadSecIn(cwd, ".")!.snapshot.loop?.status, "running", "and the sweep was not touched");
 });
 
 test("rerunning deep on the same finding REOPENS it and RESUMES it — round, questions and findings kept", () => {
@@ -3051,12 +3095,14 @@ test("rerunning deep on the same finding REOPENS it and RESUMES it — round, qu
   assert.equal(reopened.ok, true, reopened.errors.join("; "));
   assert.equal(reopened.resumed, true, "reported as a REOPEN, so nobody thinks their work was discarded");
   assert.equal(reopened.round, 1, "at the round it stopped on");
+  assert.match(reopened.dir!, /sec\d{3}-deep-F-0001/);
+  assert.match(reopened.dir!, /sec\d{3}-deep-F-0001/, "reopened in its own directory");
   const after = loadSec(cwd).snapshot;
   assert.equal(after.loop?.round, 1, "nothing was reset");
   assert.equal(after.loop?.status, "running", "and it was RESUMED — a reopened stopped run that never ticks is a lie");
   assert.equal(after.surfaces.length, 1, "the sub-questions carried over");
   assert.equal(after.loop?.deep?.findingId, "F-0001");
-  assert.equal(secStateDir(cwd), path.join(cwd, ".pi-loopsec", "deep", "F-0001"));
+  assert.match(secStateDir(cwd), /sec\d{3}-deep-F-0001/);
 });
 
 test("reopening with a new directive is refused, and points at the mechanism that works", () => {
@@ -3069,29 +3115,39 @@ test("reopening with a new directive is refused, and points at the mechanism tha
   assert.equal(refused.ok, false);
   assert.match(refused.errors.join(" "), /\/loopsec context/, "names the verb that actually reaches every round");
   // Read the DEEP run explicitly: the active run is the sweep again, which has no `deep` field.
-  const deep = loadSecIn(cwd, "deep/F-0001")!.snapshot.loop;
+  const deepRun = listRuns(cwd).find((r) => r.deepOf === "F-0001")!;
+  const deep = loadSecIn(cwd, deepRun.dir)!.snapshot.loop;
   assert.equal(deep?.deep?.directive, "重点关注绕过", "and the original steer is untouched");
 });
 
-test("a deep directory holding another finding's run is not reopened under this name", () => {
+test("deep on a DIFFERENT finding gets its OWN run, and does not reopen the first", () => {
+  // Runs are found by the FINDING they were opened for, not by recomputing a name. Getting this wrong
+  // would reopen the wrong log under the wrong id — or, before the fix, create a second run under the
+  // same finding and orphan the operator's earlier rounds.
   const cwd = seeded();
   withSweepFinding(cwd);
-  assert.equal(startDeepRun(cwd, "F-0001").ok, true);
-  assert.equal(endDeepRun(cwd).ok, true);
-  // Point at it and rewrite its loop state as if the directory had been copied from elsewhere.
-  assert.equal(setActiveRun(cwd, { dir: "deep/F-0001" }).ok, true);
-  const loop = loadSec(cwd).snapshot.loop!;
-  appendSecEvent(cwd, {
-    type: "loop_updated",
-    at: new Date().toISOString(),
-    loop: { ...loop, deep: { ...loop.deep!, findingId: "F-0002" } },
-  } as never);
-  assert.equal(setActiveRun(cwd, null).ok, true);
-
-  const refused = startDeepRun(cwd, "F-0001");
-  assert.equal(refused.ok, false);
-  assert.match(refused.errors.join(" "), /holds a run for F-0002/);
-  assert.equal(secStateDir(cwd), path.join(cwd, ".pi-loopsec"), "and the pointer stayed on the sweep");
+  recordFinding(cwd, {
+    title: "第二个发现",
+    category: "path-traversal",
+    severity: "high",
+    file: "src/fs.py",
+    line: 9,
+    evidence: "open(p)",
+    preAuth: false,
+  });
+  const first = startDeepRun(cwd, "F-0001");
+  assert.equal(first.ok, true, first.errors.join("; "));
+  endDeepRun(cwd);
+  const second = startDeepRun(cwd, "F-0002");
+  assert.equal(second.ok, true, second.errors.join("; "));
+  assert.notEqual(second.dir, first.dir, "a different finding is a different run");
+  assert.equal(loadSecIn(cwd, first.dir!)!.snapshot.loop?.deep?.findingId, "F-0001", "the first is untouched");
+  assert.equal(loadSecIn(cwd, second.dir!)!.snapshot.loop?.deep?.findingId, "F-0002");
+  // ...and going back to the first one REOPENS it rather than making a third.
+  endDeepRun(cwd);
+  const again = startDeepRun(cwd, "F-0001");
+  assert.equal(again.dir, first.dir);
+  assert.equal(again.resumed, true);
 });
 
 // ---- the two the previous review left, plus the dangling reference they uncovered --------
@@ -3158,4 +3214,149 @@ test("with no findings, a deep report does not point at the section it no longer
   assert.equal(snapshot.findings.length, 0, "the deep run starts with no findings of its own");
   assert.ok(!report.includes("见下面的「未读」"), "so the pointer must not be there");
   assert.match(report, /本次运行只围绕它一个/, "the honest version states the limit without the pointer");
+});
+
+// =================================================================
+// SEVERAL RUNS — the operator keeps a sweep going while starting another
+// =================================================================
+
+test("a named objective creates its own run instead of resuming or refusing", () => {
+  const cwd = seeded();
+  const a = nextRunName(cwd, "挖掘认证前漏洞");
+  assert.equal(a, "sec001-挖掘认证前漏洞", "numbered, and the objective is readable in the name");
+  const b = nextRunName(cwd, "文件读取利用");
+  assert.equal(b, "sec001-文件读取利用", "the number is per existing runs, so it only advances once a run exists");
+});
+
+test("run names are filesystem-safe and keep Chinese", () => {
+  // The operator's objectives are Chinese, and transliterating them would produce `sec001-` and nothing
+  // else for most of them — so the characters are KEPT and only what a path cannot hold is removed.
+  assert.equal(slugifyRunName("挖掘认证前漏洞"), "挖掘认证前漏洞");
+  assert.equal(slugifyRunName("a/b:c*d?e"), "a-b-c-d-e");
+  assert.equal(slugifyRunName("  spaced   out  "), "spaced-out");
+  assert.equal(slugifyRunName(""), "run");
+  assert.ok(slugifyRunName("x".repeat(100)).length <= 40, "bounded");
+});
+
+test("two runs live in separate directories and never write into each other", () => {
+  const cwd = seeded();
+  const first = runIn(cwd, "挖掘认证前漏洞");
+  recordFinding(cwd, {
+    title: "文件读取", category: "path-traversal", severity: "high", file: "a.py", line: 1, evidence: "e", preAuth: false,
+  });
+  const second = runIn(cwd, "文件读取利用");
+
+  assert.notEqual(first, second);
+  assert.equal(loadSecIn(cwd, first)!.snapshot.findings.length, 1, "the first keeps its finding");
+  assert.equal(loadSecIn(cwd, second)!.snapshot.findings.length, 0, "the second starts empty");
+  // The objective lives on the LOOP for a sec run — there is no hypothesis tree whose objective it is.
+  assert.equal(loadSecIn(cwd, first)!.snapshot.loop?.objective, "挖掘认证前漏洞");
+  assert.equal(loadSecIn(cwd, second)!.snapshot.loop?.objective, "文件读取利用");
+  // Both directories are on disk, in creation order, and labelled with what they are.
+  assert.deepEqual(
+    listRuns(cwd).map((r) => r.run),
+    [first.split("/")[1]!, second.split("/")[1]!],
+  );
+});
+
+test("the scheduler rotates instead of starving: both runs advance, alternately", () => {
+  // THE POINT OF THE WHOLE CHANGE. One conversation, several runs, so each settle gives the next round
+  // to the least-recently-advanced run. Collapsing the settle and the dispatch into one tick gave the
+  // round straight back to the run that had just finished, which would have starved every other run.
+  const cwd = seeded();
+  runIn(cwd, "挖掘认证前漏洞");
+  runIn(cwd, "文件读取利用");
+  const order: string[] = [];
+  for (let i = 0; i < 6; i++) {
+    const advanced = advanceRuns(cwd);
+    if (advanced.sent) order.push(advanced.sent.run);
+  }
+  assert.ok(order.length >= 4, `only ${order.length} round(s) were sent: ${order.join(",")}`);
+  const firsts = new Set(order.map((r) => r.split("-")[0]!));
+  assert.equal(firsts.size, 2, `both runs got rounds: ${order.join(",")}`);
+  // Strictly alternating is what least-recently-advanced produces here.
+  for (let i = 1; i < order.length; i++) {
+    assert.notEqual(order[i], order[i - 1], `the same run took two in a row: ${order.join(",")}`);
+  }
+});
+
+test("a paused run does not hold up the others", () => {
+  const cwd = seeded();
+  const first = runIn(cwd, "挖掘认证前漏洞");
+  const second = runIn(cwd, "文件读取利用");
+  // Pause the run the operator's commands point at.
+  assert.equal(pauseLoop(cwd, loadSec(cwd).snapshot, "operator paused this one").ok, true);
+  const advanced = advanceRuns(cwd);
+  assert.equal(advanced.sent?.dir, first, "the other run still gets rounds");
+  assert.equal(loadSecIn(cwd, second)!.snapshot.loop?.status, "paused", "and the paused one is untouched");
+});
+
+test("a round claims its run for its own turn, and the claim is released when it settles", () => {
+  const cwd = seeded();
+  const first = runIn(cwd, "挖掘认证前漏洞");
+  runIn(cwd, "文件读取利用");
+  const advanced = advanceRuns(cwd);
+  assert.equal(advanced.sent?.dir, first);
+  const claim = readTurnClaim(cwd);
+  assert.equal(claim?.dir, first, "the tool calls in this turn resolve to the run that sent it");
+  assert.equal(claim?.round, 1);
+  // A claim is never STALE: after any advance it names a round that is actually in flight, because a
+  // claim left behind from a finished round would send the next turn's writes to the wrong log.
+  advanceRuns(cwd);
+  const after = readTurnClaim(cwd);
+  if (after) {
+    const loop = loadSecIn(cwd, after.dir)!.snapshot.loop;
+    assert.equal(loop?.awaitingRound, after.round, `claim for round ${after.round} matches the fence`);
+  } else {
+    assert.equal(
+      listRuns(cwd).filter((r) => r.status === "running").length,
+      0,
+      "no claim means nothing was dispatched — not that one was dropped",
+    );
+  }
+});
+
+test("the operator's `use` is not overridden by a round of another run", () => {
+  // `use` writes the CURRENT claim; a round writes the TURN claim. The turn wins while it is in flight
+  // (that is what keeps tool calls in the right log) and the operator's choice comes back afterwards.
+  const cwd = seeded();
+  runIn(cwd, "挖掘认证前漏洞");
+  const second = runIn(cwd, "文件读取利用");
+  assert.equal(setActiveRun(cwd, { dir: second, run: second.split("/")[1]! }).ok, true);
+  const advanced = advanceRuns(cwd);
+  const settledRun = advanced.sent?.dir;
+  assert.notEqual(settledRun, second, "the other run was due first");
+  assert.equal(secStateDir(cwd), path.join(cwd, ".pi-loopsec", settledRun!), "during the turn, writes go to the run that is working");
+  advanceRuns(cwd); // settles + dispatches
+  advanceRuns(cwd); // settles + dispatches
+  // Once nothing is in flight, the operator's choice is what `status`/`report` mean again.
+  const claims = readTurnClaim(cwd);
+  if (claims === null) {
+    assert.equal(secStateDir(cwd), path.join(cwd, ".pi-loopsec", second), "back to the run the operator chose");
+  } else {
+    // Still mid-turn: the claim is what everything resolves to, and it names the run being worked.
+    assert.equal(secStateDir(cwd), path.join(cwd, ".pi-loopsec", claims.dir));
+  }
+});
+
+test("an old single-run project still resolves with no pointer at all", () => {
+  // Every project that ran this tool before `runs/` existed has one directory and no claim. Making them
+  // need a claim to be readable would have stranded every existing audit.
+  const cwd = seeded();
+  withSweepFinding(cwd);
+  assert.equal(readActiveRun(cwd), null, "no claim was ever written");
+  assert.equal(secStateDir(cwd), path.join(cwd, ".pi-loopsec"), "and it still resolves");
+  assert.equal(loadSec(cwd).snapshot.findings.length, 1);
+  assert.deepEqual(listRuns(cwd).map((r) => r.run), [LEGACY_RUN_SLUG], "listed as the legacy run");
+});
+
+test("`ls` finds runs by prefix, and an ambiguous prefix is not guessed at", () => {
+  const cwd = seeded();
+  const a = runIn(cwd, "挖掘认证前漏洞");
+  const b = runIn(cwd, "文件读取利用");
+  assert.equal(findRun(cwd, a)?.dir, a, "exact name");
+  assert.equal(findRun(cwd, "sec001")?.dir, a, "unique prefix");
+  assert.equal(findRun(cwd, "sec002")?.dir, b);
+  assert.equal(findRun(cwd, "sec00"), null, "a prefix matching both is refused, not guessed");
+  assert.equal(findRun(cwd, "nope"), null);
 });
