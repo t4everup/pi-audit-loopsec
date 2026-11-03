@@ -470,6 +470,22 @@ export function setActiveRun(projectRoot: string, run: RunRef | null): { ok: boo
 }
 
 /**
+ * The OPERATOR'S claim only — what a typed command means, ignoring any in-flight round.
+ *
+ * `readActiveRun` prefers the turn claim, which is right for PATH RESOLUTION (a tool call inside a
+ * round must write to the run that round belongs to) and wrong for TELLING THE OPERATOR what a control
+ * verb acted on: after `use sec001`, a `pause` during sec002's round pauses sec002, and without this
+ * distinction the message cannot say so.
+ */
+export function readCurrentClaim(projectRoot: string): RunRef | null {
+  const claims = readClaims(projectRoot);
+  if (!claims?.current) return null;
+  const resolved = resolveRunDir(projectRoot, claims.current.dir);
+  if (!resolved || !fs.existsSync(resolved)) return null;
+  return claims.current;
+}
+
+/**
  * Claim a run for the round that is about to be sent.
  *
  * This is the whole reason several runs can advance in rotation: a tool called during the turn that

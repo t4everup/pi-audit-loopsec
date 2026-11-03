@@ -32,6 +32,7 @@ import {
   loadSec,
   nextRunName,
   readActiveRun,
+  readCurrentClaim,
   readTurnClaim,
   secBaseDir,
   secTreeLogPath,
@@ -205,6 +206,28 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
             return null;
           }
           return snapshot;
+        };
+
+        /**
+         * WHICH RUN a control verb just acted on, for the message.
+         *
+         * With several runs this is not cosmetic: `secStateDir` prefers the TURN claim, so `pause`
+         * during another run's round pauses THAT run, not the one `use` selected. Saying so — and
+         * naming both when they differ — is the difference between a surprise and a warning.
+         */
+        const actedOn = (): string => {
+          const effective = readActiveRun(cwd);
+          if (!effective) return "";
+          const turn = readTurnClaim(cwd);
+          const mine = readCurrentClaim(cwd);
+          const line = `\n  run: ${effective.run}`;
+          if (turn && mine && turn.run !== mine.run) {
+            return (
+              line +
+              ` (a round is in flight for it — that is what this acted on; \`use\` points at ${mine.run})`
+            );
+          }
+          return line;
         };
 
         /** Prepare a round and hand the brief to the model. */
@@ -423,24 +446,24 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
             if (!budgetSnapshot) return;
             if (budget !== "" && /^\d+$/.test(budget)) {
               const result = pauseAfterRounds(cwd, budgetSnapshot, Number(budget), undefined, kind);
-              notify(result.ok ? result.message! : `REJECTED: ${result.errors.join("\n")}`, result.ok ? "info" : "warning");
+              notify(
+                result.ok ? `${result.message}${actedOn()}` : `REJECTED: ${result.errors.join("\n")}`,
+                result.ok ? "info" : "warning",
+              );
               refreshWidget(ctx);
               return;
             }
-            if (budget !== "") {
-              notify(
-                `REJECTED: "${budget}" is not a round count.\n\n` +
-                  `  /${loopCommandName(kind)} pause          pause now\n` +
-                  `  /${loopCommandName(kind)} pause <n>      run n MORE rounds, then pause\n` +
-                  `  /${loopCommandName(kind)} pause <reason> pause now, recording why`,
-                "warning",
-              );
-              return;
-            }
+            // A NON-NUMERIC ARGUMENT IS THE REASON, not a mistake. The refusal above used to advertise
+            // `pause <reason>` while returning before anything could be paused with one — a message that
+            // names a dead end, which is the class of bug this file has fixed twice before.
+            const pauseReason = budget !== "" ? budget : "paused by the user";
             const pauseSnapshot = loadOrReport();
             if (!pauseSnapshot) return;
-            const result = pauseLoop(cwd, pauseSnapshot, "paused by the user", undefined, kind);
-            notify(result.ok ? result.message! : `REJECTED: ${result.errors.join("; ")}`, result.ok ? "info" : "warning");
+            const result = pauseLoop(cwd, pauseSnapshot, pauseReason, undefined, kind);
+            notify(
+              result.ok ? `${result.message}${actedOn()}` : `REJECTED: ${result.errors.join("; ")}`,
+              result.ok ? "info" : "warning",
+            );
             refreshWidget(ctx);
             return;
           }
@@ -481,7 +504,10 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
             const stopSnapshot = loadOrReport();
             if (!stopSnapshot) return;
             const result = stopLoop(cwd, stopSnapshot, rest || "stopped by the user", undefined, kind);
-            notify(result.ok ? result.message! : `REJECTED: ${result.errors.join("; ")}`, result.ok ? "info" : "warning");
+            notify(
+              result.ok ? `${result.message}${actedOn()}` : `REJECTED: ${result.errors.join("; ")}`,
+              result.ok ? "info" : "warning",
+            );
             refreshWidget(ctx);
             return;
           }

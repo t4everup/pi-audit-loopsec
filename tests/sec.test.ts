@@ -18,6 +18,8 @@ import * as path from "node:path";
 
 import {
   LEGACY_RUN_SLUG,
+  claimTurn,
+  readCurrentClaim,
   RUNS_DIR_NAME,
   appendSecEvent,
   findRun,
@@ -36,6 +38,15 @@ import { evaluateRound, pauseAfterRounds, pauseLoop, resumeLoop, startLoop, stop
 import { advanceRuns, endDeepRun, parkOnSendFailure, startDeepRun } from "../extensions/loop-sec/loop.ts";
 import { loadSettings, saveSettings } from "../extensions/loop-sec/settings.ts";
 import { LOOP_VERBS, parseArgs, tailAfterVerb } from "../extensions/loop-sec/args.ts";
+
+// THE SUITE MUST NOT READ THIS MACHINE'S USER-LEVEL SETTINGS.
+//
+// `loadSettings` layers `~/.pi-loopsec/settings.json` underneath the project's own file, so a test that
+// assumes a built-in default silently starts asserting against whatever the operator has set globally.
+// It did: after `/loopsec config fenceLanguage=bash`, "the setting refuses a value that is not a
+// language tag" failed with `got "bash"` — the test was correct and the assertion was reading a file
+// outside the test.
+process.env.PI_LOOPSC_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "loopsec-home-"));
 import { loopCommandName, type SecFindingStep } from "../extensions/loop-sec/types.ts";
 import {
   appendSecLedger,
@@ -3528,4 +3539,26 @@ test("config parses the REAL way — through parseArgs, not a replicated fragmen
 
   // No pairs at all means "show the settings", which is a different branch.
   assert.deepEqual(parse("config"), { global: false, patch: {} });
+});
+
+test("with several runs, the control verb names the run it acted on — and can say that is NOT yours", () => {
+  // `secStateDir` prefers the TURN claim, so `pause` during another run's round pauses THAT run, not the
+  // one `use` selected. The mechanism is right — a tool call inside a round must write to the run the
+  // round belongs to — so what was missing was saying which one, and warning when it is not yours.
+  const cwd = seeded();
+  const a = runIn(cwd, "挖掘认证前漏洞");
+  const b = runIn(cwd, "文件读取利用");
+  const nameOf = (dir: string): string => dir.split("/")[1]!;
+
+  // The operator's commands point at b...
+  assert.equal(setActiveRun(cwd, { dir: b, run: nameOf(b) }).ok, true);
+  // ...and a round of a is put in flight, exactly the way advanceRuns does it.
+  const aNext = (loadSecIn(cwd, a)!.snapshot.loop?.round ?? 0) + 1;
+  assert.equal(claimTurn(cwd, { dir: a, run: nameOf(a) }, aNext).ok, true);
+  tickLoop(cwd, loadSec(cwd).snapshot);
+
+  assert.equal(readTurnClaim(cwd)?.dir, a, "a's round is the one in flight");
+  assert.equal(readCurrentClaim(cwd)?.dir, b, "the operator's choice is unchanged");
+  // What a control verb will hit is the TURN claim — the fact the message has to disclose.
+  assert.equal(secStateDir(cwd), path.join(cwd, ".pi-loopsec", a));
 });
