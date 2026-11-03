@@ -143,12 +143,26 @@ for twenty rounds is what the sweep already did for three.
 - Settings **layer**: `runs/<run>/settings.json` overrides `.pi-loopsec/settings.json`, which
   overrides the user layer, key by key — so `allowCommandProbes` is inherited rather than lost.
 
-## Turning probes on — once, not per project
+## Probes: ON by default
 
 `sec_verify` runs ONE shell command per finding — **the command the model wrote** — inside the
-audited project, as you. That is the only thing here that touches anything outside the source tree,
-so it is gated by `allowCommandProbes` (default **off**; off means the report is entirely static
-claims, and says so).
+audited project, as you. That is the only thing here that touches anything outside the source tree.
+It is **ON by default** (300s timeout, 20k output cap), because the difference between "I read the
+sink" and "I made it fire" is the whole product.
+
+Nothing to configure on a fresh project. What is left is the opt-out, for a target where a PoC has
+side effects — a live service, a shared database:
+
+```text
+/loopsec config allowCommandProbes=false        # this project only
+```
+
+Turning it off does not stop the model from running anything (it has its own shell); it stops the
+AUDIT LOOP from doing it unattended and from recording the result as verification. Every finding
+then closes with `_未经验证：无等级 · 无证伪 · 无对抗复核_` and the overview says the report is
+entirely static claims.
+
+To change the defaults for every project at once (this is optional now):
 
 ```text
 /loopsec config --global allowCommandProbes=true commandTimeoutMs=300000 maxOutputChars=20000

@@ -75,6 +75,11 @@
 
 ### 3.3 `sec_verify` 的输出截断按"字符"而非"字节"，且不脱敏
 
+> 注意：`allowCommandProbes` 现在是**默认开启**（300s / 20k），所以这一条的风险面比之前大 ——
+> 探针默认会跑，而输出（可能含口令/token）会原样写进 `tree.jsonl` 和报告。
+> 另外没有针对破坏性命令的护栏：`DELETE|DROP|TRUNCATE|UPDATE|rm ` 之类的命令会被照跑不误，
+> 唯一的刹车是每个项目可以 `/loopsec config allowCommandProbes=false`。
+
 `maxOutputChars` 默认 8000。命令输出里可能有 token/密码（例如连库的 PoC），
 现在会原样进入 `tree.jsonl` 和报告。审计工具把凭据写进交付物是危险的。
 

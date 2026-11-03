@@ -41,9 +41,16 @@ export const SETTINGS_NAME = "settings.json";
 
 export interface HypothesisSettings {
   /**
-   * Consent gate for `command` probes. FALSE by default.
+   * Consent gate for `command` probes. TRUE by default, and deliberately so.
    *
-   * Read-only probes are unaffected: they run whether or not this is set.
+   * WHAT THE GATE ACTUALLY GUARDS: `sec_verify` runs one shell command, and the command string is
+   * written by the MODEL. It executes in the audited project, as the operator, once per verification —
+   * bounded by `commandTimeoutMs` and `maxOutputChars`, and gated on an `expect` stated before the run.
+   * Turning it off does not stop the model from running anything (it has its own shell); it stops the
+   * AUDIT LOOP from doing it unattended and from recording the result as verification.
+   *
+   * Set it to `false` in a project's own `.pi-loopsec/settings.json` for a target that must not be
+   * probed: a live production system, a shared database, anything where a PoC has side effects.
    */
   allowCommandProbes: boolean;
   /** Hard ceiling for one command probe, in milliseconds. */
@@ -140,9 +147,21 @@ export interface HypothesisSettings {
 }
 
 export const DEFAULT_SETTINGS: HypothesisSettings = {
-  allowCommandProbes: false,
-  commandTimeoutMs: 120_000,
-  maxOutputChars: 8_000,
+  // ON BY DEFAULT, for the environment this mode is built for: an authorised audit where the
+  // difference between "I read the sink" and "I made it fire" is the entire product. OFF meant every
+  // report was a page of static claims until somebody remembered a config command, and a setting that
+  // has to be re-typed per project is a setting that is usually missing.
+  //
+  // The gate still exists and still matters: `allowCommandProbes: false` remains the way to say "this
+  // target must not be probed", set it in the project's own settings.json and it overrides this. What
+  // changed is which side of the gate you get for free.
+  //
+  // Bounds are raised with it: 300s because a real PoC against a live service is slow (startup,
+  // first-request JIT, a DB connect), and 20k characters because 8k truncated stack traces and
+  // response bodies mid-line — the part that proved the finding was the part that got cut.
+  allowCommandProbes: true,
+  commandTimeoutMs: 300_000,
+  maxOutputChars: 20_000,
   maxGrepMatches: 50,
   locationContext: 6,
   maxFilesScanned: 4_000,

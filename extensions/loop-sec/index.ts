@@ -272,13 +272,13 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
                   "",
                   live,
                   "",
-                  "The one that matters for sec_verify: allowCommandProbes (default false — nothing is executed without it).",
+                  "sec_verify runs the MODEL's command — bounded, and only with an `expect` stated first. Set allowCommandProbes=false in a project to forbid it there.",
                   ...(settings.allowCommandProbes
                     ? [
                         "",
                         probeFrom
                           ? `allowCommandProbes is ON, set by: ${probeFrom}`
-                          : "allowCommandProbes is ON (from the built-in default — it should not be).",
+                          : "allowCommandProbes is ON (built-in default). Set it to false in a project's own settings.json to forbid probes there.",
                       ]
                     : []),
                 ].join("\n"),

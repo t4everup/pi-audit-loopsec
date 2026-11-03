@@ -478,14 +478,17 @@ test("the round summary says how much of the surface has been examined", () => {
 // This is the only tool in the mode that touches anything outside the source tree, so it
 // needs the strongest tests: the gate, the bounds, and the verdict.
 
-test("sec_verify is REFUSED until the project consents, and names the setting", () => {
+test("a project can FORBID probes, and the refusal names the setting that forbids them", () => {
+  // Probes are ON by default, so what is left to test is the gate itself: a target where a PoC has side
+  // effects has to be able to say "not here", and the refusal has to say which line said so.
   const cwd = seeded();
   startSec(cwd);
+  saveSettings(cwd, { allowCommandProbes: false });
   const f = recordFinding(cwd, { title: "x", category: "rce", file: "src/a.c", line: 1 });
   if (!f.ok) return assert.fail("the finding must record");
-  assert.equal(loadSettings(cwd).settings.allowCommandProbes, false, "off by default");
+  assert.equal(loadSettings(cwd).settings.allowCommandProbes, false, "the project forbade it");
   const r = verifyFinding(cwd, f.value.id, { command: "echo hi", expect: "prints hi" });
-  assert.equal(r.ok, false, "nothing is executed without consent");
+  assert.equal(r.ok, false, "nothing is executed when the project forbids it");
   assert.match(r.errors.join(" "), /allowCommandProbes=true/, "and the refusal names the fix");
   assert.equal(loadSec(cwd).snapshot.findings[0]!.verification, undefined, "nothing was recorded");
 });
@@ -759,8 +762,12 @@ test("a HIGH finding nobody ran is a depth target — but only when probes are A
 test("an ordinary HIGH finding with no gate, no deepen flag and probes off is NOT a depth target", () => {
   // The reflex must not fire on everything, or the work list never gets touched: a depth round is
   // the expensive kind, and it is spent where the model says there is more.
+  //
+  // Probes are ON by default, so "off" is now an explicit project setting rather than the absence of
+  // one — which is why this test says so instead of relying on the default.
   const cwd = seeded();
   startSec(cwd, "x", 99, 1);
+  saveSettings(cwd, { allowCommandProbes: false });
   submitSecRecon(cwd, NOTE);
   recordSurface(cwd, { title: "S1", kind: "sink", file: "s.py", line: 1 });
   recordFinding(cwd, { title: "plain high", category: "rce", severity: "high", file: "d.py", line: 4, evidence: "e" });

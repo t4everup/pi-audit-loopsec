@@ -350,9 +350,9 @@ export function updateFinding(projectRoot: string, id: string, patch: SecFinding
  * the only thing that needs a gate. Three rules, and each exists for a failure this project
  * has already seen:
  *
- *   1. CONSENT FIRST. `allowCommandProbes` defaults to false, and the refusal names the exact
- *      setting that turns it on. A mode that could send requests to a live target without the
- *      operator saying so is not a triage tool, it is a scanner nobody asked for.
+ *   1. CONSENT FIRST. `allowCommandProbes` is a real gate even though it defaults to true: setting it
+ *      to false in a project's own settings.json refuses every probe there, and the refusal names the
+ *      exact setting to change. A target where a PoC has side effects must be able to say "not here".
  *
  *   2. THE EXPECTATION IS STATED BEFORE THE RUN. `expect` is required, and `confirmed` is
  *      COMPUTED from the exit code and the output substring — never taken from the caller's
