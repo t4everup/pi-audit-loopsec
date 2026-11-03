@@ -3482,3 +3482,50 @@ test("every verb the help text advertises is actually ROUTED", () => {
     assert.ok(LOOP_VERBS.includes(c), `case "${c}" exists but "${c}" is not in LOOP_VERBS`);
   }
 });
+
+test("config parses the REAL way — through parseArgs, not a replicated fragment", () => {
+  // The earlier test reproduced the split logic on a plain string and passed while the verb was dead:
+  // `parseArgs` moves every `key=value` into `flags`, so `positional` — which the verb used to read —
+  // never contained one. `/loopsec config allowCommandProbes=true` showed the settings and wrote
+  // nothing. This test goes through the same two functions the command uses.
+  const parse = (input: string) => {
+    const parsed = parseArgs(input);
+    const first = parsed.positional[0]!;
+    const tokens = tailAfterVerb(parsed.tokens, first, 0);
+    const global = tokens.some((t) => t.replace(/^["']|["']$/g, "") === "--global");
+    const rest = tokens.filter((t) => t.replace(/^["']|["']$/g, "") !== "--global").join(" ").trim();
+    const patch: Record<string, unknown> = {};
+    for (const pair of rest === "" ? [] : rest.split(/\s+/).filter((p) => p.includes("="))) {
+      const eq = pair.indexOf("=");
+      const key = pair.slice(0, eq).trim();
+      if (key === "") continue;
+      let value: unknown = pair.slice(eq + 1).trim().replace(/^"(.*)"$/s, "$1").replace(/^'(.*)'$/s, "$1");
+      if (value === "true") value = true;
+      else if (value === "false") value = false;
+      else if (typeof value === "string" && value !== "" && !Number.isNaN(Number(value))) value = Number(value);
+      patch[key] = value;
+    }
+    return { global, patch };
+  };
+
+  // The spellings that MUST work.
+  assert.deepEqual(parse("config allowCommandProbes=true"), { global: false, patch: { allowCommandProbes: true } });
+  assert.deepEqual(parse("config fenceLanguage=bash"), { global: false, patch: { fenceLanguage: "bash" } });
+  assert.deepEqual(parse('config fenceLanguage="bash"'), { global: false, patch: { fenceLanguage: "bash" } });
+  assert.deepEqual(parse("config allowCommandProbes=true commandTimeoutMs=300000 maxOutputChars=20000"), {
+    global: false,
+    patch: { allowCommandProbes: true, commandTimeoutMs: 300000, maxOutputChars: 20000 },
+  });
+  assert.deepEqual(parse("config --global commandTimeoutMs=240000"), { global: true, patch: { commandTimeoutMs: 240000 } });
+  assert.deepEqual(parse("config allowCommandProbes=false pursuitRounds=5"), {
+    global: false,
+    patch: { allowCommandProbes: false, pursuitRounds: 5 },
+  });
+
+  // Spaces around the "=" are NOT a valid spelling, and must produce nothing rather than a setting
+  // named "" — the command refuses that pair by name.
+  assert.deepEqual(parse('config fenceLanguage = "bash"').patch, {});
+
+  // No pairs at all means "show the settings", which is a different branch.
+  assert.deepEqual(parse("config"), { global: false, patch: {} });
+});

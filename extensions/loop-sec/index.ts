@@ -161,8 +161,19 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
         const rest = verb ? positional.slice(1).join(" ").trim() : positional.join(" ").trim();
         // `--global` is a TARGET for the `config` verb, not a setting: without stripping it the parser
         // would look for a setting literally named "--global".
-        const configGlobal = /(^|\s)--global(\s|$)/.test(rest);
-        const configRest = rest.replace(/(^|\s)--global(\s|$)/g, " ").trim();
+        //
+        // READ FROM `tokens`, NOT FROM `rest`. `parseArgs` moves every `key=value` token into `flags`,
+        // so `positional` never contains one and `rest` was empty for the exact input this verb exists
+        // for: `/loopsec config allowCommandProbes=true` became "show the settings" and wrote nothing,
+        // and `config --global k=v` became rest = "--global" and wrote nothing either. The verb was
+        // documented, tested at the string level, and dead end to end. `tailAfterVerb` returns the raw
+        // text after the verb, which is what a `key=value` parser actually needs.
+        const configTokens = tailAfterVerb(parsed.tokens, first, 0);
+        const configGlobal = configTokens.some((t) => t.replace(/^["']|["']$/g, "") === "--global");
+        const configRest = configTokens
+          .filter((t) => t.replace(/^["']|["']$/g, "") !== "--global")
+          .join(" ")
+          .trim();
         const cwd = ctx.cwd;
         const notify = (m: string, t: "info" | "warning" | "error" = "info"): void => ctx.ui.notify(m, t);
 
@@ -290,10 +301,20 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
               const eq = pair.indexOf("=");
               const key = pair.slice(0, eq).trim();
               if (key === "") {
-                notify(`REJECTED: "${pair}" has no setting name before the "=" — write key=value.`, "warning");
+                notify(
+                  `REJECTED: "${pair}" has no setting name before the "=" — write it as ONE token: ` +
+                    `/loopsec config key=value (no spaces around the "=").`,
+                  "warning",
+                );
                 return;
               }
-              let value: unknown = pair.slice(eq + 1);
+              // A value written as `key="bash"` keeps its quotes in the raw token; the quotes are the
+              // shell's, not part of the setting.
+              let value: unknown = pair
+                .slice(eq + 1)
+                .trim()
+                .replace(/^"(.*)"$/s, "$1")
+                .replace(/^'(.*)'$/s, "$1");
               if (value === "true") value = true;
               else if (value === "false") value = false;
               else if (typeof value === "string" && value !== "" && !Number.isNaN(Number(value))) value = Number(value);
