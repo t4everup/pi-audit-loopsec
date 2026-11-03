@@ -107,3 +107,34 @@ export function tailAfterVerb(tokens: readonly string[], verb: string, skipAfter
 function quote(value: string): string {
   return `"${value.replace(/"/g, '\\"')}"`;
 }
+
+//
+// A VERB THAT IS NOT IN THIS LIST IS NOT AN ERROR — it silently becomes the OBJECTIVE of a new run,
+// because anything the handler cannot match falls through to the start path. `/loopsec ls` therefore
+// created a run whose objective was the word "ls", which looks exactly like success. Keeping the list
+// exported lets a test assert that everything the help text advertises is actually routed.
+export const LOOP_VERBS: readonly string[] = [
+  "start",
+  "status",
+  "pause",
+  "resume",
+  "stop",
+  "cancel",
+  "next",
+  "tree",
+  "log",
+  "report",
+  "note",
+  "context",
+  "notes",
+  "dismiss",
+  "hide",
+  "close",
+  "show",
+  "config",
+  "deep",
+  "ls",
+  "runs",
+  "use",
+  "help",
+]
