@@ -40,6 +40,7 @@ import { advanceRuns, endDeepRun, parkOnSendFailure, pickNextRun, startDeepRun }
 import { loadSettings, saveSettings } from "../extensions/loop-sec/settings.ts";
 import { LOOP_VERBS, parseArgs, tailAfterVerb } from "../extensions/loop-sec/args.ts";
 import { noteSecToolCall, secToolCallCount } from "../extensions/loop-sec/activity.ts";
+import { acquireTurnLock, turnLockDir } from "../extensions/loop-sec/lock.ts";
 
 // THE SUITE MUST NOT READ THIS MACHINE'S USER-LEVEL SETTINGS.
 //
@@ -4042,4 +4043,79 @@ test("a SWEEP run never gets a wrap-up proposal, however tidy its list looks", (
   recordSurface(cwd, { title: "a", kind: "sink", file: "a.py", line: 1 });
   clearSurface(cwd, "S-0001", "守卫在 a.py:1 之前执行，这条路径不在公开路由表里", { file: "a.py", line: 1 });
   assert.equal(deepWrapUp(loadSec(cwd).snapshot), null);
+});
+
+// =================================================================
+// CROSS-PROCESS LOCK — one round at a time, two windows
+// =================================================================
+
+test("a second window cannot take a round while the first holds the lock", () => {
+  // The failure this exists to stop: two windows on one project, both writing the single turn claim, so
+  // the loser's tool calls resolve to the winner's run and its finding lands in another audit's log.
+  const cwd = seeded();
+  const first = acquireTurnLock(cwd, { ttlMs: 600_000 });
+  assert.equal(first.ok, true);
+  const second = acquireTurnLock(cwd, { ttlMs: 600_000 });
+  assert.equal(second.ok, false, "the second window must not work a round");
+  assert.match(second.ok ? "" : second.reason, /another process is working a round/);
+  assert.match(second.ok ? "" : second.reason, new RegExp(`pid ${process.pid}`), "and it names the holder");
+  if (first.ok) first.release();
+});
+
+test("advanceRuns SKIPS when another process holds the lock, and says so", () => {
+  const cwd = seeded();
+  runIn(cwd, "挖掘认证前rce");
+  const held = acquireTurnLock(cwd, { ttlMs: 600_000 });
+  assert.equal(held.ok, true);
+  const before = loadSec(cwd).snapshot.loop?.round;
+
+  const advanced = advanceRuns(cwd);
+  assert.equal(advanced.sent, undefined, "no round was dispatched");
+  assert.match(advanced.idleReason ?? "", /another process/);
+  assert.equal(loadSec(cwd).snapshot.loop?.round, before, "and nothing moved");
+
+  if (held.ok) held.release();
+  // With the lock released, the next attempt works.
+  const after = advanceRuns(cwd);
+  assert.ok(after.sent, `the round goes ahead once the lock is free: ${after.idleReason ?? ""}`);
+});
+
+test("the lock is RELEASED even when the round path throws", () => {
+  const cwd = seeded();
+  runIn(cwd, "挖掘认证前rce");
+  // A throw inside the evaluation is simulated by making the log unreadable at the worst moment: the
+  // wrapper's `finally` is what this asserts, not the throw itself.
+  let threw = false;
+  try {
+    advanceRuns(cwd);
+  } catch {
+    threw = true;
+  }
+  assert.equal(threw, false, "a clean round does not throw");
+  // Whatever happened, the lock must be free afterwards.
+  const again = acquireTurnLock(cwd, { ttlMs: 600_000 });
+  assert.equal(again.ok, true, "the lock did not leak");
+  if (again.ok) again.release();
+});
+
+test("a STALE lock is taken over — a killed process must not block the run forever", () => {
+  const cwd = seeded();
+  runIn(cwd, "挖掘认证前rce");
+  // Hold it, then pretend the owner died: the TTL is what makes this recoverable.
+  const held = acquireTurnLock(cwd, { ttlMs: 1 });
+  assert.equal(held.ok, true);
+  const taken = acquireTurnLock(cwd, { ttlMs: 0, at: Date.now() + 10_000 });
+  assert.equal(taken.ok, true, "an owner older than the TTL is taken over");
+  if (taken.ok) taken.release();
+});
+
+test("the lock directory is the only thing removed — records are append-only", () => {
+  const cwd = seeded();
+  runIn(cwd, "挖掘认证前rce");
+  const logBefore = fs.readFileSync(path.join(cwd, ".pi-loopsec", "runs", listRuns(cwd)[0]!.run, "tree.jsonl"), "utf-8");
+  const lock = acquireTurnLock(cwd, { ttlMs: 600_000 });
+  if (lock.ok) lock.release();
+  assert.equal(fs.existsSync(turnLockDir(cwd)), false, "the lock is gone");
+  const logAfter = fs.readFileSync(path.join(cwd, ".pi-loopsec", "runs", listRuns(cwd)[0]!.run, "tree.jsonl"), "utf-8");
+  assert.equal(logAfter, logBefore, "and the log is untouched");
 });

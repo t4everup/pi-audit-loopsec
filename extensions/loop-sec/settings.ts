@@ -117,6 +117,14 @@ export interface HypothesisSettings {
    */
   reconRounds: number;
   /**
+   * How long a round lock may be held before another process takes it over.
+   *
+   * A process killed mid-round leaves the lock behind. Without a TTL the run would be blocked forever by
+   * a dead owner; with one too short, two windows can both work a round. Ten minutes is longer than any
+   * single round should take and shorter than an operator would wait before checking.
+   */
+  lockTtlMs: number;
+  /**
    * The language of the REPORT's own scaffolding.
    *
    * Only the scaffolding: the headings, the labels, the method section. The
@@ -175,6 +183,7 @@ export const DEFAULT_SETTINGS: HypothesisSettings = {
   // to break. The model can always close early with `pursuitClosed` once it concludes.
   pursuitRounds: 3,
   reconRounds: 2,
+  lockTtlMs: 600_000,
   // zh by default: this extension's operating instructions are Chinese-first,
   // and a report nobody on the team can read is not a deliverable.
   reportLanguage: "zh",
@@ -392,6 +401,14 @@ export function allowCommandProbesOf(projectRoot: string): boolean {
 }
 
 /** The per-finding depth budget, so the report can print `已花 N/M 轮`. */
+export function lockTtlMsOf(projectRoot: string): number {
+  try {
+    return loadSettings(projectRoot).settings.lockTtlMs;
+  } catch {
+    return DEFAULT_SETTINGS.lockTtlMs;
+  }
+}
+
 export function pursuitRoundsOf(projectRoot: string): number {
   try {
     return loadSettings(projectRoot).settings.pursuitRounds;
@@ -492,6 +509,7 @@ function applySettingsObject(o: Record<string, unknown>, settings: HypothesisSet
   // Capped at 5: past that the rounds are re-reading, not understanding, and the plateau
   // no longer protects the run because a re-read can still add a sentence.
   num("reconRounds", 1, 5);
+  num("lockTtlMs", 10_000, 3_600_000);
 
   return partial;
 }

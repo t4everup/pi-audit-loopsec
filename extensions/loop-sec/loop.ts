@@ -126,8 +126,9 @@ function appendLoopEvent(projectRoot: string, kind: AuditLoopKind, event: TreeEv
   return kind === "sec" ? appendSecEvent(projectRoot, event) : appendEvent(projectRoot, event);
 }
 import { markNotesDelivered, pendingNotes, renderNotesSection, renderNotesStatus, writeOperatorMirror } from "./notes.js";
-import { loadSettings, reportLanguageOf } from "./settings.js";
+import { loadSettings, lockTtlMsOf, reportLanguageOf } from "./settings.js";
 import { secToolCallCount } from "./activity.js";
+import { DEFAULT_LOCK_TTL_MS, acquireTurnLock } from "./lock.js";
 import {
   SEC_DIG_BUDGET,
   appendSecLedger,
@@ -826,6 +827,25 @@ export interface AdvanceResult {
  * "that round is known to have produced nothing".
  */
 export function advanceRuns(projectRoot: string, opts: { at?: string; dryRun?: boolean } = {}): AdvanceResult {
+  // ---- ONE ROUND AT A TIME, ACROSS PROCESSES ----------------------------------------------
+  //
+  // The turn claim keeps one round in flight per PROCESS; two windows open on the same project both write
+  // it, and the loser's tool calls then resolve to the winner's run — a finding landing in another
+  // audit's log with neither window reporting anything. The lock is taken here because this function is
+  // the single entry for a round (the settle path and `/loopsec next` both come through it).
+  //
+  // The TTL comes from settings so an operator can shorten it; a released lock is removed in a `finally`
+  // so an exception cannot leave the project wedged.
+  const lock = acquireTurnLock(projectRoot, { ttlMs: lockTtlMsOf(projectRoot) });
+  if (!lock.ok) return { idleReason: lock.reason };
+  try {
+    return advanceRunsLocked(projectRoot, opts);
+  } finally {
+    lock.release();
+  }
+}
+
+function advanceRunsLocked(projectRoot: string, opts: { at?: string; dryRun?: boolean } = {}): AdvanceResult {
   const at = opts.at ?? nowIso();
   const out: AdvanceResult = {};
 
