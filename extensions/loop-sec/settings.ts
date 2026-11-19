@@ -125,6 +125,18 @@ export interface HypothesisSettings {
    */
   lockTtlMs: number;
   /**
+   * May a probe run a command that MUTATES state?
+   *
+   * `allowCommandProbes` says "this project may be probed at all". This one says "…and a probe may
+   * change something", which is a different decision: `DELETE`, `DROP`, `TRUNCATE`, `UPDATE`,
+   * `rm -rf` against a live service are not experiments, they are incidents. Refused by default while
+   * probes are on, so a model's slip on a target that happens to be connected to real data is a refused
+   * round instead of a lost table.
+   *
+   * Read-only probes are unaffected: `curl`, `python3 poc.py`, `SELECT`, `cat` all pass.
+   */
+  allowDestructiveProbes: boolean;
+  /**
    * The language of the REPORT's own scaffolding.
    *
    * Only the scaffolding: the headings, the labels, the method section. The
@@ -184,6 +196,7 @@ export const DEFAULT_SETTINGS: HypothesisSettings = {
   pursuitRounds: 3,
   reconRounds: 2,
   lockTtlMs: 600_000,
+  allowDestructiveProbes: false,
   // zh by default: this extension's operating instructions are Chinese-first,
   // and a report nobody on the team can read is not a deliverable.
   reportLanguage: "zh",
@@ -401,6 +414,14 @@ export function allowCommandProbesOf(projectRoot: string): boolean {
 }
 
 /** The per-finding depth budget, so the report can print `已花 N/M 轮`. */
+export function allowDestructiveProbesOf(projectRoot: string): boolean {
+  try {
+    return loadSettings(projectRoot).settings.allowDestructiveProbes === true;
+  } catch {
+    return false;
+  }
+}
+
 export function lockTtlMsOf(projectRoot: string): number {
   try {
     return loadSettings(projectRoot).settings.lockTtlMs;
@@ -484,6 +505,7 @@ function applySettingsObject(o: Record<string, unknown>, settings: HypothesisSet
   };
 
   bool("allowCommandProbes");
+  bool("allowDestructiveProbes");
   const str = (key: keyof HypothesisSettings, valid: (v: unknown) => boolean): void => {
     if (key in o) {
       if (valid(o[key])) settings[key] = o[key] as never;

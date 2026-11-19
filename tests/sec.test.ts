@@ -89,6 +89,8 @@ import {
   reconSections,
   submitSecRecon,
   verifyFinding,
+  looksDestructive,
+  redactSecrets,
   updateSurface,
   surfaceProgress,
   updateFinding,
@@ -4155,4 +4157,81 @@ test("observations do not resurrect a round that produced nothing AND recorded n
   modelActed();
   tickLoop(cwd, loadSec(cwd).snapshot); // settles round 1 with nothing recorded
   assert.equal(loadSec(cwd).snapshot.loop?.stallRounds, 1, "still unproductive");
+});
+
+// =================================================================
+// PROBES THAT MUTATE, AND SECRETS IN THEIR OUTPUT
+// =================================================================
+//
+// Probes are ON by default now (300s / 20k). Two consequences have to be handled together, because they
+// are the same decision: "this project may be probed" is not "a probe may change the target" and it is
+// not "what the target returns may be stored verbatim".
+
+test("a probe that would MUTATE is refused by default, and the refusal names the setting", () => {
+  const cwd = seeded();
+  startSec(cwd);
+  const f = recordFinding(cwd, { title: "sql 注入", category: "sqli", severity: "high", file: "a.py", line: 1, evidence: "e" });
+  if (!f.ok) return assert.fail("the finding must record");
+
+  for (const cmd of ["mysql -e 'DROP TABLE users'", "python3 -c \"import os; os.system('rm -rf /tmp/x')\"", "psql -c 'DELETE FROM t'"]) {
+    const r = verifyFinding(cwd, f.value.id, { command: cmd, expect: "some output" });
+    assert.equal(r.ok, false, `must be refused: ${cmd}`);
+    assert.match(r.ok ? "" : r.errors.join(" "), /would CHANGE something/);
+    assert.match(r.ok ? "" : r.errors.join(" "), /allowDestructiveProbes=true/, "and it names the way through");
+  }
+  assert.equal(loadSec(cwd).snapshot.findings[0]!.verification, undefined, "nothing was recorded and nothing ran");
+});
+
+test("read-only probes still pass the guard — the check is about verbs, not words", () => {
+  const cwd = seeded();
+  startSec(cwd);
+  // No false positives on ordinary probes.
+  assert.equal(looksDestructive("curl -s 'http://127.0.0.1:8080/api?id=1'"), false);
+  assert.equal(looksDestructive("python3 poc.py --target localhost"), false);
+  assert.equal(looksDestructive("rg -n 'DELETE FROM' src/"), false, "searching FOR the word is not doing it");
+  assert.equal(looksDestructive("curl 'http://x/?q=deleted'"), false);
+  // And the real thing is caught.
+  assert.equal(looksDestructive("mysql -e 'drop table t'"), true);
+  assert.equal(looksDestructive("sh -c 'rm -rf /var/www'"), true);
+  assert.equal(looksDestructive("SELECT 1; DROP TABLE t"), true);
+});
+
+test("allowDestructiveProbes=true is the explicit way through", () => {
+  const cwd = seeded();
+  startSec(cwd);
+  saveSettings(cwd, { allowDestructiveProbes: true });
+  assert.equal(loadSettings(cwd).settings.allowDestructiveProbes, true);
+  // The guard no longer fires; the command itself is then up to the timeout, which is not this test.
+  assert.equal(looksDestructive("mysql -e 'drop table t'"), true, "still destructive — it is now permitted");
+});
+
+test("secrets in probe output are REDACTED, and the record says so", () => {
+  const cwd = seeded();
+  startSec(cwd);
+  const f = recordFinding(cwd, { title: "配置泄露", category: "info-disclosure", severity: "medium", file: "a.py", line: 2, evidence: "e" });
+  if (!f.ok) return assert.fail("the finding must record");
+
+  const r = verifyFinding(cwd, f.value.id, {
+    command: `printf 'password=hunter2\\ntoken: abc123\\nAuthorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcdefghij\\nhost=db'`,
+    expect: "prints a config",
+    expectOutput: "***",
+  });
+  assert.equal(r.ok, true, r.ok ? "" : r.errors.join("; "));
+  const v = loadSec(cwd).snapshot.findings[0]!.verification!;
+  assert.ok(!v.output.includes("hunter2"), `the password must not be stored: ${v.output}`);
+  assert.ok(!v.output.includes("abc123"), "nor the token");
+  assert.ok(!v.output.includes("eyJhbGciOiJIUzI1NiJ9"), "nor the JWT");
+  assert.match(v.output, /password=\*\*\*/);
+  assert.match(v.output, /host=db/, "and ordinary text is left alone");
+  assert.equal(v.redacted, true, "the record says the output is not verbatim");
+});
+
+test("redaction is best-effort and says so — it does not claim to be complete", () => {
+  // A value with no recognisable key in front of it is NOT caught, which is exactly why the record is
+  // marked "redacted" rather than presented as safe.
+  const out = redactSecrets("the answer is 42 and the secret-looking blob is 9f8e7d6c5b4a");
+  assert.equal(out.changed, false, "no key, no claim");
+  const hit = redactSecrets("api_key: sk-live-abcdef123456");
+  assert.equal(hit.changed, true);
+  assert.match(hit.text, /api_key: \*\*\*/);
 });

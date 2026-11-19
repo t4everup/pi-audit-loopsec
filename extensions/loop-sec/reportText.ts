@@ -137,6 +137,8 @@ export interface SecStrings {
   probesOnNote: (verified: number, total: number) => string;
   /** The heading of a finding's verification block. */
   verifyHeading: string;
+  /** Printed under a verification whose output had secrets replaced. */
+  verifyRedacted: string;
   verifyConfirmed: string;
   verifyNotConfirmed: string;
 
@@ -303,6 +305,7 @@ const SEC_ZH: SecStrings = {
     `打开该设置（\`/loopsec config allowCommandProbes=true\`）可以让审计真的把 PoC 跑一遍。`,
   probesOnNote: (v, t) => `其中 **${v}/${t}** 条跑过命令，且结果符合跑之前声明的预期。`,
   verifyHeading: "**验证**",
+  verifyRedacted: "_输出里识别到口令 / token / JWT 的形态，已替换为 \`***\` —— **尽力而为**，原值未保存，也不保证全部识别。_",
   verifyConfirmed: "已复现 —— 下面的命令真的运行过，结果符合跑之前声明的预期",
   verifyNotConfirmed: "**未复现** —— 跑过了，但结果**不符合**跑之前声明的预期：要么发现是错的，要么预期是错的",
   noFindings:
@@ -456,6 +459,7 @@ const SEC_EN: SecStrings = {
     `Turn it on (\`/loopsec config allowCommandProbes=true\`) to have the audit actually run its PoCs.`,
   probesOnNote: (v, t) => `**${v}/${t}** were run and matched the expectation stated before the run.`,
   verifyHeading: "**Verification**",
+  verifyRedacted: "_Credentials (password / token / JWT shapes) were replaced with \`***\` — **best-effort**, the original was not kept, and it is not guaranteed to catch everything._",
   verifyConfirmed: "REPRODUCED — the command below was actually run and matched the expectation stated before it",
   verifyNotConfirmed: "**NOT REPRODUCED** — it was run and did NOT match the pre-stated expectation: either the finding is wrong or the expectation was",
   noFindings:

@@ -1147,6 +1147,8 @@ function normalizeVerification(value: unknown): SecVerification | undefined {
     timedOut,
     expect,
     expectExit,
+    // Best-effort redaction happened, so the report must not present the output as verbatim.
+    ...(o.redacted === true ? { redacted: true } : {}),
     ...(expectOutput !== null ? { expectOutput } : {}),
     confirmed: !timedOut && exitOk && outputOk,
   };

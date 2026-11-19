@@ -53,7 +53,14 @@ import * as path from "node:path";
 import { SEC_STATE_DIR_NAME, appendSecEvent, loadSec, nowIso, secStateDir } from "./store.js";
 import { type Result } from "./types.js";
 import { coverageGaps, coverageHeadline, type CoverageReport } from "./coverage.js";
-import { allowCommandProbesOf, fenceLanguageOf, loadSettings, pursuitRoundsOf, reportLanguageOf } from "./settings.js";
+import {
+  allowCommandProbesOf,
+  allowDestructiveProbesOf,
+  fenceLanguageOf,
+  loadSettings,
+  pursuitRoundsOf,
+  reportLanguageOf,
+} from "./settings.js";
 import { ladderFor } from "./ladders.js";
 import {
   type ReportLanguage,
@@ -366,6 +373,72 @@ export function updateFinding(projectRoot: string, id: string, patch: SecFinding
  * What it buys: the report can distinguish a sink somebody READ from a request that CAME
  * BACK. That distinction is the difference between a triage list and a weapon.
  */
+/**
+ * Commands that CHANGE something, and are refused unless the project says otherwise.
+ *
+ * A probe is an experiment. `DROP TABLE` / `DELETE FROM` / `rm -rf` are not: on a target that happens to
+ * be connected to real data they are incidents, and the model writing the command has no way to know
+ * which kind of target it is hitting. The list is deliberately about VERBS NEAR A STATEMENT BOUNDARY, not
+ * about strings that merely contain the word — `curl "...q=deleted"` must still run.
+ */
+/**
+ * Commands whose LEADING word makes the rest of the line data, not instructions.
+ *
+ * Without this the guard fires on `rg -n 'DELETE FROM' src/`, which is how an audit greps for a SQL
+ * sink — the guard would then obstruct the ordinary work it exists to make safe. The list is the
+ * read-only tools an audit actually uses.
+ *
+ * WHAT THIS IS AND IS NOT. It is a guard against a MODEL's slip on a target that happens to hold real
+ * data, not a sandbox: a determined command can still mutate (`find . -delete` leads with `find`). That
+ * asymmetry is deliberate — a false refusal costs a round and is visible in the log, while a false
+ * permit costs the data, so the two errors are not equal and the list is tuned toward letting the
+ * audit READ.
+ */
+const READ_ONLY_LEADERS =
+  /^(rg|grep|egrep|fgrep|ag|ack|find|awk|sed|cat|head|tail|less|more|jq|sort|uniq|wc|diff|ls|stat|file|strings|nm|objdump|readelf|echo|printf)\b/i;
+
+/**
+ * The verbs that change something.
+ *
+ * \b on both sides: \"drop\" inside \"dropdown\" is a variable name, and \"deleted\" is not \"delete\".
+ */
+const DESTRUCTIVE_PROBE =
+  /\b(delete|drop|truncate|update|insert|replace\s+into|alter\s+table|grant|revoke|rm|rmdir|mv|shutdown|reboot|format|mkfs|dd)\b/i;
+
+/** True when this command would mutate state rather than observe it. Exported for the tests. */
+export function looksDestructive(command: string): boolean {
+  const cmd = (command ?? "").trim();
+  if (cmd === "") return false;
+  // Searching for a dangerous word is not performing it.
+  if (READ_ONLY_LEADERS.test(cmd)) return false;
+  return DESTRUCTIVE_PROBE.test(cmd);
+}
+
+/**
+ * Best-effort redaction of secrets in captured output.
+ *
+ * NOT A GUARANTEE, and the report says "best-effort" rather than "redacted": the shapes below are the
+ * ones that actually appear in a probe's output (a config dump, a token in a JSON body, an Authorization
+ * header). Anything else gets through, which is why the value is stored as `***` and the original is not
+ * kept anywhere.
+ */
+export function redactSecrets(text: string): { text: string; changed: boolean } {
+  let out = text ?? "";
+  let changed = false;
+  const poke = (re: RegExp, replacement: string): void => {
+    const next = out.replace(re, replacement);
+    if (next !== out) changed = true;
+    out = next;
+  };
+  // key = value / key: "value" / key=value in a query string
+  poke(/((?:password|passwd|pwd|secret|token|api[_-]?key|apikey|access[_-]?key|private[_-]?key)\s*[=:]\s*)("[^"]*"|'[^']*'|[^\s,;&"'}]+)/gi, "$1***");
+  // Authorization: Bearer <token>
+  poke(/(authorization\s*[:=]\s*(?:bearer|basic|token)\s+)[A-Za-z0-9._~+/=-]+/gi, "$1***");
+  // a bare JWT (three base64url segments) anywhere
+  poke(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, "***");
+  return { text: out, changed };
+}
+
 export function verifyFinding(
   projectRoot: string,
   id: string,
@@ -404,6 +477,22 @@ export function verifyFinding(
     };
   }
 
+  // ---- MUTATION NEEDS ITS OWN CONSENT -------------------------------------------------------
+  //
+  // Probes being on says this project may be probed. It does not say a probe may DROP a table, and the
+  // model cannot tell whether the target it is pointed at holds real data. Refusing here costs one round
+  // and a clear message; the alternative costs the data.
+  if (!allowDestructiveProbesOf(projectRoot) && looksDestructive(command)) {
+    return {
+      ok: false,
+      errors: [
+        "this command would CHANGE something, and mutation is off for this project — nothing was executed.",
+        "A probe is an experiment: read, fetch, query. DELETE / DROP / TRUNCATE / UPDATE / rm are incidents on a live target.",
+        "If this target is disposable and you really mean it:  /loopsec config allowDestructiveProbes=true",
+      ],
+    };
+  }
+
   let output = "";
   let exitCode: number | null = null;
   let timedOut = false;
@@ -422,7 +511,11 @@ export function verifyFinding(
     return { ok: false, errors: [`the command could not be run: ${(error as Error).message}`] };
   }
 
-  const clipped = output.length > settings.maxOutputChars ? `${output.slice(0, settings.maxOutputChars)}\n… [clipped at ${settings.maxOutputChars} chars]` : output;
+  const clippedRaw = output.length > settings.maxOutputChars ? `${output.slice(0, settings.maxOutputChars)}\n… [clipped at ${settings.maxOutputChars} chars]` : output;
+  // BEST-EFFORT, and recorded as such: a probe's output routinely carries the target's own credentials
+  // (a config dump, a token in a JSON body), and the log and the report are both durable.
+  const redacted = redactSecrets(clippedRaw);
+  const clipped = redacted.text;
   const expectExit = input.expectExit === "nonzero" ? "nonzero" : "zero";
   const expectOutput = input.expectOutput && input.expectOutput.trim() ? input.expectOutput : null;
   const exitOk = exitCode !== null && (expectExit === "zero" ? exitCode === 0 : exitCode !== 0);
@@ -430,6 +523,7 @@ export function verifyFinding(
   const verification: SecVerification = {
     at,
     command,
+    ...(redacted.changed ? { redacted: true } : {}),
     output: clipped,
     exitCode,
     timedOut,
@@ -3072,6 +3166,11 @@ function renderSecFinding(
     for (const line of v.output.split("\n")) body.push(`  ${line}`);
     fenced(t.verifyHeading, body.join("\n"));
     lines.push(v.confirmed ? t.verifyConfirmed : t.verifyNotConfirmed);
+    // THE OUTPUT IS NOT VERBATIM WHEN SECRETS WERE FOUND, and the report has to say so: a reader who
+    // assumes these are the exact bytes would draw a wrong conclusion about a value that is now "***".
+    if (v.redacted === true) {
+      lines.push(t.verifyRedacted);
+    }
     lines.push("");
   }
 

@@ -1762,6 +1762,13 @@ export interface SecFinding {
  * predicted a refusal is a DISCONFIRMATION, and it is recorded as one.
  */
 export interface SecVerification {
+  /**
+   * Secrets were found in the output and replaced with `***`.
+   *
+   * Set when the redaction actually changed something, so the report can say so instead of implying the
+   * output is verbatim. The original text is NOT kept anywhere.
+   */
+  redacted?: boolean;
   /** ISO timestamp of the run. */
   at: string;
   /** The exact command line that was executed. */
