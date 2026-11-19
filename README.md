@@ -51,7 +51,7 @@ acceptance checklist for a version that is safe to run unattended.
 | `sec_clear` | mark an item examined and guarded. The reason must NAME the guard, `file`+`line` must point at it |
 | `sec_dig` | hand the SAME item another bounded round |
 | `sec_reopen` | withdraw a clearance: the guard does not actually hold |
-| `sec_update` | correct a finding instead of recording a duplicate |
+| `sec_update` | correct a finding instead of recording a duplicate; on an `S-` id it changes `requires` / `priority` / `title` |
 | `sec_verify` | run ONE command against a finding, with its `expect` stated first |
 | `sec_observe` | write down a **fact** the code showed you (not a finding) — `file:line`, or `files` for a module/build |
 | `sec_recall` | search what the run has established: observations, findings AND clearances |
@@ -61,6 +61,24 @@ The write tools all existed before; `sec_observe` / `sec_recall` / `sec_show` ar
 side**. Without them the brief was the only channel and had to truncate, and a truncated record
 with no way back is a lost record: a round would re-read a file somebody had already cleared.
 The brief can now stay small, because nothing has to be carried in it.
+
+### Dependencies — the order of an audit is not its enumeration order
+
+```text
+sec_surface(title="有没有入口跳过守卫？", requires=["S-0001"], ...)
+```
+
+`S-0001` means: do not hand this item a round until `S-0001` is **cleared**. On a real finding the
+decisive question was "does the guard read the same parameter the handler does?" — four other
+questions rested on that premise and could not be answered before it, and a flat list made them
+parallel.
+
+- the bar is `cleared`, not `examined` — an item that produced a finding has not answered anything;
+- a **cycle is refused at write time**, because a cycle never unblocks and would look like an item
+  merely waiting its turn;
+- `requires=[]` **clears** the list — a list that cannot be emptied cannot be corrected;
+- no deadlock by construction: the graph is a DAG, so while any item is open there is always one
+  whose prerequisites are satisfied.
 
 ## The command
 
