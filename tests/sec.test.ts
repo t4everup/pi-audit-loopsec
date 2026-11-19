@@ -60,6 +60,7 @@ import {
   nextOpenSurface,
   recordFinding,
   recordObservation,
+  sameFileNeighbours,
   recordSurface,
   recallRecords,
   showRecord,
@@ -4234,4 +4235,54 @@ test("redaction is best-effort and says so — it does not claim to be complete"
   const hit = redactSecrets("api_key: sk-live-abcdef123456");
   assert.equal(hit.changed, true);
   assert.match(hit.text, /api_key: \*\*\*/);
+});
+
+test("recording a finding hands back what already stands in the SAME FILE", () => {
+  // The combination question is the highest-value one an audit asks and the one it asks least, because
+  // nothing prompts it. This makes the prompt mechanical: at the moment of recording, the pair is in front
+  // of the model instead of needing to be recalled.
+  const cwd = seeded();
+  withSurface(cwd, 1);
+  recordFinding(cwd, {
+    title: "路径穿越", category: "path-traversal", severity: "medium", file: "src/api/export.py", line: 12, evidence: "open(p)",
+  });
+  const second = recordFinding(cwd, {
+    title: "命令注入", category: "command-injection", severity: "high", file: "src/api/export.py", line: 210, evidence: "exec(x)",
+  });
+  assert.equal(second.ok, true);
+  const near = sameFileNeighbours(loadSec(cwd).snapshot, second.ok ? second.value : ({} as never));
+  assert.deepEqual(
+    near.findings.map((f) => f.id),
+    ["F-0001"],
+    "same FILE, not same line — a traversal 200 lines from an exec in one handler is exactly the pair that combines",
+  );
+
+  // A finding in another file gets nothing.
+  const third = recordFinding(cwd, {
+    title: "另一处的注入", category: "sqli", severity: "high", file: "src/db.py", line: 1, evidence: "e",
+  });
+  assert.equal(third.ok, true);
+  assert.deepEqual(sameFileNeighbours(loadSec(cwd).snapshot, third.ok ? third.value : ({} as never)).findings, []);
+});
+
+test("a clearance in the same file is handed back too — so the report cannot contradict itself", () => {
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 1);
+  submitSecRecon(cwd, NOTE);
+  recordSurface(cwd, { title: "导出接口", kind: "entrypoint", file: "src/api/export.py", line: 1 });
+  clearSurface(cwd, "S-0001", "这个入口有 require_admin 守卫，在 export.py:3 处短路返回", { file: "src/api/export.py", line: 3 });
+  const f = recordFinding(cwd, {
+    title: "导出接口未授权", category: "auth-bypass", severity: "high", file: "src/api/export.py", line: 12, evidence: "e",
+  });
+  assert.equal(f.ok, true);
+  const near = sameFileNeighbours(loadSec(cwd).snapshot, f.ok ? f.value : ({} as never));
+  assert.deepEqual(near.cleared.map((s) => s.id), ["S-0001"], "the clearance that says this path is guarded");
+});
+
+test("a finding with no location gets no neighbours rather than a wrong guess", () => {
+  const cwd = seeded();
+  withSurface(cwd, 1);
+  const f = recordFinding(cwd, { title: "无位置的断言", category: "other", severity: "low", evidence: "一段摘录" });
+  assert.equal(f.ok, true);
+  assert.deepEqual(sameFileNeighbours(loadSec(cwd).snapshot, f.ok ? f.value : ({} as never)), { findings: [], cleared: [] });
 });

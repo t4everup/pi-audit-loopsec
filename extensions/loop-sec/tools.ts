@@ -15,7 +15,7 @@ import { defineTool, type ExtensionAPI, type ExtensionContext } from "@earendil-
 import { Type } from "typebox";
 
 import { SEVERITIES, SEC_SURFACE_KINDS, clip, type SecFindingPatch, type SecSurfaceKind, type Severity } from "./types.js";
-import { recallRecords, showRecord, recordObservation, clearSurface, digSurface, recordFinding, recordSurface, reopenSurface, submitSecRecon, surfaceProgress, updateFinding, updateSurface, verifyFinding } from "./sec.js";
+import { recallRecords, sameFileNeighbours, showRecord, recordObservation, clearSurface, digSurface, recordFinding, recordSurface, reopenSurface, submitSecRecon, surfaceProgress, updateFinding, updateSurface, verifyFinding } from "./sec.js";
 import { loadSec } from "./store.js";
 import { noteSecToolCall } from "./activity.js";
 
@@ -170,6 +170,29 @@ export function registerSecTools(pi: ExtensionAPI): void {
         }
         const f = result.value;
         const where = f.location ? ` ${f.location.file}:${f.location.line}` : "";
+        // THE COMBINATION QUESTION, ASKED MECHANICALLY. Nothing in this mode prompts it otherwise, and it
+        // is the question that turns two mediums into one critical.
+        const near = sameFileNeighbours(loadSec(root).snapshot, f);
+        const nearLines: string[] = [];
+        if (near.findings.length > 0) {
+          nearLines.push(
+            "",
+            `SAME FILE (${f.location?.file}) — already recorded here:`,
+            ...near.findings.slice(0, 5).map((n) => `  ${n.id} [${n.severity ?? "unrated"}] ${n.category} — ${clip(n.title, 90)}`),
+            "Do these MEET? If one gives you a value, a write, a position or a token the other needs, record the",
+            "combination as its own finding with `chainOf=[...]` — its artifact is its parts, and the report can",
+            "only state the chain if you record it.",
+          );
+        }
+        if (near.cleared.length > 0) {
+          nearLines.push(
+            "",
+            `SAME FILE, already RULED OUT:`,
+            ...near.cleared.slice(0, 5).map((c) => `  ${c.id} — ${clip(c.clearedReason ?? "", 90)}`),
+            "If one of those reasons also covers this finding, it does not hold — `sec_reopen` it rather than",
+            "letting the report contradict itself.",
+          );
+        }
         return text(
           [
             `Recorded ${f.id}: [${f.severity ?? "unrated"}] ${f.category} — ${f.title}${where}`,
@@ -177,6 +200,7 @@ export function registerSecTools(pi: ExtensionAPI): void {
             "NOTE: this mode has no verification tier, no falsification attempt and no challenge round.",
             "The finding is recorded as your claim plus the artifact you attached, and nothing more.",
             "If it matters, re-run the objective under /loop, where it gets all three.",
+            ...nearLines,
           ].join("\n"),
           { findingId: f.id, total: loadSec(root).snapshot.findings.length },
         );

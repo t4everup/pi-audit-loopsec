@@ -70,6 +70,7 @@ import {
 } from "./reportText.js";
 import {
   type AuditLoopState,
+  type EvidenceLocation,
   type SecFinding,
   type SecFindingPatch,
   type SecObservation,
@@ -243,6 +244,29 @@ function nextFindingId(snapshot: TreeSnapshot): string {
     if (m) max = Math.max(max, Number(m[1]));
   }
   return `F-${String(max + 1).padStart(4, "0")}`;
+}
+
+/**
+ * Findings and clearances that touch the SAME FILE as this one.
+ *
+ * The combination question — "do two findings meet?" — is the highest-value question an audit can ask
+ * and the one it asks least, because nothing prompts it. `chainOf` is recorded when the model remembers;
+ * this makes the reminder mechanical: at the moment a finding is recorded, the ones already standing in
+ * the same file are handed back, so the model is looking at the pair instead of having to recall it.
+ *
+ * Same file, not same line: a traversal and an exec 200 lines apart in one handler are exactly the pair
+ * that combines, and a line-level match would miss them.
+ */
+export function sameFileNeighbours(
+  snapshot: TreeSnapshot,
+  finding: { id: string; location?: EvidenceLocation },
+): { findings: SecFinding[]; cleared: SecSurface[] } {
+  const file = finding.location?.file;
+  if (!file) return { findings: [], cleared: [] };
+  return {
+    findings: snapshot.findings.filter((f) => f.id !== finding.id && f.location?.file === file),
+    cleared: snapshot.surfaces.filter((s) => s.status === "cleared" && (s.location?.file === file || s.guardLocation?.file === file)),
+  };
 }
 
 export function recordFinding(projectRoot: string, input: FindingInput, at = nowIso()): Result<SecFinding> {
