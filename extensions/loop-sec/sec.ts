@@ -1530,6 +1530,32 @@ export const PURSUIT_MIN_SEVERITY: Severity = "high";
  * reachability was never even asserted.
  */
 // -----------------------------------------------------------------
+// LAYER-TO-LAYER FEEDBACK — a deep run must be able to say "I am done"
+// -----------------------------------------------------------------
+//
+// A deep run answers sub-questions one at a time. Without a wrap-up, answering every one of them leads
+// to the sub-question brief asking for MORE questions — so the run either invents work or idles until
+// the plateau stops it, and the parent finding keeps a pursuit nobody closed.
+//
+// IT IS A PROPOSAL, NOT A VERDICT. The tempting version writes `pursuitClosed` itself the moment the
+// last sub-question clears. That would be wrong for a reason worth stating: "all my sub-questions came
+// back negative" is equally consistent with "the finding does not hold" and with "I asked the wrong
+// questions", and only the model knows which. Automating it would convert the second case into a
+// recorded conclusion — the one thing this mode refuses to do.
+
+/** Is this a deep run whose sub-questions are all answered, with nothing to show for it? */
+export function deepWrapUp(snapshot: TreeSnapshot): { answered: number; findingId: string } | null {
+  const deep = snapshot.loop?.deep;
+  if (!deep) return null;
+  if (snapshot.surfaces.length === 0) return null;
+  // A finding recorded IN THIS RUN is a result; the run should keep going, not wrap up.
+  if (snapshot.findings.length > 0) return null;
+  const open = snapshot.surfaces.filter((s) => s.status === "open" || s.status === "digging");
+  if (open.length > 0) return null;
+  return { answered: snapshot.surfaces.length, findingId: deep.findingId };
+}
+
+// -----------------------------------------------------------------
 // DEEP RUNS — one finding, worked until it gives or the budget ends
 // -----------------------------------------------------------------
 //
@@ -2008,6 +2034,21 @@ export function renderSecDeepQuestionBrief(snapshot: TreeSnapshot, objective: st
   lines.push(snapshot.secNote ?? "(the seed note is missing — record the sub-questions from the finding itself)");
   lines.push("--- END ---");
   lines.push("");
+  // THE WRAP-UP COMES FIRST, because everything below it asks for MORE questions. A run that has answered
+  // them all and produced nothing should not be invited to invent a ninth question to look busy.
+  const wrap = deepWrapUp(snapshot);
+  if (wrap) {
+    lines.push("--- 子问题已全部答完 ---");
+    lines.push(`  ${wrap.answered}/${wrap.answered} 个子问题都有结论，且这次深挖没有产出任何新发现。`);
+    lines.push("");
+    lines.push("这可能有两种意思，只有你知道是哪一种：");
+    lines.push("  1. 这条发现确实不成立 →");
+    lines.push(`     \`sec_update ${wrap.findingId} pursuitClosed="<各个方向分别试到了哪里，为什么都不成立>"\``);
+    lines.push("  2. **问错了问题** → 说出真正该问的，用 `sec_surface` 记下来（新子问题会重新打开这一轮）。");
+    lines.push("");
+    lines.push("不会自动关闭：「我的问题都被否定」和「这条发现不成立」是两件事，把前者写成后者是这个模式最不能做的事。");
+    lines.push("");
+  }
   lines.push("This run has ONE target and no attack surface to sweep. What it needs from you now is");
   lines.push("the next questions, not a list of places.");
   lines.push("");

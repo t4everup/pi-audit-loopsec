@@ -64,6 +64,7 @@ import {
   showRecord,
   reopenSurface,
   renderSecAnalyzeBrief,
+  renderSecDeepQuestionBrief,
   renderSecFindings,
   renderSecReport,
   renderSecSurfaceBrief,
@@ -76,6 +77,7 @@ import {
   SEC_IMPLICIT_AUTH_GATE,
   depthReasons,
   gatesOfFinding,
+  deepWrapUp,
   isBlocked,
   unsatisfiedRequires,
   objectiveHits,
@@ -3983,4 +3985,61 @@ test("the brief NAMES the dependency, and the debt block counts blocked items", 
   const brief = renderSecAnalyzeBrief(s, "x", 4, s.surfaces[0]!);
   assert.match(brief, /blocked by a prerequisite/, "breadth debt names the blocked ones");
   assert.match(brief, /S-0002 ← S-0001/, "and which item waits on which");
+});
+
+// =================================================================
+// LAYER-TO-LAYER FEEDBACK — the deep run can say it is done
+// =================================================================
+
+test("a deep run with every sub-question answered and no findings PROPOSES closing the parent", () => {
+  const cwd = seeded();
+  withSweepFinding(cwd);
+  startDeepRun(cwd, "F-0001");
+  recordSurface(cwd, { title: "守卫读哪个参数？", kind: "boundary", file: "g.py", line: 8 });
+  recordSurface(cwd, { title: "有没有入口跳过守卫？", kind: "entrypoint", file: "a.py", line: 3 });
+  clearSurface(cwd, "S-0001", "守卫读 query，处理器读 body —— 两者不同源，这条不成立", { file: "g.py", line: 8 });
+  clearSurface(cwd, "S-0002", "所有到 sink 的路由都走同一个守卫，没有旁路", { file: "a.py", line: 3 });
+
+  const s = loadSec(cwd).snapshot;
+  assert.deepEqual(deepWrapUp(s), { answered: 2, findingId: "F-0001" });
+  const brief = renderSecDeepQuestionBrief(s, "x", 5);
+  assert.match(brief, /子问题已全部答完/);
+  assert.match(brief, /2\/2/);
+  assert.match(brief, /pursuitClosed/, "it names the exact call, so the model does not have to remember it");
+  assert.match(brief, /不会自动关闭/, "and says why this is a proposal rather than a verdict");
+  assert.match(brief, /问错了问题/, "including the possibility the run itself is what is wrong");
+});
+
+test("ONE open sub-question means no proposal — the run still has work", () => {
+  const cwd = seeded();
+  withSweepFinding(cwd);
+  startDeepRun(cwd, "F-0001");
+  recordSurface(cwd, { title: "a", kind: "boundary", file: "g.py", line: 8 });
+  recordSurface(cwd, { title: "b", kind: "entrypoint", file: "a.py", line: 3 });
+  clearSurface(cwd, "S-0001", "守卫读 query，处理器读 body —— 两者不同源，这条不成立", { file: "g.py", line: 8 });
+  assert.equal(deepWrapUp(loadSec(cwd).snapshot), null);
+  assert.ok(!renderSecDeepQuestionBrief(loadSec(cwd).snapshot, "x", 5).includes("子问题已全部答完"));
+});
+
+test("a NEW finding in the deep run suppresses the proposal — that is a result, not a dead end", () => {
+  const cwd = seeded();
+  withSweepFinding(cwd);
+  startDeepRun(cwd, "F-0001");
+  recordSurface(cwd, { title: "a", kind: "boundary", file: "g.py", line: 8 });
+  clearSurface(cwd, "S-0001", "守卫读 query，处理器读 body —— 两者不同源，这条不成立", { file: "g.py", line: 8 });
+  recordFinding(cwd, {
+    title: "认证前表达式注入", category: "rce", severity: "critical", file: "x.py", line: 9, evidence: "exec(x)", preAuth: true,
+  });
+  assert.equal(deepWrapUp(loadSec(cwd).snapshot), null, "keep going — there is something here");
+});
+
+test("a SWEEP run never gets a wrap-up proposal, however tidy its list looks", () => {
+  // A sweep's end condition is the plateau or the operator, not "no open items": the surface list being
+  // exhausted means "enumerate more", not "the audit is over".
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 1);
+  submitSecRecon(cwd, NOTE);
+  recordSurface(cwd, { title: "a", kind: "sink", file: "a.py", line: 1 });
+  clearSurface(cwd, "S-0001", "守卫在 a.py:1 之前执行，这条路径不在公开路由表里", { file: "a.py", line: 1 });
+  assert.equal(deepWrapUp(loadSec(cwd).snapshot), null);
 });
