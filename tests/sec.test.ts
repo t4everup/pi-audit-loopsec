@@ -4119,3 +4119,40 @@ test("the lock directory is the only thing removed — records are append-only",
   const logAfter = fs.readFileSync(path.join(cwd, ".pi-loopsec", "runs", listRuns(cwd)[0]!.run, "tree.jsonl"), "utf-8");
   assert.equal(logAfter, logBefore, "and the log is untouched");
 });
+
+test("a round that recorded OBSERVATIONS counts as productive — reading is not nothing", () => {
+  // The gap this closes appeared the day sec_observe was added: `produced` looked only at findings,
+  // statuses and digs, so four files read and four locatable facts written scored as an empty round and
+  // the plateau punished exactly the behaviour the tool asks for.
+  const cwd = seeded();
+  startSec(cwd, "挖掘认证前rce漏洞", 2);
+  submitSecRecon(cwd, NOTE);
+  recordSurface(cwd, { title: "S1", kind: "sink", file: "s.py", line: 1 });
+
+  // Round 1 is dispatched; the model reads the item and records facts, no finding.
+  tickLoop(cwd, loadSec(cwd).snapshot);
+  modelActed();
+  recordObservation(cwd, {
+    text: "这个 handler 的入参来自 query string，没有经过任何白名单校验",
+    location: { file: "s.py", line: 12 },
+  });
+  const second = tickLoop(cwd, loadSec(cwd).snapshot);
+  const s = loadSec(cwd).snapshot;
+  assert.equal(s.loop?.stallRounds, 0, "the round is productive, so the plateau does not move");
+  const rec = s.roundRecords.at(-2)!;
+  const outcome = evaluateRound(s, rec, false);
+  assert.equal(outcome.produced, true);
+  assert.match(outcome.detail, /observation/, "and the summary says why");
+  assert.equal(second.action, "sent");
+});
+
+test("observations do not resurrect a round that produced nothing AND recorded nothing", () => {
+  const cwd = seeded();
+  startSec(cwd, "x", 2);
+  submitSecRecon(cwd, NOTE);
+  recordSurface(cwd, { title: "S1", kind: "sink", file: "s.py", line: 1 });
+  tickLoop(cwd, loadSec(cwd).snapshot);
+  modelActed();
+  tickLoop(cwd, loadSec(cwd).snapshot); // settles round 1 with nothing recorded
+  assert.equal(loadSec(cwd).snapshot.loop?.stallRounds, 1, "still unproductive");
+});

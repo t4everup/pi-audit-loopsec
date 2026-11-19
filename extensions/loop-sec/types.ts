@@ -1451,6 +1451,15 @@ export interface RoundRecord {
    * Inferred, and labelled as such: this is "nothing was touched", not "the turn was aborted".
    */
   toolCallsAtStart?: number;
+  /**
+   * How many observations the run held when the round was prepared.
+   *
+   * The baseline for "did this round LEARN anything". Without it a round that read four files and
+   * wrote down four locatable facts scored as unproductive, because `produced` only looked at
+   * findings, statuses and digs — so the plateau punished exactly the behaviour `sec_observe` exists
+   * to encourage.
+   */
+  observationCountAtStart?: number;
   /** For a `/loopSEC` analyze round: which surface item was handed over. */
   surfaceId?: string | null;
   /**

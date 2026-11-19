@@ -1371,6 +1371,16 @@ function judgeRound(snapshot: TreeSnapshot, record: RoundRecord): RoundOutcome {
     // slot for being thorough, which pays it to close an item hastily instead of finishing
     // the trace. Bounded by construction: `digging` can only be set `digBudget` times.
     const dug = record.surfaceWasDigging === true;
+    // A ROUND THAT WROTE DOWN WHAT IT LEARNED IS NOT AN EMPTY ONE.
+    //
+    // `produced` used to look only at findings, statuses and digs, so reading four files and recording
+    // four locatable observations scored as nothing — the plateau punished precisely what `sec_observe`
+    // asks for. One observation is enough for the round to count: they must be locatable (enforced at
+    // write time) and they are printed in the report, so a model that spams one per round to defeat the
+    // plateau is producing a visible, checkable record rather than a free pass.
+    const observed = record.observationCountAtStart === undefined
+      ? 0
+      : snapshot.observations.length - record.observationCountAtStart;
 
     // A PURSUIT ROUND IS A DIFFERENT AXIS, and its progress signal has to be different too: there
     // is no status to flip (the finding's item was already examined when the finding landed), so
@@ -1411,13 +1421,14 @@ function judgeRound(snapshot: TreeSnapshot, record: RoundRecord): RoundOutcome {
     if (added > 0) bits.push(`${added} finding(s) recorded`);
     if (examined > 0) bits.push(`${examined} item(s) examined`);
     if (bits.length === 0 && dug) bits.push("a depth round on the item you asked to keep digging");
+    if (observed > 0) bits.push(`${observed} observation(s) recorded`);
     return {
       round: record.round,
       kind: record.kind,
       verdictReached: false,
       evidenceAdded: added > 0 || examined > 0 || dug,
       detail: bits.length > 0 ? bits.join(", ") : "nothing was examined and nothing was recorded",
-      produced: added > 0 || examined > 0 || dug,
+      produced: added > 0 || examined > 0 || dug || observed > 0,
     };
   }
 
@@ -1966,6 +1977,7 @@ export function tickLoop(projectRoot: string, snapshot: TreeSnapshot, opts: Tick
       confirmedAtStart: snapshot.nodes.filter((n) => n.status === "confirmed").length,
       nodeCountAtStart: snapshot.nodes.length,
       toolCallsAtStart: secToolCallCount(),
+      observationCountAtStart: snapshot.observations.length,
       findingCountAtStart: snapshot.findings.length,
       surfaceCountAtStart: snapshot.surfaces.length,
       surfaceExaminedAtStart: progress.examined,

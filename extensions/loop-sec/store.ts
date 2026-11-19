@@ -1719,6 +1719,9 @@ function normalizeRoundRecord(value: unknown): RoundRecord | null {
     ...(typeof o.toolCallsAtStart === "number" && Number.isFinite(o.toolCallsAtStart)
       ? { toolCallsAtStart: Math.max(0, Math.floor(o.toolCallsAtStart)) }
       : {}),
+    ...(typeof o.observationCountAtStart === "number" && Number.isFinite(o.observationCountAtStart)
+      ? { observationCountAtStart: Math.max(0, Math.floor(o.observationCountAtStart)) }
+      : {}),
     summary: Array.isArray(o.summary) ? o.summary.filter((s): s is string => typeof s === "string") : [],
   };
 }
