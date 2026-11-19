@@ -86,6 +86,7 @@ import {
   updateSurface,
   surfaceProgress,
   updateFinding,
+  updateSurface,
   validateFinding,
   validateSurface,
   writeSecReport,
@@ -3748,4 +3749,45 @@ test("a truncated findings list says how to reach the rest", () => {
   const brief = renderSecAnalyzeBrief(loadSec(cwd).snapshot, "x", 3, item);
   assert.match(brief, /\+3 more/, "the count is still honest");
   assert.match(brief, /sec_show <F-id>/, "and it names the way to open one");
+});
+
+test("the analyze brief says WHAT IS STILL NOT EXAMINED — breadth is debt, and it is visible", () => {
+  // The report has always had this section; the BRIEF never did. An item the model never opens is an
+  // item whose finding never exists, and a model cannot manage a backlog it cannot see.
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 1);
+  submitSecRecon(cwd, NOTE);
+  for (let i = 0; i < 5; i++) {
+    recordSurface(cwd, { title: `item ${i}`, kind: "sink", file: `f${i}.py`, line: i + 1 });
+  }
+  recordFinding(cwd, { title: "hit", category: "rce", severity: "high", file: "s.py", line: 2, evidence: "e" });
+  // One item examined with no conclusion (attempts > 0), one cleared.
+  const st = loadSec(cwd).snapshot;
+  updateSurface(cwd, "S-0002", { attempts: 2 });
+  clearSurface(cwd, "S-0003", "check_auth 在 session.c:12 之前执行，这条路径不在公开路由表里", {
+    file: "src/auth/session.c",
+    line: 12,
+  });
+
+  const item = loadSec(cwd).snapshot.surfaces.find((s) => s.status === "open")!;
+  const brief = renderSecAnalyzeBrief(loadSec(cwd).snapshot, "x", 4, item);
+  assert.match(brief, /WHAT IS STILL NOT EXAMINED/);
+  assert.match(brief, /never examined/, "the count of untouched items");
+  assert.match(brief, /attempted with no conclusion/, "and the ones a round already looked at without settling");
+  assert.match(brief, /next unexamined:/, "plus the next few by name");
+  assert.match(brief, /covers ONE of these/, "so the breadth does not turn into multi-tasking");
+});
+
+test("with everything examined, the debt block does not pretend there is work left", () => {
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 1);
+  submitSecRecon(cwd, NOTE);
+  recordSurface(cwd, { title: "only", kind: "sink", file: "a.py", line: 1 });
+  clearSurface(cwd, "S-0001", "check_auth 在 a.py:1 之前执行，且这条路由不在公开表里", { file: "a.py", line: 1 });
+  const s = loadSec(cwd).snapshot;
+  // There is no open item, so the loop would take the SURFACE branch; render the analyze brief for the
+  // cleared item anyway to prove the block degrades honestly rather than claiming unseen work.
+  const brief = renderSecAnalyzeBrief(s, "x", 4, s.surfaces[0]!);
+  assert.match(brief, /1 item\(s\): 0 never examined/, "0 never-examined is stated, not hidden");
+  assert.ok(!brief.includes("next unexamined:"), "and no list is invented");
 });

@@ -2226,6 +2226,42 @@ export function renderSecAnalyzeBrief(
     lines.push(renderSecLadder(category));
     lines.push("");
   }
+  // ---- WHAT IS STILL NOT EXAMINED ------------------------------------------------
+  //
+  // The report has always had this (尚未分析 / 未读), and the BRIEF never did. That is backwards:
+  // breadth is not lost because there is nowhere left to go, it is lost because the model cannot see
+  // how much it has NOT looked at. An item it never opens is an item whose finding never exists.
+  //
+  // Deliberately short — a count, and the next few titles. A full list would push out the item this
+  // round is about, which is the mistake the 30-finding cap already fixed.
+  const debt = surfaceProgress(snapshot);
+  const neverExamined = snapshot.surfaces.filter((s) => s.status === "open" && (s.attempts ?? 0) === 0);
+  const attemptedOpen = snapshot.surfaces.filter((s) => s.status === "open" && (s.attempts ?? 0) > 0);
+  if (debt.total > 0) {
+    lines.push("--- WHAT IS STILL NOT EXAMINED ---");
+    lines.push(
+      `  ${debt.total} item(s): ${neverExamined.length} never examined · ${attemptedOpen.length} attempted with no conclusion · ` +
+        `${debt.digging} mid-dig · ${debt.cleared} cleared`,
+    );
+    const upcoming = [...neverExamined].sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0)).slice(0, 3);
+    if (upcoming.length > 0) {
+      lines.push("  next unexamined:");
+      for (const u of upcoming) {
+        const where = u.location ? ` — ${u.location.file}:${u.location.line}` : "";
+        lines.push(`    ${u.id} [${u.kind}] ${clip(u.title, 80)}${where}`);
+      }
+      if (neverExamined.length > upcoming.length) {
+        lines.push(`    … +${neverExamined.length - upcoming.length} more (sec_recall <关键词> searches all of them)`);
+      }
+    }
+    if (attemptedOpen.length > 0) {
+      lines.push(`  attempted, no conclusion: ${attemptedOpen.slice(0, 4).map((s) => `${s.id}(${s.attempts})`).join(" ")}`);
+    }
+    lines.push("");
+    lines.push("Your round covers ONE of these. Closing the one you have is worth more than touching several.");
+    lines.push("");
+  }
+
   lines.push("--- ALREADY CLEARED ---");
   const cleared = snapshot.surfaces.filter((s) => s.status === "cleared");
   if (cleared.length === 0) {
