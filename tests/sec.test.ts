@@ -39,7 +39,7 @@ import { evaluateRound, pauseAfterRounds, pauseLoop, resumeLoop, startLoop, stop
 import { advanceRuns, endDeepRun, parkOnSendFailure, pickNextRun, startDeepRun } from "../extensions/loop-sec/loop.ts";
 import { loadSettings, saveSettings } from "../extensions/loop-sec/settings.ts";
 import { LOOP_VERBS, parseArgs, tailAfterVerb } from "../extensions/loop-sec/args.ts";
-import { noteSecToolCall, secToolCallCount } from "../extensions/loop-sec/tools.ts";
+import { noteSecToolCall, secToolCallCount } from "../extensions/loop-sec/activity.ts";
 
 // THE SUITE MUST NOT READ THIS MACHINE'S USER-LEVEL SETTINGS.
 //

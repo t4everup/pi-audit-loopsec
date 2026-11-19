@@ -127,7 +127,7 @@ function appendLoopEvent(projectRoot: string, kind: AuditLoopKind, event: TreeEv
 }
 import { markNotesDelivered, pendingNotes, renderNotesSection, renderNotesStatus, writeOperatorMirror } from "./notes.js";
 import { loadSettings, reportLanguageOf } from "./settings.js";
-import { secToolCallCount } from "./tools.js";
+import { secToolCallCount } from "./activity.js";
 import {
   SEC_DIG_BUDGET,
   appendSecLedger,

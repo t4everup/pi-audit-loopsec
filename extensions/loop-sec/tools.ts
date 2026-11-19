@@ -17,6 +17,11 @@ import { Type } from "typebox";
 import { SEVERITIES, SEC_SURFACE_KINDS, clip, type SecFindingPatch, type SecSurfaceKind, type Severity } from "./types.js";
 import { recallRecords, showRecord, recordObservation, clearSurface, digSurface, recordFinding, recordSurface, reopenSurface, submitSecRecon, surfaceProgress, updateFinding, updateSurface, verifyFinding } from "./sec.js";
 import { loadSec } from "./store.js";
+import { noteSecToolCall } from "./activity.js";
+
+// The activity counter lives in activity.ts, which imports nothing: a test that needs it must not
+// pull in the host SDK through this file. Third time this bit, so the seam is now structural.
+export { noteSecToolCall, secToolCallCount } from "./activity.js";
 
 function text(value: string, details: Record<string, unknown> = {}): { content: Array<{ type: "text"; text: string }>; details: Record<string, unknown> } {
   return { content: [{ type: "text", text: value }], details };
@@ -26,31 +31,7 @@ function projectRootOf(ctx: ExtensionContext): string {
   return ctx.cwd;
 }
 
-/**
- * How many `sec_*` tool calls have run in this PROCESS.
- *
- * The round record stores this at prepare time, so a settle can ask "did the model touch anything at
- * all after the brief". The declared SDK reports nothing about how a turn ended
- * (`AgentSettledEvent` has only a type), so this is the one honest signal available: a round that made
- * ZERO tool calls examined nothing, which is not evidence about the project and must not feed the
- * plateau.
- *
- * Process-local on purpose: it is a delta between two points in the same process, and a value that
- * survived a restart would make the delta meaningless.
- */
-let secToolCalls = 0;
 
-export function secToolCallCount(): number {
-  return secToolCalls;
-}
-
-/**
- * Record that a tool ran. Exported for the TEST seam: the round tests drive  directly and
- * need to represent "the model acted this round", which in production happens by calling a sec tool.
- */
-export function noteSecToolCall(): void {
-  secToolCalls++;
-}
 
 
 export function registerSecTools(pi: ExtensionAPI): void {
@@ -73,7 +54,7 @@ export function registerSecTools(pi: ExtensionAPI): void {
         }),
       }),
       async execute(_id, params, _signal, _onUpdate, ctx) {
-          secToolCalls++;
+          noteSecToolCall();
         const root = projectRootOf(ctx);
         const submitted = submitSecRecon(root, params.notes ?? "");
         if (!submitted.ok) {
@@ -166,7 +147,7 @@ export function registerSecTools(pi: ExtensionAPI): void {
         ),
       }),
       async execute(_id, params, _signal, _onUpdate, ctx) {
-          secToolCalls++;
+          noteSecToolCall();
         const root = projectRootOf(ctx);
         const result = recordFinding(root, {
           title: params.title,
@@ -238,7 +219,7 @@ export function registerSecTools(pi: ExtensionAPI): void {
         ),
       }),
       async execute(_id, params, _signal, _onUpdate, ctx) {
-          secToolCalls++;
+          noteSecToolCall();
         const root = projectRootOf(ctx);
         const result = recordSurface(root, {
           title: params.title,
@@ -295,7 +276,7 @@ export function registerSecTools(pi: ExtensionAPI): void {
         line: Type.Number({ description: "1-based line of that guard." }),
       }),
       async execute(_id, params, _signal, _onUpdate, ctx) {
-          secToolCalls++;
+          noteSecToolCall();
         const root = projectRootOf(ctx);
         const result = clearSurface(root, params.id, params.reason, { file: params.file, line: params.line });
         if (!result.ok) {
@@ -336,7 +317,7 @@ export function registerSecTools(pi: ExtensionAPI): void {
         id: Type.String({ description: "The surface item id, e.g. S-0003." }),
       }),
       async execute(_id, params, _signal, _onUpdate, ctx) {
-          secToolCalls++;
+          noteSecToolCall();
         const root = projectRootOf(ctx);
         const result = digSurface(root, params.id);
         if (!result.ok) {
@@ -376,7 +357,7 @@ export function registerSecTools(pi: ExtensionAPI): void {
         }),
       }),
       async execute(_id, params, _signal, _onUpdate, ctx) {
-          secToolCalls++;
+          noteSecToolCall();
         const root = projectRootOf(ctx);
         const result = reopenSurface(root, params.id, params.reason);
         if (!result.ok) {
@@ -446,7 +427,7 @@ export function registerSecTools(pi: ExtensionAPI): void {
         ),
       }),
       async execute(_id, params, _signal, _onUpdate, ctx) {
-          secToolCalls++;
+          noteSecToolCall();
         const root = projectRootOf(ctx);
         const patch: SecFindingPatch = {};
         if (params.title) patch.title = params.title;
@@ -520,7 +501,7 @@ export function registerSecTools(pi: ExtensionAPI): void {
         ),
       }),
       async execute(_id, params, _signal, _onUpdate, ctx) {
-          secToolCalls++;
+          noteSecToolCall();
         const root = projectRootOf(ctx);
         const result = verifyFinding(root, params.id, {
           command: params.command,
@@ -581,7 +562,7 @@ export function registerSecTools(pi: ExtensionAPI): void {
           findingId: Type.Optional(Type.String({ description: "The finding this came out of, e.g. F-0002." })),
         }),
         async execute(_id, params, _signal, _onUpdate, ctx) {
-          secToolCalls++;
+          noteSecToolCall();
           const root = projectRootOf(ctx);
           const result = recordObservation(root, {
             text: params.text ?? "",
@@ -626,7 +607,7 @@ export function registerSecTools(pi: ExtensionAPI): void {
           limit: Type.Optional(Type.Number({ description: "Max results (default 20)." })),
         }),
         async execute(_id, params, _signal, _onUpdate, ctx) {
-          secToolCalls++;
+          noteSecToolCall();
           const root = projectRootOf(ctx);
           const snapshot = loadSec(root).snapshot;
           const query = (params.query ?? "").trim();
@@ -672,7 +653,7 @@ export function registerSecTools(pi: ExtensionAPI): void {
           id: Type.String({ description: "F-0001, S-0003 or O-0007." }),
         }),
         async execute(_id, params, _signal, _onUpdate, ctx) {
-          secToolCalls++;
+          noteSecToolCall();
           const root = projectRootOf(ctx);
           const snapshot = loadSec(root).snapshot;
           const shown = showRecord(snapshot, params.id ?? "");
