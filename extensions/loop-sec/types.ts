@@ -1221,6 +1221,15 @@ export interface AuditLoopState {
   plateauWindow: number;
   stallRounds: number;
   /**
+   * How many rounds in a row made no `sec_*` tool call at all.
+   *
+   * ONE free pass, then it counts. A single silent round is most likely an interrupted turn and says
+   * nothing about the project; a run that is silent again and again says something about the RUN, and
+   * must feed the plateau or it spins forever. This is the bound that keeps "don't punish an
+   * interruption" from turning into "never stop".
+   */
+  silentStreak?: number;
+  /**
    * Paused time already banked, in milliseconds.
    *
    * Folded in when the loop RESUMES rather than when it pauses, because a
@@ -1430,6 +1439,18 @@ export interface RoundRecord {
    * baseline is what tells `evaluateRound` which one it is looking at.
    */
   findingCountAtStart?: number;
+  /**
+   * How many `sec_*` tool calls had run when the round was prepared.
+   *
+   * THE ONLY OBSERVABLE SIGN OF A ROUND THAT NEVER RAN. The declared SDK (0.86.1) gives an
+   * `agent_settled` event carrying nothing but its type, so the host cannot say "this turn was aborted" or
+   * "the provider errored". What CAN be seen is whether the model called a single tool after the brief was
+   * sent: a round with zero tool calls examined nothing, so it is no evidence about the project and must
+   * not feed the plateau — which is exactly how eight uninterrupted-but-dead turns used to stop a run.
+   *
+   * Inferred, and labelled as such: this is "nothing was touched", not "the turn was aborted".
+   */
+  toolCallsAtStart?: number;
   /** For a `/loopSEC` analyze round: which surface item was handed over. */
   surfaceId?: string | null;
   /**

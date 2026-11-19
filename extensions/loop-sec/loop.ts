@@ -127,6 +127,7 @@ function appendLoopEvent(projectRoot: string, kind: AuditLoopKind, event: TreeEv
 }
 import { markNotesDelivered, pendingNotes, renderNotesSection, renderNotesStatus, writeOperatorMirror } from "./notes.js";
 import { loadSettings, reportLanguageOf } from "./settings.js";
+import { secToolCallCount } from "./tools.js";
 import {
   SEC_DIG_BUDGET,
   appendSecLedger,
@@ -1259,6 +1260,15 @@ export interface RoundOutcome {
   detail: string;
   /** True when the round moved the audit forward in any way. */
   produced: boolean;
+  /**
+   * The round made NO `sec_*` tool call at all.
+   *
+   * `produced` answers "did the audit move"; the plateau asks "is the well dry". A round that never ran
+   * answered neither — it examined nothing, so it is no evidence about the project, and counting it made
+   * eight dead turns stop a run that had found nothing wrong. Observed, not guessed: the declared SDK
+   * reports nothing about why a turn ended, so this is measured from the tool counter instead of claimed.
+   */
+  silent?: boolean;
 }
 
 /**
@@ -1268,7 +1278,28 @@ export interface RoundOutcome {
  * plateau signal: a round that reached no verdict and added no evidence is a
  * round that spent tokens and learned nothing.
  */
-export function evaluateRound(snapshot: TreeSnapshot, record: RoundRecord): RoundOutcome {
+/**
+ * Judge a finished round, and stamp HOW it was judged.
+ *
+ * THE STAMP LIVES HERE, IN ONE PLACE, ON PURPOSE. The first attempt added `silent` to each `return` in
+ * `judgeRound` and missed two branches — the analyze return among them, which is the one that matters
+ * most. A wrapper cannot miss a branch, because it never looks at the branches.
+ */
+export function evaluateRound(
+  snapshot: TreeSnapshot,
+  record: RoundRecord,
+  /**
+   * The round made no `sec_*` tool call at all — see `RoundRecord.toolCallsAtStart`.
+   *
+   * Passed in rather than derived here because the counter lives in the tool layer and this function is
+   * pure. A silent round is not an empty one: it examined nothing, so it says nothing about the project.
+   */
+  silent = false,
+): RoundOutcome {
+  return { ...judgeRound(snapshot, record), silent };
+}
+
+function judgeRound(snapshot: TreeSnapshot, record: RoundRecord): RoundOutcome {
   const confirmedNow = snapshot.nodes.filter((n) => n.status === "confirmed").length;
   const confirmedGrew = confirmedNow > record.confirmedAtStart;
 
@@ -1642,7 +1673,9 @@ export function tickLoop(projectRoot: string, snapshot: TreeSnapshot, opts: Tick
     // is the most recently appended one, and a previous run may share the number.
     const record = [...currentRunRounds(snapshot)].reverse().find((r) => r.round === current.awaitingRound);
     if (record) {
-      previous = evaluateRound(snapshot, record);
+      // "Silent" is a DELTA between the counter now and the baseline this round stored at prepare.
+      const calls = secToolCallCount() - (record.toolCallsAtStart ?? secToolCallCount());
+      previous = evaluateRound(snapshot, record, calls === 0);
       if (previous.kind === "coverage") {
         current = { ...current, coverageRounds: (current.coverageRounds ?? 0) + 1 };
       }
@@ -1650,10 +1683,25 @@ export function tickLoop(projectRoot: string, snapshot: TreeSnapshot, opts: Tick
         const stall = current.consolidationStall ?? 0;
         current = { ...current, consolidationStall: previous.produced ? 0 : stall + 1 };
       }
+      // A SILENT ROUND GETS ONE FREE PASS, NOT A FREE RIDE.
+      //
+      // `produced` answers "did the audit move"; the plateau asks "is the well dry". A round in which the
+      // model called no tool at all answered neither — it touched nothing, so it says nothing about the
+      // project, and counting the first one made a single interrupted turn cost a plateau slot.
+      //
+      // But silence repeated is a fact about the RUN, not about the project: a driver that keeps sending
+      // briefs nobody acts on must still stop. So the FIRST silent round is exempt and every one after it
+      // counts. Without that bound "don't punish an interruption" becomes "never stop".
+      // A ROUND THAT PRODUCED RESETS THE STREAK EVEN IF IT TOUCHED NO TOOL. In the tests a clearance
+      // can land between prepare and settle, and in production a round can produce from what it already
+      // read — either way the run is not silent, so counting a silence streak against it would be a lie.
+      const silentStreak = previous.produced ? 0 : previous.silent ? (current.silentStreak ?? 0) + 1 : 0;
+      const counts = !previous.produced && (!previous.silent || silentStreak > 1);
       current = {
         ...current,
         awaitingRound: null,
-        stallRounds: previous.produced ? 0 : current.stallRounds + 1,
+        silentStreak,
+        stallRounds: counts ? current.stallRounds + 1 : 0,
       };
     } else {
       // The record is missing (a torn write, or a wipe). Clearing the fence is
@@ -1897,6 +1945,7 @@ export function tickLoop(projectRoot: string, snapshot: TreeSnapshot, opts: Tick
       nodeEvidenceAtStart: 0,
       confirmedAtStart: snapshot.nodes.filter((n) => n.status === "confirmed").length,
       nodeCountAtStart: snapshot.nodes.length,
+      toolCallsAtStart: secToolCallCount(),
       findingCountAtStart: snapshot.findings.length,
       surfaceCountAtStart: snapshot.surfaces.length,
       surfaceExaminedAtStart: progress.examined,

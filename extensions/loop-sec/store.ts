@@ -1651,6 +1651,9 @@ function normalizeLoopState(value: unknown): AuditLoopState | null {
         : {}),
     plateauWindow: num(o.plateauWindow),
     stallRounds: num(o.stallRounds),
+    ...(typeof o.silentStreak === "number" && Number.isFinite(o.silentStreak) && o.silentStreak > 0
+      ? { silentStreak: Math.max(0, Math.floor(o.silentStreak)) }
+      : {}),
     // A loop written before these fields existed has no banked pause time and is
     // not mid-pause, which is exactly what these defaults say.
     pausedMs: num(o.pausedMs),
@@ -1701,6 +1704,11 @@ function normalizeRoundRecord(value: unknown): RoundRecord | null {
       : {}),
     ...(typeof o.surfaceExaminedAtStart === "number" && Number.isFinite(o.surfaceExaminedAtStart)
       ? { surfaceExaminedAtStart: Math.max(0, Math.floor(o.surfaceExaminedAtStart)) }
+      : {}),
+    // A field a new round record carries but this function does not copy is erased on reload — the
+    // failure this file has produced six times.
+    ...(typeof o.toolCallsAtStart === "number" && Number.isFinite(o.toolCallsAtStart)
+      ? { toolCallsAtStart: Math.max(0, Math.floor(o.toolCallsAtStart)) }
       : {}),
     summary: Array.isArray(o.summary) ? o.summary.filter((s): s is string => typeof s === "string") : [],
   };

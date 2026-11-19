@@ -39,6 +39,7 @@ import { evaluateRound, pauseAfterRounds, pauseLoop, resumeLoop, startLoop, stop
 import { advanceRuns, endDeepRun, parkOnSendFailure, pickNextRun, startDeepRun } from "../extensions/loop-sec/loop.ts";
 import { loadSettings, saveSettings } from "../extensions/loop-sec/settings.ts";
 import { LOOP_VERBS, parseArgs, tailAfterVerb } from "../extensions/loop-sec/args.ts";
+import { noteSecToolCall, secToolCallCount } from "../extensions/loop-sec/tools.ts";
 
 // THE SUITE MUST NOT READ THIS MACHINE'S USER-LEVEL SETTINGS.
 //
@@ -187,6 +188,17 @@ function withSweepFinding(cwd: string): void {
     ],
     poc: 'POST /expr/parse {"e":"..."}',
   });
+}
+
+/**
+ * Simulate "the model did something this round".
+ *
+ * The round tests drive `tickLoop` directly, so no sec tool ever runs and every round looks SILENT —
+ * which the loop now (correctly) refuses to count toward the plateau, because a round that called no
+ * tool examined nothing. This marks one tool call so the round counts as a real, empty attempt.
+ */
+function modelActed(): void {
+  noteSecToolCall();
 }
 
 function withSurface(cwd: string, items = 3): void {
@@ -1049,6 +1061,7 @@ test("a pursuit round is PROGRESS when the gate is refined — and not when noth
 
   // Round 1: nothing changes → unproductive, so the plateau advances.
   tickLoop(cwd, loadSec(cwd).snapshot);
+  modelActed();
   assert.equal(loadSec(cwd).snapshot.loop!.stallRounds, 0, "the first round has no prior outcome to judge");
   tickLoop(cwd, loadSec(cwd).snapshot);
   const stalled = loadSec(cwd).snapshot.loop!.stallRounds;
@@ -2298,6 +2311,8 @@ test("the analyze brief shows the last round AND how close the run is to stoppin
   recordSurface(cwd, { title: "a", kind: "file", file: "src/a.c", line: 1 });
   const first = tickLoop(cwd, loadSec(cwd).snapshot);
   assert.match(first.brief!, /UNPRODUCTIVE ROUNDS: 0\/8/);
+  // The model READ the item and concluded nothing — that is an empty round, not a silent one.
+  modelActed();
   const second = tickLoop(cwd, loadSec(cwd).snapshot);
   assert.match(second.brief!, /Last round \(\d+\): /, "the hypothesis briefs have had this all along");
   assert.match(second.brief!, /UNPRODUCTIVE ROUNDS: 1\/8/);
@@ -2524,7 +2539,8 @@ test("attempted and examined are DIFFERENT numbers, and the plateau reads examin
   const p = surfaceProgress(snap);
   assert.equal(p.attempted, 1, "it was handed a round");
   assert.equal(p.examined, 0, "but nothing was concluded");
-  // And the round is correctly judged unproductive.
+  // And the round is correctly judged unproductive — it looked, and recorded nothing.
+  modelActed();
   tickLoop(cwd, loadSec(cwd).snapshot);
   assert.equal(loadSec(cwd).snapshot.loop!.stallRounds, 1, "an attempt is not a result");
 });
@@ -3790,4 +3806,73 @@ test("with everything examined, the debt block does not pretend there is work le
   const brief = renderSecAnalyzeBrief(s, "x", 4, s.surfaces[0]!);
   assert.match(brief, /1 item\(s\): 0 never examined/, "0 never-examined is stated, not hidden");
   assert.ok(!brief.includes("next unexamined:"), "and no list is invented");
+});
+
+// =================================================================
+// SILENT ROUNDS — an interrupted turn is not an empty one
+// =================================================================
+//
+// The declared SDK gives `agent_settled` a type and nothing else, so the host cannot say "this turn was
+// aborted". What CAN be measured is whether the model called a single tool after the brief: a round with
+// zero tool calls examined nothing, so it is no evidence about the project.
+
+test("one silent round does not cost a plateau slot; the next one does", () => {
+  const cwd = seeded();
+  // plateau 2: two COUNTING unproductive rounds stop the run.
+  startSec(cwd, "挖掘认证前rce漏洞", 2);
+  submitSecRecon(cwd, NOTE);
+  recordSurface(cwd, { title: "S1", kind: "sink", file: "s.py", line: 1 });
+
+  // No tool calls happen in this test at all, so every round is silent.
+  const first = tickLoop(cwd, loadSec(cwd).snapshot);
+  assert.equal(first.action, "sent");
+  // tick 1 dispatched round 1; tick 2 settles it. ONE settle has happened, so the streak is 1 and the
+  // plateau has not moved: the first silent round is exempt.
+  const second = tickLoop(cwd, loadSec(cwd).snapshot);
+  assert.equal(second.action, "sent");
+  let s = loadSec(cwd).snapshot;
+  assert.equal(s.loop?.silentStreak, 1, "the streak is recorded");
+  assert.equal(s.loop?.stallRounds, 0, "and the exempt round did not cost a slot");
+
+  // tick 3 settles round 2 — the SECOND consecutive silent round counts.
+  const third = tickLoop(cwd, loadSec(cwd).snapshot);
+  assert.equal(third.action, "sent");
+  s = loadSec(cwd).snapshot;
+  assert.equal(s.loop?.silentStreak, 2);
+  assert.equal(s.loop?.stallRounds, 1, "the second one counts");
+
+  // tick 4 settles round 3 → stall reaches the plateau of 2 and the run stops.
+  const fourth = tickLoop(cwd, loadSec(cwd).snapshot);
+  assert.equal(fourth.action, "stopped");
+  assert.match(fourth.reason, /plateau/, "repeated silence still stops the run — the bound is what keeps it from spinning");
+});
+
+test("a round that PRODUCES resets the silent streak", () => {
+  const cwd = seeded();
+  startSec(cwd, "挖掘认证前rce漏洞", 99);
+  submitSecRecon(cwd, NOTE);
+  recordSurface(cwd, { title: "S1", kind: "sink", file: "s.py", line: 1 });
+  tickLoop(cwd, loadSec(cwd).snapshot);
+  tickLoop(cwd, loadSec(cwd).snapshot);
+  assert.equal(loadSec(cwd).snapshot.loop?.silentStreak, 1, "one settle saw a silent round");
+
+  // The model acts now: a clearance is a produced round.
+  clearSurface(cwd, "S-0001", "check_auth 在 s.c:1 之前执行，这条路径不在公开路由表里", { file: "s.c", line: 1 });
+  tickLoop(cwd, loadSec(cwd).snapshot);
+  // 0 is the default and is not persisted, so "cleared" reads back as absent.
+  assert.equal(loadSec(cwd).snapshot.loop?.silentStreak ?? 0, 0, "producing clears the streak");
+});
+
+test("the tool counter is what the baseline is measured against", () => {
+  // A round's baseline is taken at prepare, so the delta at settle is "did the model touch anything".
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 1);
+  submitSecRecon(cwd, NOTE);
+  recordSurface(cwd, { title: "S1", kind: "sink", file: "s.py", line: 1 });
+  const before = secToolCallCount();
+  tickLoop(cwd, loadSec(cwd).snapshot);
+  const rec = loadSec(cwd).snapshot.roundRecords.at(-1)!;
+  assert.equal(rec.toolCallsAtStart, before, "the baseline is the count at prepare");
+  // Simulate the model working: the counter moves, so the settle sees a non-silent round.
+  assert.ok(secToolCallCount() >= before);
 });
