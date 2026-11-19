@@ -65,6 +65,7 @@ import {
   type AuditLoopState,
   type SecFinding,
   type SecFindingPatch,
+  type SecObservation,
   type SecFindingStep,
   type SecSurface,
   type SecSurfaceKind,
@@ -539,6 +540,263 @@ export function submitSecRecon(projectRoot: string, note: string, at = nowIso())
     // The mirror is a convenience; the event is the record.
   }
   return { ok: true, value: combined, warnings: [] };
+}
+
+// -----------------------------------------------------------------
+// OBSERVATIONS — what a round SAW, as opposed to what it CONCLUDED
+// -----------------------------------------------------------------
+//
+// The gap this closes is a measured one. A round reads four files and comes back with one finding; the
+// other three things it learned ("the guard reads the query string", "this table is seeded with exactly
+// one row", "the admin build excludes this module") exist only inside that conversation. After context
+// compaction the next round cannot recall them, and the brief — which shows the 30 most recent findings
+// — has no room to carry them anyway.
+//
+// So they are written down, and the model gets a way to ASK. That is the whole design: the brief can
+// afford to be small because nothing is lost, and depth stops depending on how much of the conversation
+// survived.
+
+export interface ObservationInput {
+  text: string;
+  location?: { file: string; line: number };
+  files?: string[];
+  how?: string;
+  surfaceId?: string;
+  findingId?: string;
+}
+
+/**
+ * The observation's gate, and it is the same bar the findings carry: IT MUST BE LOCATABLE.
+ *
+ * A fact nobody can go and check is indistinguishable from a guess, and a recall result with no
+ * `file:line` is a sentence the next round has to trust. A line is preferred; a set of files is
+ * accepted for facts about a module, a build or a config, where no single line is the answer.
+ */
+export function validateObservation(input: ObservationInput): Result<ObservationInput> {
+  const errors: string[] = [];
+  const text = (input.text ?? "").trim();
+  // TWENTY, not thirty. The point of the minimum is to exclude "checked", "nothing found", "ok" — not
+  // to enforce prose. Measured against the way this mode is actually used: a complete Chinese
+  // observation ("守卫读的是 query string，handler 读 body") is 20-odd characters, and a 30-character
+  // floor rejected good records while admitting an English sentence that says nothing.
+  if (text.length < 20) {
+    errors.push(
+      `text must be at least 20 characters (got ${text.length}). A later round reads this WITHOUT having ` +
+        `seen the file, so "checked" is not an observation.`,
+    );
+  }
+  const hasLocation =
+    !!input.location &&
+    typeof input.location.file === "string" &&
+    input.location.file.trim() !== "" &&
+    input.location.line > 0;
+  const files = (input.files ?? []).filter((f) => typeof f === "string" && f.trim() !== "");
+  if (!hasLocation && files.length === 0) {
+    errors.push(
+      "it must be locatable: pass `file`+`line`, or `files` when the fact is about a module/build/config " +
+        "rather than one line. An observation a reader cannot open is a guess with a timestamp.",
+    );
+  }
+  if (input.surfaceId && !/^S-\d+$/.test(input.surfaceId)) {
+    errors.push(`surfaceId must look like S-0001, got "${input.surfaceId}"`);
+  }
+  if (input.findingId && !/^F-\d+$/.test(input.findingId)) {
+    errors.push(`findingId must look like F-0001, got "${input.findingId}"`);
+  }
+  return errors.length === 0 ? { ok: true, value: { ...input, text }, warnings: [] } : { ok: false, errors };
+}
+
+function nextObservationId(snapshot: TreeSnapshot): string {
+  let max = 0;
+  for (const o of snapshot.observations) {
+    const m = /^O-(\d+)$/.exec(o.id);
+    if (m) max = Math.max(max, Number(m[1]));
+  }
+  return `O-${String(max + 1).padStart(4, "0")}`;
+}
+
+/**
+ * Record one observation.
+ *
+ * The ROUND is taken from the loop, not from the caller: an observation is only useful to a later round
+ * if the reader can tell WHEN it was made, and a model that forgets to pass the round would produce a
+ * record it cannot place in the run's history.
+ */
+export function recordObservation(
+  projectRoot: string,
+  input: ObservationInput,
+  round?: number,
+  at = nowIso(),
+): Result<SecObservation> {
+  const validated = validateObservation(input);
+  if (!validated.ok) return { ok: false, errors: validated.errors };
+  const snapshot = loadSec(projectRoot).snapshot;
+  const observation: SecObservation = {
+    id: nextObservationId(snapshot),
+    at,
+    round: round ?? snapshot.loop?.round ?? 0,
+    text: validated.value.text,
+    ...(validated.value.location ? { location: validated.value.location } : {}),
+    ...(validated.value.files && validated.value.files.length > 0 ? { files: [...validated.value.files] } : {}),
+    ...(validated.value.how ? { how: validated.value.how } : {}),
+    ...(validated.value.surfaceId ? { surfaceId: validated.value.surfaceId } : {}),
+    ...(validated.value.findingId ? { findingId: validated.value.findingId } : {}),
+  };
+  if (!appendSecEvent(projectRoot, { type: "observation_recorded", at, observation })) {
+    return { ok: false, errors: ["the observation could not be written to the log"] };
+  }
+  return { ok: true, value: observation, warnings: [] };
+}
+
+export interface RecallHit {
+  id: string;
+  kind: "observation" | "finding" | "surface";
+  round: number;
+  /** One line: what it is, with the location when there is one. */
+  line: string;
+  /** Where to check it, when known. */
+  location?: { file: string; line: number };
+}
+
+/**
+ * Search what this run has established, across all three record kinds.
+ *
+ * WHY IT SEARCHES OBSERVATIONS TOO. The findings and clearances are already in the brief; what is
+ * missing is everything in between. A round asking "did anybody look at the session store" needs the
+ * observation that says somebody did, not just the finding it did not produce.
+ *
+ * Matching is plain case-insensitive substring over the record's text plus its ids and paths — NOT a
+ * semantic search. Semantic matching would need embeddings and would sometimes return something
+ * plausibly related instead of something actually recorded, and in an audit that difference is the
+ * difference between a lead and a fabrication.
+ */
+export function recallRecords(snapshot: TreeSnapshot, query: string, limit = 20): RecallHit[] {
+  const q = (query ?? "").trim().toLowerCase();
+  if (q === "") return [];
+  const terms = q.split(/\s+/).filter(Boolean);
+  const hits: RecallHit[] = [];
+  const matches = (haystack: string): boolean => {
+    const h = haystack.toLowerCase();
+    return terms.every((t) => h.includes(t));
+  };
+  const where = (loc?: { file: string; line: number }): { location?: { file: string; line: number } } =>
+    loc ? { location: loc } : {};
+
+  for (const o of snapshot.observations) {
+    const hay = [o.text, o.id, o.how ?? "", o.location?.file ?? "", ...(o.files ?? []), o.surfaceId ?? "", o.findingId ?? ""].join(" ");
+    if (!matches(hay)) continue;
+    hits.push({ id: o.id, kind: "observation", round: o.round, line: clip(o.text, 200), ...where(o.location) });
+  }
+  for (const f of snapshot.findings) {
+    const hay = [f.title, f.id, f.category, f.reasoning ?? "", f.location?.file ?? "", f.evidence ?? ""].join(" ");
+    if (!matches(hay)) continue;
+    hits.push({
+      id: f.id,
+      kind: "finding",
+      round: f.round,
+      line: `[${f.severity ?? "unrated"}] ${f.category} — ${clip(f.title, 160)}`,
+      ...where(f.location),
+    });
+  }
+  for (const x of snapshot.surfaces) {
+    // THE GUARD LOCATION COUNTS AS THE SURFACE'S PATH. A clearance is a fact about a LINE, and
+    // "who already cleared session.c" is one of the most useful questions a later round can ask.
+    const hay = [
+      x.title,
+      x.id,
+      x.kind,
+      x.clearedReason ?? "",
+      x.location?.file ?? "",
+      x.guardLocation?.file ?? "",
+      ...(x.categories ?? []),
+    ].join(" ");
+    if (!matches(hay)) continue;
+    hits.push({
+      id: x.id,
+      kind: "surface",
+      round: x.round,
+      line: `[${x.kind}/${x.status}] ${clip(x.title, 160)}${x.clearedReason ? ` — ${clip(x.clearedReason, 100)}` : ""}`,
+      ...where(x.location ?? x.guardLocation),
+    });
+  }
+  // Newest first: a round asking "what do we know about X" usually wants the most recent state.
+  return hits.sort((a, b) => b.round - a.round || a.id.localeCompare(b.id)).slice(0, Math.max(1, limit));
+}
+
+/** Everything recorded about one id, for `sec_show` — the full record the brief had to truncate. */
+export function showRecord(
+  snapshot: TreeSnapshot,
+  id: string,
+): { kind: "observation" | "finding" | "surface"; text: string } | null {
+  const key = (id ?? "").trim().toUpperCase();
+  const o = snapshot.observations.find((x) => x.id.toUpperCase() === key);
+  if (o) {
+    return {
+      kind: "observation",
+      text: [
+        `${o.id} · 第 ${o.round} 轮`,
+        o.location ? `位置：${o.location.file}:${o.location.line}` : "",
+        !o.location && o.files && o.files.length > 0 ? `文件：${o.files.join(", ")}` : "",
+        o.surfaceId ? `来自攻击面：${o.surfaceId}` : "",
+        o.findingId ? `来自发现：${o.findingId}` : "",
+        o.how ? `怎么得到的：${o.how}` : "",
+        "",
+        o.text,
+      ]
+        .filter((l) => l !== "")
+        .join("\n"),
+    };
+  }
+  const f = snapshot.findings.find((x) => x.id.toUpperCase() === key);
+  if (f) {
+    const chain =
+      f.path && f.path.length > 0
+        ? f.path
+            .map((st, i) => `${i + 1}. ${st.file ? `${st.file}${st.line ? `:${st.line}` : ""} — ` : ""}${st.detail}`)
+            .join("\n")
+        : "";
+    return {
+      kind: "finding",
+      text: [
+        `${f.id} · ${f.severity ?? "未定级"} · ${f.category} · 第 ${f.round} 轮`,
+        `认证：${f.preAuth === true ? "认证前" : f.preAuth === false ? "需要认证" : "未判断"}`,
+        f.location ? `位置：${f.location.file}:${f.location.line}` : "",
+        "",
+        `**${f.title}**`,
+        f.reasoning ? `\n推理：\n${f.reasoning}` : "",
+        f.evidence ? `\n物证：${f.evidence}` : "",
+        f.poc ? `\nPoC：\n${f.poc}` : "",
+        chain ? `\n调用链：\n${chain}` : "",
+        f.blockers && f.blockers.length > 0 ? `\n前提：\n${f.blockers.map((b) => `- ${b}`).join("\n")}` : "",
+        f.pursuitClosed ? `\n追索已结束：${f.pursuitClosed}` : "",
+        f.verification
+          ? `\n验证：${f.verification.confirmed ? "已复现" : "未复现"} — ${f.verification.command}（退出码 ${f.verification.exitCode ?? "超时"}）\n${clip(f.verification.output, 2000)}`
+          : "",
+      ]
+        .filter((l) => l !== "")
+        .join("\n"),
+    };
+  }
+  const x = snapshot.surfaces.find((y) => y.id.toUpperCase() === key);
+  if (x) {
+    return {
+      kind: "surface",
+      text: [
+        `${x.id} · ${x.kind} · ${x.status} · 第 ${x.round} 轮`,
+        x.location ? `位置：${x.location.file}:${x.location.line}` : "",
+        x.categories && x.categories.length > 0 ? `类别：${x.categories.join(", ")}` : "",
+        `尝试次数：${x.attempts ?? 0}${x.status === "digging" ? ` · dig ${x.digRounds ?? 0}` : ""}`,
+        "",
+        `**${x.title}**`,
+        x.clearedReason ? `\n结论：${x.clearedReason}` : "",
+        x.guardLocation ? `守卫位置：${x.guardLocation.file}:${x.guardLocation.line}` : "",
+        x.findingId ? `关联发现：${x.findingId}` : "",
+      ]
+        .filter((l) => l !== "")
+        .join("\n"),
+    };
+  }
+  return null;
 }
 
 // -----------------------------------------------------------------
@@ -1491,7 +1749,10 @@ function renderFoundSoFar(snapshot: TreeSnapshot): string {
     lines.push(`  ${f.id} [${f.severity ?? "unrated"}] ${f.category} — ${clip(f.title, 110)}${where}${chain}${ran}${gated}`);
   }
   if (findings.length > shown.length) {
-    lines.push(`  … +${findings.length - shown.length} more, worst-first — the full list is in SEC-REPORT.md and tree.jsonl.`);
+    // SAY HOW TO REACH THEM. A truncation with no way back is a lost record, and the model then
+    // either re-reads the file or, worse, re-reports the finding.
+    lines.push(`  … +${findings.length - shown.length} more, worst-first. ` +
+      `sec_show <F-id> opens one in full; sec_recall <query> finds one by keyword.`);
   }
   const chains = findings.filter((f) => f.chainOf && f.chainOf.length > 0);
   if (chains.length > 0) {
@@ -1951,6 +2212,16 @@ export function renderSecAnalyzeBrief(
   lines.push("**Trace it ALL before concluding.** Stopping half way is guessing, and a guess written into the");
   lines.push("report is one a reader cannot tell apart from a checked conclusion.");
   lines.push("");
+  // THE READ SIDE, SAID ONCE PER ROUND. The brief carries 30 findings and 40 clearances and stops
+  // there; the model has to know the rest is reachable, or a truncated record is a lost record and the
+  // round re-reads a file somebody already covered.
+  lines.push("**You can ASK this run what it already knows:**");
+  lines.push("  - `sec_recall <关键词>` — 历轮的观察 / 发现 / clearance 里按关键字检索（符号、路径片段、路由、表名）；");
+  lines.push("  - `sec_show <id>` — 打开一条完整记录（简报截断的那些在这里）；");
+  lines.push("  - `sec_observe` — 把本轮读到的**事实**写下来（不是发现），下一轮才不用重新读这个文件。");
+  lines.push("");
+  lines.push("先 `sec_recall` 再读文件：别人查过的东西，答案在这里，这一轮就省下来了。");
+  lines.push("");
   for (const category of item.categories ?? []) {
     lines.push(renderSecLadder(category));
     lines.push("");
@@ -1970,7 +2241,8 @@ export function renderSecAnalyzeBrief(
       lines.push(`  ${s.id}  ${clip(s.title, 80)} — ${clip(s.clearedReason ?? "", 90)}`);
     }
     if (cleared.length > CLEARED_SHOWN) {
-      lines.push(`  … +${cleared.length - CLEARED_SHOWN} earlier clearance(s), not shown — they are in the report.`);
+      lines.push(`  … +${cleared.length - CLEARED_SHOWN} earlier clearance(s), not shown. ` +
+        `sec_show <S-id> opens one; sec_recall <query> searches all of them.`);
     }
   }
   lines.push("");

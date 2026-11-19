@@ -52,6 +52,15 @@ acceptance checklist for a version that is safe to run unattended.
 | `sec_dig` | hand the SAME item another bounded round |
 | `sec_reopen` | withdraw a clearance: the guard does not actually hold |
 | `sec_update` | correct a finding instead of recording a duplicate |
+| `sec_verify` | run ONE command against a finding, with its `expect` stated first |
+| `sec_observe` | write down a **fact** the code showed you (not a finding) — `file:line`, or `files` for a module/build |
+| `sec_recall` | search what the run has established: observations, findings AND clearances |
+| `sec_show` | open one record in full — the brief truncates at 30 findings / 40 clearances |
+
+The write tools all existed before; `sec_observe` / `sec_recall` / `sec_show` are the **read
+side**. Without them the brief was the only channel and had to truncate, and a truncated record
+with no way back is a lost record: a round would re-read a file somebody had already cleared.
+The brief can now stay small, because nothing has to be carried in it.
 
 ## The command
 

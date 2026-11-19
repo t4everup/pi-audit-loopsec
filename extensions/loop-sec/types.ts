@@ -1931,6 +1931,40 @@ export interface SecSurface {
   findingId?: string;
 }
 
+/**
+ * Something a round OBSERVED, as opposed to something it CONCLUDED.
+ *
+ * The distinction is the whole point. A finding is a claim with an artifact; an observation is a fact
+ * about the code that a LATER round may need and that no report will ever print — "this loader is only
+ * reachable from the admin build", "the guard reads the query string", "this table is seeded with one
+ * row". Those are what an audit actually accumulates, and until now they existed only inside the
+ * conversation that produced them: after context compaction, a round could not recall what round 3 had
+ * already established, and the brief could only show the 30 most recent findings.
+ *
+ * Written down, they become searchable (`sec_recall`) and the brief can afford to be small.
+ *
+ * IT MUST BE LOCATABLE. An observation carries a `file:line` or at least one file, because a fact
+ * nobody can go and check is indistinguishable from a guess — the same bar the findings carry, applied
+ * to the intermediate steps.
+ */
+export interface SecObservation {
+  id: string;
+  at: string;
+  /** The round that recorded it. */
+  round: number;
+  /** Reported as free text; the reader is a later round, not a parser. */
+  text: string;
+  /** Where it can be checked. One of these is required — see the interface note. */
+  location?: EvidenceLocation;
+  /** Files it concerns when there is no single line (a module, a config, a build). */
+  files?: string[];
+  /** How it was obtained: the command, the read, the query. Optional, and useful to a later round. */
+  how?: string;
+  /** The surface item / finding this came from, when it came from one. */
+  surfaceId?: string;
+  findingId?: string;
+}
+
 /** The fields a surface update may change. */
 export interface SecSurfacePatch {
   status?: SecSurfaceStatus;
@@ -2016,6 +2050,12 @@ export interface TreeSnapshot {
    * re-enumerated and re-examined, and the run would look busier than it is.
    */
   surfaces: SecSurface[];
+  /**
+   * The run's observations, oldest first. Windowed (see SEC_OBSERVATION_WINDOW) because this is a
+   * RECALL corpus and grows by a few entries per round; the findings and surfaces are not windowed
+   * because they are the deliverable.
+   */
+  observations: SecObservation[];
   /**
    * The `/loopSEC` recon note, or null.
    *

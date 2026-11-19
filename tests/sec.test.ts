@@ -57,7 +57,10 @@ import {
   digSurface,
   nextOpenSurface,
   recordFinding,
+  recordObservation,
   recordSurface,
+  recallRecords,
+  showRecord,
   reopenSurface,
   renderSecAnalyzeBrief,
   renderSecFindings,
@@ -3607,4 +3610,142 @@ test("a fence with NO turn claim is settled automatically — the run is not stu
   assert.match(recovered.settled?.reason ?? "", /ORPHANED round 1/, "it reports the recovery rather than doing it silently");
   assert.equal(recovered.sent?.round, 2, "and the run moves again");
   assert.equal(loadSec(cwd).snapshot.loop?.round, 2);
+});
+
+// =================================================================
+// THE READ SIDE — observation / recall / show
+// =================================================================
+//
+// Until these existed the tool surface was write-only: a round could record findings, surfaces and
+// clearances, but could not ASK the run anything back. Everything it knew had to fit in the brief,
+// which is why the brief truncates at 30 findings — and a truncated record with no way back is lost.
+
+test("an observation needs a location, because a fact nobody can open is a guess", () => {
+  const cwd = seeded();
+  startSec(cwd);
+
+  const noText = recordObservation(cwd, { text: "checked", location: { file: "a.c", line: 1 } });
+  assert.equal(noText.ok, false, "20 characters minimum — 'checked' is not an observation");
+
+  const nowhere = recordObservation(cwd, { text: "守卫读的是 query string 而不是 body 里的 id 字段" });
+  assert.equal(nowhere.ok, false, "and it must be locatable");
+  assert.match(nowhere.ok ? "" : nowhere.errors.join(" "), /must be locatable/);
+
+  const ok = recordObservation(cwd, {
+    text: "守卫读的是 query string 而不是 body 里的 id 字段，两者可以给出不同的值",
+    location: { file: "src/guard.py", line: 42 },
+  });
+  assert.equal(ok.ok, true, ok.ok ? "" : ok.errors.join("; "));
+  assert.equal(ok.value.id, "O-0001");
+  assert.equal(ok.value.round, 0, "the round comes from the loop, not the caller");
+
+  // A module/build fact has no single line — a file list is accepted for it.
+  const filesOnly = recordObservation(cwd, {
+    text: "admin 构建通过 build tag 排除了整个 internal/legacy 目录",
+    files: ["internal/legacy", "build.go"],
+  });
+  assert.equal(filesOnly.ok, true, filesOnly.ok ? "" : filesOnly.errors.join("; "));
+  assert.equal(filesOnly.value.id, "O-0002");
+});
+
+test("observations survive the log round trip and are numbered monotonically", () => {
+  const cwd = seeded();
+  startSec(cwd);
+  recordObservation(cwd, { text: "第一个观察：session 只在这个文件里签发，没有第二处", location: { file: "a.c", line: 3 } });
+  recordObservation(cwd, {
+    text: "第二个观察：execSync 只在这一处被调用，入参来自上层的 cmd 变量",
+    location: { file: "b.c", line: 9 },
+    how: "rg execSync",
+  });
+  const s = loadSec(cwd).snapshot;
+  assert.deepEqual(
+    s.observations.map((o) => o.id),
+    ["O-0001", "O-0002"],
+  );
+  assert.equal(s.observations[1]!.how, "rg execSync");
+  assert.deepEqual(s.observations[1]!.location, { file: "b.c", line: 9 });
+});
+
+test("recall searches observations, findings AND clearances — all three kinds", () => {
+  const cwd = seeded();
+  withSurface(cwd, 1);
+  recordObservation(cwd, {
+    text: "session cookie 由 middleware 统一校验，源码里没有第二处签发点",
+    location: { file: "src/auth/session.c", line: 77 },
+  });
+  recordFinding(cwd, {
+    title: "session 反序列化", category: "deserialization", severity: "high", file: "src/auth/session.c", line: 90, evidence: "e",
+  });
+  clearSurface(cwd, "S-0001", "session 相关路径都有守卫，check_auth 在 session.c:77 之前执行", {
+    file: "src/auth/session.c",
+    line: 77,
+  });
+
+  const hits = recallRecords(loadSec(cwd).snapshot, "session");
+  const kinds = new Set(hits.map((h) => h.kind));
+  assert.deepEqual([...kinds].sort(), ["finding", "observation", "surface"], "all three record kinds are searchable");
+
+  // ANDed terms; a term that matches nothing returns nothing rather than a fuzzy neighbour.
+  assert.equal(recallRecords(loadSec(cwd).snapshot, "session nonsenseterm").length, 0);
+  assert.ok(recallRecords(loadSec(cwd).snapshot, "src/auth/session.c").length >= 3, "paths are searchable");
+});
+
+test("recall is newest-first, and an empty query is refused rather than returning everything", () => {
+  const cwd = seeded();
+  startSec(cwd);
+  recordObservation(cwd, { text: "较早的观察：loader 只在启动路径上被调用一次", location: { file: "a.c", line: 1 } }, 2);
+  recordObservation(cwd, { text: "较晚的观察：loader 在热重载路径上也会被调用", location: { file: "b.c", line: 2 } }, 9);
+  const hits = recallRecords(loadSec(cwd).snapshot, "loader");
+  assert.equal(hits.length, 2);
+  assert.equal(hits[0]!.round, 9, "the most recent state comes first");
+  assert.deepEqual(recallRecords(loadSec(cwd).snapshot, "   "), [], "an empty query is not 'everything'");
+});
+
+test("sec_show returns the WHOLE record — the thing the brief had to truncate", () => {
+  const cwd = seeded();
+  withSurface(cwd, 1);
+  const longReasoning = "这是一段很长的推理，用于验证 sec_show 不会像简报那样把它截断。".repeat(20);
+  recordFinding(cwd, {
+    title: "注入", category: "command-injection", severity: "critical", file: "src/a.py", line: 7,
+    evidence: "exec(x)", reasoning: longReasoning,
+    path: [{ detail: "入口", file: "src/a.py", line: 1 }, { detail: "执行", file: "src/a.py", line: 7 }],
+  });
+  const shown = showRecord(loadSec(cwd).snapshot, "F-0001");
+  assert.equal(shown?.kind, "finding");
+  assert.ok(shown!.text.includes(longReasoning), "the full reasoning, not a clipped version");
+  assert.match(shown!.text, /1\. src\/a\.py:1 — 入口/, "and the call chain, one hop per line");
+
+  // Observations and surfaces resolve through the same tool.
+  const o = recordObservation(cwd, {
+    text: "某条观察正文：这个校验发生在前置过滤器里，不在 handler 内",
+    location: { file: "x.c", line: 4 },
+  });
+  assert.ok(o.ok);
+  assert.equal(showRecord(loadSec(cwd).snapshot, "O-0001")?.kind, "observation");
+  assert.equal(showRecord(loadSec(cwd).snapshot, "S-0001")?.kind, "surface");
+  assert.equal(showRecord(loadSec(cwd).snapshot, "F-9999"), null, "an unknown id is null, not a guess");
+});
+
+test("the analyze brief tells the model it can ask, and how to reach a truncated record", () => {
+  const cwd = seeded();
+  withSurface(cwd, 2);
+  const item = loadSec(cwd).snapshot.surfaces[0]!;
+  const brief = renderSecAnalyzeBrief(loadSec(cwd).snapshot, "x", 3, item);
+  assert.match(brief, /sec_recall <关键词>/, "the read side is announced");
+  assert.match(brief, /sec_show <id>/);
+  assert.match(brief, /sec_observe/, "and the write side that makes recall useful");
+});
+
+test("a truncated findings list says how to reach the rest", () => {
+  const cwd = seeded();
+  withSurface(cwd, 1);
+  for (let i = 0; i < 33; i++) {
+    recordFinding(cwd, {
+      title: `finding ${i}`, category: "rce", severity: "high", file: `f${i}.py`, line: i + 1, evidence: "e",
+    });
+  }
+  const item = loadSec(cwd).snapshot.surfaces[0]!;
+  const brief = renderSecAnalyzeBrief(loadSec(cwd).snapshot, "x", 3, item);
+  assert.match(brief, /\+3 more/, "the count is still honest");
+  assert.match(brief, /sec_show <F-id>/, "and it names the way to open one");
 });

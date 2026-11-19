@@ -74,6 +74,7 @@ import {
   type RoundRecord,
   type SecFinding,
   type SecFindingPatch,
+  type SecObservation,
   type SecLoopDeep,
   type SecFindingStep,
   type SecSurface,
@@ -126,6 +127,15 @@ export const HISTORY_WINDOW = 50;
 /** How many consolidation passes the folded snapshot keeps. Each record is
  * small and carries at most a handful of pair keys, so this is generous. */
 export const CONSOLIDATION_HISTORY_WINDOW = 200;
+
+/**
+ * How many observations the folded snapshot keeps.
+ *
+ * Larger than the round window because recall is only useful if it reaches back — but still bounded, so
+ * a very long run cannot make the fold grow without limit. Older observations leave the SNAPSHOT and
+ * stay in the log; `sec_recall` searches the snapshot, which is the documented limit.
+ */
+export const SEC_OBSERVATION_WINDOW = 2000;
 
 /** How many round records the folded snapshot keeps. */
 export const ROUND_HISTORY_WINDOW = 100;
@@ -657,6 +667,8 @@ export type TreeEvent =
   | { type: "finding_updated"; at: string; id: string; patch: SecFindingPatch }
   /** The `/loopSEC` recon note. Latest wins. */
   | { type: "sec_recon_submitted"; at: string; note: string }
+  /** What a round OBSERVED. Append-only; searchable from later rounds with `sec_recall`. */
+  | { type: "observation_recorded"; at: string; observation: SecObservation }
   /** One item on the `/loopSEC` attack surface. Append-only, never windowed. */
   | { type: "surface_recorded"; at: string; surface: SecSurface }
   | { type: "surface_updated"; at: string; id: string; patch: SecSurfacePatch }
@@ -848,6 +860,11 @@ function normalizeEvent(raw: Record<string, unknown>): TreeEvent | null {
     case "sec_recon_submitted": {
       if (typeof raw.note !== "string") return null;
       return { type: "sec_recon_submitted", at, note: raw.note };
+    }
+    case "observation_recorded": {
+      const observation = normalizeObservation(raw.observation);
+      if (!observation) return null;
+      return { type: "observation_recorded", at, observation };
     }
     case "surface_recorded": {
       const surface = normalizeSurface(raw.surface);
@@ -1171,6 +1188,44 @@ function normalizeFindingList(value: unknown): SecFinding[] {
  * `Evidence.reproduces` and `AuditLoopKind: "sec"` — so every field of `SecSurface`
  * appears below, and the round-trip test covers the class rather than one field.
  */
+/**
+ * Round-trip one observation.
+ *
+ * EVERY FIELD PASSES THROUGH AN ALLOWLIST, and the reason is written all over this file: a field a new
+ * event carries but this function does not copy is silently erased on reload. That has happened five
+ * times here (`Evidence.reproduces`, `SecSurface.priority`, the loop kind, `deep`, `directive`), so a new
+ * record type gets its normalizer on the same day it gets its type.
+ */
+function normalizeObservation(value: unknown): SecObservation | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const o = value as Record<string, unknown>;
+  const id = typeof o.id === "string" ? o.id.trim() : "";
+  const text = typeof o.text === "string" ? o.text.trim() : "";
+  if (!/^O-\d+$/.test(id) || text === "") return null;
+  const location =
+    o.location && typeof o.location === "object"
+      ? (() => {
+          const l = o.location as Record<string, unknown>;
+          const file = typeof l.file === "string" ? l.file : "";
+          const line = typeof l.line === "number" && Number.isFinite(l.line) ? Math.max(1, Math.floor(l.line)) : 0;
+          return file && line > 0 ? { file, line } : null;
+        })()
+      : null;
+  const files = Array.isArray(o.files) ? (o.files as unknown[]).filter((f): f is string => typeof f === "string" && f !== "") : [];
+  const round = typeof o.round === "number" && Number.isFinite(o.round) ? Math.max(0, Math.floor(o.round)) : 0;
+  return {
+    id,
+    at: typeof o.at === "string" ? o.at : "",
+    round,
+    text,
+    ...(location ? { location } : {}),
+    ...(files.length > 0 ? { files } : {}),
+    ...(typeof o.how === "string" && o.how ? { how: o.how } : {}),
+    ...(typeof o.surfaceId === "string" && o.surfaceId ? { surfaceId: o.surfaceId } : {}),
+    ...(typeof o.findingId === "string" && o.findingId ? { findingId: o.findingId } : {}),
+  };
+}
+
 function normalizeSurface(value: unknown): SecSurface | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const o = value as Record<string, unknown>;
@@ -1791,6 +1846,7 @@ export function emptySnapshot(): TreeSnapshot {
     reconAt: null,
     findings: [],
     surfaces: [],
+    observations: [],
     secNote: null,
     maxNodeSeq: 0,
     rounds: 0,
@@ -1823,6 +1879,7 @@ export function foldEvents(events: readonly TreeEvent[]): TreeSnapshot {
   let reconAt: string | null = null;
   let findings: SecFinding[] = [];
   let surfaces: SecSurface[] = [];
+  let observations: SecObservation[] = [];
   let secNote: string | null = null;
   let notes: OperatorNote[] = [];
   const order: string[] = [];
@@ -1958,6 +2015,18 @@ export function foldEvents(events: readonly TreeEvent[]): TreeSnapshot {
         if (event.at) updatedAt = event.at;
         break;
       }
+      case "observation_recorded": {
+        // Append-only, and a duplicate id is dropped for the same reason surfaces are: two records
+        // with one id make every later lookup ambiguous.
+        if (!observations.some((x) => x.id === event.observation.id)) {
+          observations = [...observations, event.observation];
+          if (observations.length > SEC_OBSERVATION_WINDOW) {
+            observations = observations.slice(-SEC_OBSERVATION_WINDOW);
+          }
+        }
+        if (event.at) updatedAt = event.at;
+        break;
+      }
       case "surface_recorded": {
         // Append-only, and a duplicate id is dropped rather than trusted: the report
         // counts examined/total, and a double-counted item makes that ratio a lie.
@@ -2018,7 +2087,7 @@ export function foldEvents(events: readonly TreeEvent[]): TreeSnapshot {
 
   return {
     treeId, objective, rootId, nodes, byId, order, selections, consolidations, loop, roundRecords,
-    notes, segments, segmentRecords, reconAt, findings, surfaces, secNote, maxNodeSeq, rounds, tornLines: 0, compactions, updatedAt,
+    notes, segments, segmentRecords, reconAt, findings, surfaces, observations, secNote, maxNodeSeq, rounds, tornLines: 0, compactions, updatedAt,
   };
 }
 

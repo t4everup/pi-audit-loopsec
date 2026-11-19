@@ -14,8 +14,8 @@
 import { defineTool, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
-import { SEVERITIES, SEC_SURFACE_KINDS, type SecFindingPatch, type SecSurfaceKind, type Severity } from "./types.js";
-import { clearSurface, digSurface, recordFinding, recordSurface, reopenSurface, submitSecRecon, surfaceProgress, updateFinding, updateSurface, verifyFinding } from "./sec.js";
+import { SEVERITIES, SEC_SURFACE_KINDS, clip, type SecFindingPatch, type SecSurfaceKind, type Severity } from "./types.js";
+import { recallRecords, showRecord, recordObservation, clearSurface, digSurface, recordFinding, recordSurface, reopenSurface, submitSecRecon, surfaceProgress, updateFinding, updateSurface, verifyFinding } from "./sec.js";
 import { loadSec } from "./store.js";
 
 function text(value: string, details: Record<string, unknown> = {}): { content: Array<{ type: "text"; text: string }>; details: Record<string, unknown> } {
@@ -513,11 +513,150 @@ export function registerSecTools(pi: ExtensionAPI): void {
       },
     }),
   );
+    // ---------------------------------------------------------------
+    // The READ side. Until these existed the tool surface was write-only: a round could record
+    // findings, surfaces, clearances and verifications, but could not ASK the run anything back.
+    // Everything it knew had to arrive inside the brief, which is why the brief had to truncate at 30
+    // findings and 40 clearances — and a truncated record the model cannot fetch is simply lost.
+    // ---------------------------------------------------------------
+    pi.registerTool(
+      defineTool({
+        name: "sec_observe",
+        label: "Record something the code showed you",
+        description:
+          "Write down a FACT about the code that a LATER round will need and that no report will ever print — 'the guard reads the query string', 'this table is seeded with one row', 'the admin build excludes this module'. It is not a finding: it is not a claim about exploitability, so it does not need severity or preAuth. It MUST be locatable (`file`+`line`, or `files` for a module/build/config), because a fact a reader cannot open is a guess with a timestamp. Recording these is what lets the brief stay small: nothing is lost, so nothing has to be carried.",
+        promptSnippet: "sec_observe — a fact I saw that a later round will need",
+        promptGuidelines: [
+          "Record the three or four things the code TAUGHT you, not the one finding it gave you. Those facts are what the next round cannot reconstruct.",
+          "It must be locatable: file+line, or files when the fact is about a module/build/config rather than one line.",
+          "Before ending a round, land what you learned. A round cut short by context limits loses anything not written down.",
+          "Do NOT restate a finding here — findings have their own record and their own bar.",
+        ],
+        parameters: Type.Object({
+          text: Type.String({
+            description: "The fact, in one or two sentences. At least 20 characters. Written for a reader who has not seen the file.",
+          }),
+          file: Type.Optional(Type.String({ description: "Project-relative path." })),
+          line: Type.Optional(Type.Number({ description: "1-based line, when the fact is about one line." })),
+          files: Type.Optional(
+            Type.Array(Type.String(), { description: "When the fact is about a module/build/config and no single line is the answer." }),
+          ),
+          how: Type.Optional(Type.String({ description: "How you got it: the command, the read, the query. A later round can reuse it." })),
+          surfaceId: Type.Optional(Type.String({ description: "The surface item this came out of, e.g. S-0003." })),
+          findingId: Type.Optional(Type.String({ description: "The finding this came out of, e.g. F-0002." })),
+        }),
+        async execute(_id, params, _signal, _onUpdate, ctx) {
+          const root = projectRootOf(ctx);
+          const result = recordObservation(root, {
+            text: params.text ?? "",
+            ...(params.file && params.line ? { location: { file: params.file, line: params.line } } : {}),
+            ...(params.files && params.files.length > 0 ? { files: params.files } : {}),
+            ...(params.how ? { how: params.how } : {}),
+            ...(params.surfaceId ? { surfaceId: params.surfaceId } : {}),
+            ...(params.findingId ? { findingId: params.findingId } : {}),
+          });
+          if (!result.ok) {
+            return text(`Observation REJECTED — nothing was recorded:\n${result.errors.map((e) => `  - ${e}`).join("\n")}`);
+          }
+          const o = result.value;
+          const where = o.location ? `${o.location.file}:${o.location.line}` : (o.files ?? []).join(", ");
+          return text(
+            [
+              `Recorded ${o.id} (round ${o.round}) at ${where}.`,
+              `  ${clip(o.text, 160)}`,
+              "",
+              "It is searchable from any later round with `sec_recall`, and `sec_show <id>` returns it whole.",
+            ].join("\n"),
+            { observationId: o.id, round: o.round },
+          );
+        },
+      }),
+    );
+
+    pi.registerTool(
+      defineTool({
+        name: "sec_recall",
+        label: "Search what this run has established",
+        description:
+          "Search EVERYTHING this run has recorded — observations, findings and clearances — by keyword. Use it before re-reading a file: if an earlier round already looked at it, the answer is here and the round is free. Matching is plain case-insensitive substring over text, ids and paths (not semantic), so search for words that literally appear: a symbol, a path fragment, a route, a table name. Results are newest-first and one line each; `sec_show <id>` opens one in full.",
+        promptSnippet: "sec_recall — did a previous round already establish this?",
+        promptGuidelines: [
+          "Search BEFORE reading a file you think somebody may have covered. That is what makes a long run cheaper than a short one instead of more expensive.",
+          "Terms are ANDed: `session cookie` finds records containing both. Use one distinctive term if a phrase returns nothing.",
+          "It searches observations too, not just findings — the fact you need may never have become a finding.",
+        ],
+        parameters: Type.Object({
+          query: Type.String({ description: "Keywords that literally appear: a symbol, a path fragment, a route, a table name." }),
+          limit: Type.Optional(Type.Number({ description: "Max results (default 20)." })),
+        }),
+        async execute(_id, params, _signal, _onUpdate, ctx) {
+          const root = projectRootOf(ctx);
+          const snapshot = loadSec(root).snapshot;
+          const query = (params.query ?? "").trim();
+          if (query === "") return text("REJECTED: `query` is required — say what you are looking for.");
+          const limit = typeof params.limit === "number" && params.limit > 0 ? Math.floor(params.limit) : 20;
+          const hits = recallRecords(snapshot, query, limit);
+          if (hits.length === 0) {
+            return text(
+              [
+                `Nothing recorded matches "${query}".`,
+                "",
+                `  ${snapshot.observations.length} observation(s), ${snapshot.findings.length} finding(s), ${snapshot.surfaces.length} surface item(s) searched.`,
+                "That means this run has not written it down — not that it is not there. Read the file, then `sec_observe` what you learn.",
+              ].join("\n"),
+              { hits: 0 },
+            );
+          }
+          const lines = [`${hits.length} record(s) match "${query}" (newest first):`, ""];
+          for (const h of hits) {
+            const where = h.location ? ` · ${h.location.file}:${h.location.line}` : "";
+            lines.push(`  ${h.id}  [${h.kind} · 第 ${h.round} 轮]${where}`);
+            lines.push(`     ${h.line}`);
+          }
+          lines.push("");
+          lines.push("`sec_show <id>` opens one in full.");
+          return text(lines.join("\n"), { hits: hits.length, ids: hits.map((h) => h.id) });
+        },
+      }),
+    );
+
+    pi.registerTool(
+      defineTool({
+        name: "sec_show",
+        label: "Open one record in full",
+        description:
+          "Return the complete record for an id — F-0001, S-0003 or O-0007 — with nothing truncated. The brief shows only the 30 most recent findings and the 40 most recent clearances; this is how you get the rest, and how you re-read your own earlier work instead of guessing at it. Accepts observation ids too.",
+        promptSnippet: "sec_show — the full record, not the brief's summary",
+        promptGuidelines: [
+          "Use it when the brief says '…and N more' or when you need a finding's full reasoning/path/PoC rather than the one-line entry.",
+          "Use it on an observation id from `sec_recall` when you need the detail the recall line clipped.",
+        ],
+        parameters: Type.Object({
+          id: Type.String({ description: "F-0001, S-0003 or O-0007." }),
+        }),
+        async execute(_id, params, _signal, _onUpdate, ctx) {
+          const root = projectRootOf(ctx);
+          const snapshot = loadSec(root).snapshot;
+          const shown = showRecord(snapshot, params.id ?? "");
+          if (!shown) {
+            const counts = `${snapshot.observations.length} O / ${snapshot.findings.length} F / ${snapshot.surfaces.length} S`;
+            return text(
+              `No record has id "${params.id}". This run has ${counts}. \`sec_recall <query>\` finds one by keyword.`,
+              { found: false },
+            );
+          }
+          return text(shown.text, { kind: shown.kind });
+        },
+      }),
+    );
 }
 
 /** The tool names a /loopsec brief may name, for the brief builders in loop.ts. */
 export const SEC_TOOL_NAMES = [
   "sec_recon",
+  "sec_observe",
+  "sec_recall",
+  "sec_show",
   "sec_surface",
   "sec_finding",
   "sec_clear",
