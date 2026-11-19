@@ -76,6 +76,8 @@ import {
   SEC_IMPLICIT_AUTH_GATE,
   depthReasons,
   gatesOfFinding,
+  isBlocked,
+  unsatisfiedRequires,
   objectiveHits,
   nextPursuit,
   reconNotePath,
@@ -3875,4 +3877,110 @@ test("the tool counter is what the baseline is measured against", () => {
   assert.equal(rec.toolCallsAtStart, before, "the baseline is the count at prepare");
   // Simulate the model working: the counter moves, so the settle sees a non-silent round.
   assert.ok(secToolCallCount() >= before);
+});
+
+// =================================================================
+// DEPENDENCIES — the order of an audit is not its enumeration order
+// =================================================================
+
+test("a blocked item is NOT dispatched — the prerequisite gets the round first", () => {
+  // The measured case: four questions all rested on "does the guard read the same parameter the handler
+  // does?". A flat list makes them parallel; the round that would have deleted them goes to the wrong
+  // question.
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 1);
+  submitSecRecon(cwd, NOTE);
+  recordSurface(cwd, { title: "守卫读哪个参数？", kind: "boundary", file: "g.py", line: 8 });
+  recordSurface(cwd, { title: "有没有入口跳过守卫？", kind: "entrypoint", file: "a.py", line: 3, requires: ["S-0001"] });
+
+  assert.deepEqual(unsatisfiedRequires(loadSec(cwd).snapshot, loadSec(cwd).snapshot.surfaces[1]!), ["S-0001"]);
+  assert.equal(nextOpenSurface(loadSec(cwd).snapshot)!.id, "S-0001", "the prerequisite is the one workable item");
+
+  // Answer it, and the dependent becomes workable.
+  clearSurface(cwd, "S-0001", "守卫读 request.getParameter(id)，处理器读 @RequestBody.id —— 两者不同源", {
+    file: "g.py",
+    line: 8,
+  });
+  assert.deepEqual(unsatisfiedRequires(loadSec(cwd).snapshot, loadSec(cwd).snapshot.surfaces[1]!), []);
+  assert.equal(nextOpenSurface(loadSec(cwd).snapshot)!.id, "S-0002", "with the prerequisite answered, it is next");
+});
+
+test("a prerequisite that is merely EXAMINED does not unblock — only cleared does", () => {
+  // "examined" includes an item that produced a finding; it has not ANSWERED the question the dependent
+  // one rests on. Using the weaker bar would let a chain advance on an unanswered premise.
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 1);
+  submitSecRecon(cwd, NOTE);
+  recordSurface(cwd, { title: "A", kind: "sink", file: "a.py", line: 1 });
+  recordSurface(cwd, { title: "B", kind: "sink", file: "b.py", line: 2, requires: ["S-0001"] });
+  updateSurface(cwd, "S-0001", { status: "examined" });
+  assert.equal(isBlocked(loadSec(cwd).snapshot, loadSec(cwd).snapshot.surfaces[1]!), true, "examined is not answered");
+});
+
+test("reopening the prerequisite RE-BLOCKS the dependent", () => {
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 1);
+  submitSecRecon(cwd, NOTE);
+  recordSurface(cwd, { title: "A", kind: "sink", file: "a.py", line: 1 });
+  recordSurface(cwd, { title: "B", kind: "sink", file: "b.py", line: 2, requires: ["S-0001"] });
+  clearSurface(cwd, "S-0001", "守卫在 a.py:1 之前执行，而且这条路径不在公开路由表里", { file: "a.py", line: 1 });
+  assert.equal(isBlocked(loadSec(cwd).snapshot, loadSec(cwd).snapshot.surfaces[1]!), false);
+  reopenSurface(cwd, "S-0001", "那条 clearance 的守卫其实没有覆盖这条路径，需要重看");
+  assert.equal(isBlocked(loadSec(cwd).snapshot, loadSec(cwd).snapshot.surfaces[1]!), true, "the answer was withdrawn");
+});
+
+test("a cycle is REFUSED — an item that can never unblock must not enter the queue", () => {
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 1);
+  submitSecRecon(cwd, NOTE);
+  recordSurface(cwd, { title: "A", kind: "sink", file: "a.py", line: 1 });
+  recordSurface(cwd, { title: "B", kind: "sink", file: "b.py", line: 2, requires: ["S-0001"] });
+  const cyc = recordSurface(cwd, { title: "C", kind: "sink", file: "c.py", line: 3, requires: ["S-0002"] });
+  assert.equal(cyc.ok, true);
+  // Now make S-0001 depend on S-0003 → closes the loop.
+  const bad = updateSurface(cwd, "S-0001", { requires: ["S-0003"] });
+  assert.equal(bad.ok, false);
+  assert.match(bad.ok ? "" : bad.errors.join(" "), /cycle/);
+});
+
+test("a prerequisite that does not exist, and self-reference, are both refused", () => {
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 1);
+  submitSecRecon(cwd, NOTE);
+  const missing = recordSurface(cwd, { title: "A", kind: "sink", file: "a.py", line: 1, requires: ["S-0099"] });
+  assert.equal(missing.ok, false);
+  assert.match(missing.ok ? "" : missing.errors.join(" "), /does not exist/);
+
+  recordSurface(cwd, { title: "B", kind: "sink", file: "b.py", line: 1 });
+  // S-0001 is the next id; requiring itself is refused at update time too.
+  const self = updateSurface(cwd, "S-0001", { requires: ["S-0001"] });
+  assert.equal(self.ok, false);
+  assert.match(self.ok ? "" : self.errors.join(" "), /itself/);
+});
+
+test("requires survives the log, and an EMPTY patch list CLEARS the dependencies", () => {
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 1);
+  submitSecRecon(cwd, NOTE);
+  recordSurface(cwd, { title: "A", kind: "sink", file: "a.py", line: 1 });
+  recordSurface(cwd, { title: "B", kind: "sink", file: "b.py", line: 2, requires: ["S-0001"] });
+  assert.deepEqual(loadSec(cwd).snapshot.surfaces[1]!.requires, ["S-0001"], "round trip");
+  const cleared = updateSurface(cwd, "S-0002", { requires: [] });
+  assert.equal(cleared.ok, true);
+  // Persisted as an explicit [] rather than dropped: "no dependencies" is a decision, and a field that
+  // vanishes when it is emptied is a field you cannot tell apart from one never set.
+  assert.deepEqual(loadSec(cwd).snapshot.surfaces[1]!.requires, [], "an empty list clears it");
+  assert.equal(isBlocked(loadSec(cwd).snapshot, loadSec(cwd).snapshot.surfaces[1]!), false);
+});
+
+test("the brief NAMES the dependency, and the debt block counts blocked items", () => {
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 1);
+  submitSecRecon(cwd, NOTE);
+  recordSurface(cwd, { title: "守卫读哪个参数？", kind: "boundary", file: "g.py", line: 8 });
+  recordSurface(cwd, { title: "有没有入口跳过守卫？", kind: "entrypoint", file: "a.py", line: 3, requires: ["S-0001"] });
+  const s = loadSec(cwd).snapshot;
+  const brief = renderSecAnalyzeBrief(s, "x", 4, s.surfaces[0]!);
+  assert.match(brief, /blocked by a prerequisite/, "breadth debt names the blocked ones");
+  assert.match(brief, /S-0002 ← S-0001/, "and which item waits on which");
 });

@@ -1247,6 +1247,9 @@ function normalizeSurface(value: unknown): SecSurface | null {
     title: o.title,
     ...(location ? { location } : {}),
     ...(categories.length > 0 ? { categories } : {}),
+    ...(Array.isArray(o.requires) && o.requires.some((r) => typeof r === "string" && !!r)
+      ? { requires: (o.requires as unknown[]).filter((r): r is string => typeof r === "string" && !!r) }
+      : {}),
     // The FIFTH field this allowlist has had to be taught. Every one was written to the
     // log and dropped on the way back in with no error, because the record that lost it
     // still validated.
@@ -1296,6 +1299,11 @@ function normalizeSurfacePatch(value: unknown): SecSurfacePatch | null {
     const categories = o.categories.filter((c): c is string => typeof c === "string" && !!c);
     if (categories.length > 0) patch.categories = categories;
   }
+  // An EMPTY array here means "clear the dependencies", which is why it is not filtered away like
+  // the categories are: a list that cannot be emptied is a list that cannot be corrected.
+  if (Array.isArray(o.requires)) {
+    patch.requires = (o.requires as unknown[]).filter((r): r is string => typeof r === "string" && !!r);
+  }
   if (typeof o.title === "string" && o.title.trim()) patch.title = o.title;
   const location = normalizeLocation(o.location);
   if (location) patch.location = location;
@@ -1315,6 +1323,7 @@ function applySurfacePatch(surface: SecSurface, patch: SecSurfacePatch): SecSurf
     ...(patch.attempts !== undefined ? { attempts: patch.attempts } : {}),
     ...(patch.findingId !== undefined ? { findingId: patch.findingId } : {}),
     ...(patch.categories !== undefined ? { categories: patch.categories } : {}),
+    ...(patch.requires !== undefined ? { requires: patch.requires } : {}),
     ...(patch.title !== undefined ? { title: patch.title } : {}),
     ...(patch.location !== undefined ? { location: patch.location } : {}),
   };

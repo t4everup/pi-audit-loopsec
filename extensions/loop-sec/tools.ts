@@ -211,6 +211,12 @@ export function registerSecTools(pi: ExtensionAPI): void {
         categories: Type.Optional(
           Type.Array(Type.String(), { description: "Classes worth checking here, e.g. [\"rce\", \"path-traversal\"]." }),
         ),
+        requires: Type.Optional(
+          Type.Array(Type.String(), {
+            description:
+              "S-ids that must be CLEARED before this item can be worked. Use it when the question rests on another one's answer — a flat list makes dependent questions parallel, and every round spent on one is spent on a premise nobody checked. Must form a DAG: a cycle is refused.",
+          }),
+        ),
         priority: Type.Optional(
           Type.Number({
             description:
@@ -227,6 +233,7 @@ export function registerSecTools(pi: ExtensionAPI): void {
           ...(params.file ? { file: params.file } : {}),
           ...(typeof params.line === "number" ? { line: params.line } : {}),
           ...(params.categories && params.categories.length > 0 ? { categories: params.categories } : {}),
+          ...(params.requires && params.requires.length > 0 ? { requires: params.requires } : {}),
           ...(typeof params.priority === "number" ? { priority: params.priority } : {}),
         });
         if (!result.ok) {
@@ -407,6 +414,12 @@ export function registerSecTools(pi: ExtensionAPI): void {
               "REPLACE the blocker list. Pass `[]` when the gate OPENED (the precondition now holds — the loop stops pursuing it); pass refined text when your pursuit round established something better than what was recorded (\"需要 admin 会话\" → \"需要 core.change_datasource 权限，它由任意已认证用户持有\"). A refined blocker is PROGRESS — the same text is not.",
           }),
         ),
+        requires: Type.Optional(
+          Type.Array(Type.String(), {
+            description:
+              "REPLACE the dependency list of a SURFACE item (id = S-xxxx). Pass [] to clear it — an item that is no longer waiting on anything.",
+          }),
+        ),
         deepen: Type.Optional(
           Type.Boolean({
             description:
@@ -429,6 +442,33 @@ export function registerSecTools(pi: ExtensionAPI): void {
       async execute(_id, params, _signal, _onUpdate, ctx) {
           noteSecToolCall();
         const root = projectRootOf(ctx);
+        // ---- A SURFACE ITEM, NOT A FINDING ------------------------------------------------
+        //
+        // The dependency list has to be CORRECTABLE: the analysis routinely discovers that an item it
+        // thought was a prerequisite is not one, and a list that can only be set at record time would
+        // leave the run waiting on a question that no longer matters.
+        if (/^S-\d+$/i.test(params.id)) {
+          const surfacePatch: Record<string, unknown> = {};
+          if (Array.isArray(params.requires)) surfacePatch.requires = params.requires;
+          if (typeof params.priority === "number") surfacePatch.priority = params.priority;
+          if (typeof params.title === "string" && params.title.trim()) surfacePatch.title = params.title;
+          if (Object.keys(surfacePatch).length === 0) {
+            return text(`REJECTED: nothing to change on ${params.id}. Surface items accept: requires, priority, title.`);
+          }
+          const updated = updateSurface(root, params.id, surfacePatch as never);
+          if (!updated.ok) {
+            return text(`Update REJECTED — nothing changed:\n${updated.errors.map((e) => `  - ${e}`).join("\n")}`);
+          }
+          const sv = updated.value;
+          return text(
+            `${sv.id} updated: ${sv.title}` +
+              (sv.requires && sv.requires.length > 0
+                ? `\n  requires (unanswered): ${sv.requires.join(", ")}`
+                : "\n  no dependencies"),
+            { surfaceId: sv.id },
+          );
+        }
+
         const patch: SecFindingPatch = {};
         if (params.title) patch.title = params.title;
         if (params.category) patch.category = params.category;

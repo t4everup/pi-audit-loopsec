@@ -800,6 +800,68 @@ export function showRecord(
 }
 
 // -----------------------------------------------------------------
+// DEPENDENCIES — the order of an audit is not its enumeration order
+// -----------------------------------------------------------------
+//
+// Measured on a real finding: the decisive question was "does the guard read the same parameter the
+// handler does?". Four other questions were built on that premise and could not have been answered
+// before it — a flat list made them parallel, and every round spent on them was spent on a premise
+// nobody had checked.
+
+/**
+ * The prerequisites of an item that are not yet \`cleared\`.
+ *
+ * \`cleared\` is the bar, not \`examined\`: an item that produced a finding, or that was merely looked at,
+ * has not answered anything. The number this returns is what the brief prints, so "blocked" is always
+ * a fact the model can act on.
+ */
+export function unsatisfiedRequires(snapshot: TreeSnapshot, item: SecSurface): string[] {
+  const req = item.requires ?? [];
+  if (req.length === 0) return [];
+  const byId = new Map(snapshot.surfaces.map((s) => [s.id, s]));
+  return req.filter((id) => byId.get(id)?.status !== "cleared");
+}
+
+/**
+ * Is this item BLOCKED — one or more prerequisites unanswered?
+ *
+ * A missing prerequisite (an id that no longer exists) counts as unsatisfied: the answer it was
+ * supposed to give is not in the record, so the dependent question still rests on nothing.
+ */
+export function isBlocked(snapshot: TreeSnapshot, item: SecSurface): boolean {
+  return unsatisfiedRequires(snapshot, item).length > 0;
+}
+
+/**
+ * Would adding \`requires\` to \`id\` create a CYCLE?
+ *
+ * Refused at write time, and that is the only place it can be refused: a cycle never unblocks, so every
+ * item in it would sit in the queue forever — and it would look exactly like an item that is simply
+ * waiting its turn. The check is a reachability walk from the proposed prerequisites: if any of them
+ * already depends (transitively) on \`id\`, the edge closes a loop.
+ */
+export function wouldCycle(snapshot: TreeSnapshot, id: string, requires: readonly string[]): string | null {
+  if (requires.includes(id)) return id;
+  const byId = new Map(snapshot.surfaces.map((s) => [s.id, s]));
+  const seen = new Set<string>();
+  const walk = (from: string): string | null => {
+    if (from === id) return from;
+    if (seen.has(from)) return null;
+    seen.add(from);
+    for (const next of byId.get(from)?.requires ?? []) {
+      const hit = walk(next);
+      if (hit) return hit;
+    }
+    return null;
+  };
+  for (const r of requires) {
+    const hit = walk(r);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+// -----------------------------------------------------------------
 // The attack surface — the work list
 // -----------------------------------------------------------------
 //
@@ -828,6 +890,8 @@ export interface SurfaceInput {
   file?: string;
   line?: number;
   categories?: string[];
+  /** Prerequisites. See SecSurface.requires. */
+  requires?: string[];
   round?: number;
   /** Raise to jump the queue. See `SecSurface.priority`. */
   priority?: number;
@@ -872,8 +936,44 @@ export function recordSurface(projectRoot: string, input: SurfaceInput, at = now
   // fault, and refusing it would make the model handle a rejection it cannot act on.
   const existing = snapshot.surfaces.find((s) => s.title.trim() === title);
   if (existing) return { ok: true, value: existing, warnings: [`already enumerated as ${existing.id}`] };
+  // The id this item WILL have — the dependency checks below need it before the record exists.
+  const newId = nextSurfaceId(snapshot);
+
+  // ---- THE DEPENDENCIES, CHECKED BEFORE ANYTHING IS WRITTEN -------------------------------
+  //
+  // A prerequisite that does not exist is refused like a cycle is: an item waiting on an answer that can
+  // never arrive looks exactly like an item waiting its turn, and the run would quietly carry a dead
+  // entry to the end. `requires` is also cleaned of duplicates and of itself.
+  const requires = [...new Set((input.requires ?? []).map((r) => r.trim().toUpperCase()).filter(Boolean))];
+  if (requires.length > 0) {
+    if (requires.includes(newId)) {
+      return { ok: false, errors: [`${newId} cannot require itself — that item would never be given a round.`] };
+    }
+    const missing = requires.filter((r) => !snapshot.surfaces.some((x) => x.id === r));
+    if (missing.length > 0) {
+      const known = snapshot.surfaces.map((x) => x.id).join(", ") || "(none yet)";
+      return {
+        ok: false,
+        errors: [
+          `${newId} requires ${missing.join(", ")}, which does not exist. Recorded items: ${known}`,
+          "A prerequisite must be an item already on the list — waiting on an answer that can never arrive is not a plan.",
+        ],
+      };
+    }
+    const cycle = wouldCycle(snapshot, newId, requires);
+    if (cycle) {
+      return {
+        ok: false,
+        errors: [
+          `${newId} requiring ${requires.join(", ")} would close a cycle through ${cycle}.`,
+          "A cycle never unblocks: every item in it would sit in the queue forever and look like it was merely waiting.",
+        ],
+      };
+    }
+  }
+
   const surface: SecSurface = {
-    id: nextSurfaceId(snapshot),
+    id: newId,
     at,
     round: typeof input.round === "number" && input.round > 0 ? input.round : snapshot.rounds,
     kind: input.kind ?? "other",
@@ -882,6 +982,7 @@ export function recordSurface(projectRoot: string, input: SurfaceInput, at = now
       ? { location: { file: input.file, line: typeof input.line === "number" ? Math.max(1, Math.floor(input.line)) : 1 } }
       : {}),
     ...(input.categories && input.categories.length > 0 ? { categories: [...input.categories] } : {}),
+    ...(requires.length > 0 ? { requires } : {}),
     ...(typeof input.priority === "number" && Number.isFinite(input.priority) && input.priority !== 0
       ? { priority: Math.floor(input.priority) }
       : {}),
@@ -1042,7 +1143,26 @@ export function updateSurface(
   patch: SecSurfacePatch,
   at = nowIso(),
 ): Result<SecSurface> {
+
   const snapshot = loadSec(projectRoot).snapshot;
+  // A PATCH THAT CHANGES DEPENDENCIES GETS THE SAME CHECKS as a fresh record — otherwise `sec_update`
+  // becomes the way to introduce a cycle that `sec_surface` refuses.
+  if (patch.requires !== undefined) {
+    const wanted = [...new Set(patch.requires.map((r) => r.trim().toUpperCase()).filter(Boolean))];
+    if (wanted.includes(id)) {
+      return { ok: false, errors: [`${id} cannot require itself — that item would never be given a round.`] };
+    }
+    const missing = wanted.filter((r) => !snapshot.surfaces.some((x) => x.id === r));
+    if (missing.length > 0) {
+      return { ok: false, errors: [`${missing.join(", ")} is not on this run's attack surface — record it with sec_surface first.`] };
+    }
+    const cycle = wouldCycle(snapshot, id, wanted);
+    if (cycle) {
+      return { ok: false, errors: [`requiring ${wanted.join(", ")} would close a cycle through ${cycle}.`] };
+    }
+    patch = { ...patch, requires: wanted };
+  }
+
   const existing = snapshot.surfaces.find((s) => s.id === id);
   if (!existing) return { ok: false, errors: [`${id} is not on this run's attack surface`] };
   const after = applySurfacePatchForCheck(existing, patch);
@@ -1098,6 +1218,14 @@ export function nextOpenSurface(snapshot: TreeSnapshot, digBudget = SEC_DIG_BUDG
   // finished, and it must not wait behind the whole plan to be continued.
   const open = snapshot.surfaces.filter((s) => s.status === "open" || s.status === "digging");
   if (open.length === 0) return null;
+  // A BLOCKED ITEM IS NOT A CANDIDATE. Its prerequisites have not answered the question it depends on,
+  // so a round spent on it is a round spent on a premise nobody checked — the exact waste `requires`
+  // exists to prevent.
+  //
+  // This cannot deadlock: the dependency graph is a DAG (cycles are refused at write time), so there is
+  // always at least one item whose prerequisites are satisfied as long as any item is open at all.
+  const unblocked = open.filter((s) => !isBlocked(snapshot, s));
+  if (unblocked.length === 0) return null;
   /**
    * 2 = mid-dig with budget left, 1 = promoted, 0 = the plan, -1 = EXHAUSTED.
    *
@@ -1139,7 +1267,7 @@ export function nextOpenSurface(snapshot: TreeSnapshot, digBudget = SEC_DIG_BUDG
   // Ties keep insertion order — `sort` is stable and every term returns 0 — so the plan
   // still governs everything nobody promoted and nothing in scope.
   return (
-    [...open].sort(
+    [...unblocked].sort(
       (a, b) => rank(b) - rank(a) || focusHit(b) - focusHit(a) || (b.priority ?? 0) - (a.priority ?? 0),
     )[0] ?? null
   );
@@ -2160,6 +2288,17 @@ export function renderSecAnalyzeBrief(
   lines.push(`  ${item.id}  [${item.kind}]  ${item.title}`);
   if (item.location) lines.push(`  at ${item.location.file}:${item.location.line}`);
   if (item.categories && item.categories.length > 0) lines.push(`  classes to check: ${item.categories.join(", ")}`);
+  // THE DEPENDENCY IS PART OF WHAT THIS ITEM IS. An item handed a round while its prerequisite is
+  // still open would be worked on a premise nobody checked — and the model cannot see the prerequisite
+  // unless the brief says so.
+  if (item.requires && item.requires.length > 0) {
+    const un = unsatisfiedRequires(snapshot, item);
+    lines.push(
+      un.length === 0
+        ? `  依赖已满足：${item.requires.join(", ")}（全部 cleared）`
+        : `  依赖：${item.requires.join(", ")} — 未满足：${un.join(", ")}`,
+    );
+  }
   if (item.status === "digging") {
     lines.push(`  CONTINUING — depth round ${item.digRounds ?? 0}/${digBudget} on this item`);
   }
@@ -2237,11 +2376,14 @@ export function renderSecAnalyzeBrief(
   const debt = surfaceProgress(snapshot);
   const neverExamined = snapshot.surfaces.filter((s) => s.status === "open" && (s.attempts ?? 0) === 0);
   const attemptedOpen = snapshot.surfaces.filter((s) => s.status === "open" && (s.attempts ?? 0) > 0);
+  // Blocked items are their own line: they are queued but NOT workable, and telling the model
+  // "never examined" about them would invite it to work a premise nobody checked.
+  const blockedOpen = snapshot.surfaces.filter((s) => (s.status === "open" || s.status === "digging") && isBlocked(snapshot, s));
   if (debt.total > 0) {
     lines.push("--- WHAT IS STILL NOT EXAMINED ---");
     lines.push(
       `  ${debt.total} item(s): ${neverExamined.length} never examined · ${attemptedOpen.length} attempted with no conclusion · ` +
-        `${debt.digging} mid-dig · ${debt.cleared} cleared`,
+        `${blockedOpen.length} blocked by a prerequisite · ${debt.digging} mid-dig · ${debt.cleared} cleared`,
     );
     const upcoming = [...neverExamined].sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0)).slice(0, 3);
     if (upcoming.length > 0) {
@@ -2253,6 +2395,10 @@ export function renderSecAnalyzeBrief(
       if (neverExamined.length > upcoming.length) {
         lines.push(`    … +${neverExamined.length - upcoming.length} more (sec_recall <关键词> searches all of them)`);
       }
+    }
+    if (blockedOpen.length > 0) {
+      const lines2 = blockedOpen.slice(0, 3).map((b) => `${b.id} ← ${unsatisfiedRequires(snapshot, b).join("/")}`);
+      lines.push(`  blocked (waiting on an unanswered prerequisite): ${lines2.join(", ")}`);
     }
     if (attemptedOpen.length > 0) {
       lines.push(`  attempted, no conclusion: ${attemptedOpen.slice(0, 4).map((s) => `${s.id}(${s.attempts})`).join(" ")}`);

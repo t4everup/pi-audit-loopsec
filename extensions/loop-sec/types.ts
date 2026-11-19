@@ -1906,6 +1906,19 @@ export interface SecSurface {
    * diversity — so a frozen enumeration order was the inconsistent one.
    */
   priority?: number;
+  /**
+   * Surface items that must be ANSWERED before this one can be worked.
+   *
+   * The order of an audit is not its enumeration order. On a real finding the decisive question was
+   * "does the guard read the same parameter the handler does?" — and until that was answered, four
+   * other questions were built on a premise nobody had checked. A flat list makes those five things
+   * parallel, which spends rounds on questions that a single answer would have deleted.
+   *
+   * `S-0003` here means: do not hand this item a round until S-0003 is `cleared`. A DAG is required —
+   * a cycle is refused at record time, because a cycle can never unblock and the item would be dead
+   * without ever looking dead.
+   */
+  requires?: string[];
   status: SecSurfaceStatus;
   /**
    * WHY it is not exploitable. Required to clear an item.
@@ -1989,6 +2002,8 @@ export interface SecObservation {
 /** The fields a surface update may change. */
 export interface SecSurfacePatch {
   status?: SecSurfaceStatus;
+  /** Replace the dependency list. See SecSurface.requires. */
+  requires?: string[];
   clearedReason?: string;
   /** Where the guard is. See `SecSurface.guardLocation`. */
   guardLocation?: EvidenceLocation;
