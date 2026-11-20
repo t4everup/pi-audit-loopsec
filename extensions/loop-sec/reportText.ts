@@ -139,6 +139,12 @@ export interface SecStrings {
   verifyHeading: string;
   /** Printed under a verification whose output had secrets replaced. */
   verifyRedacted: string;
+  /** The contract, restated at the top of the report: what counted as the result. */
+  contractTitle: string;
+  contractNote: string;
+  /** Counts: how many findings reached the bar, and how many have unverified hops. */
+  contractRows: (reached: number, total: number, withAssumptions: number, unassessed: number) => string;
+
   verifyConfirmed: string;
   verifyNotConfirmed: string;
 
@@ -306,6 +312,13 @@ const SEC_ZH: SecStrings = {
   probesOnNote: (v, t) => `其中 **${v}/${t}** 条跑过命令，且结果符合跑之前声明的预期。`,
   verifyHeading: "**验证**",
   verifyRedacted: "_输出里识别到口令 / token / JWT 的形态，已替换为 \`***\` —— **尽力而为**，原值未保存，也不保证全部识别。_",
+  contractTitle: "## 验收标准（本次运行按这个算结果）",
+  contractNote:
+    "起点是**未持有任何有效会话/口令/token**；路径不限跳数；**每一跳必须由上一跳的产物驱动**（并列不算链）；终点是**任意服务账户执行攻击者指定的命令** —— 仅文件读 / 仅盲注 / 仅固定命令 / 仅 DB 超级用户 **不算**。全文在 `.pi-loopsec/contract.md`，可改。",
+  contractRows: (reached, total, withAssumptions, unassessed) =>
+    `**达到【终点】: ${reached}/${total}** 条发现。` +
+    (withAssumptions > 0 ? ` 其中 ${withAssumptions} 条带 [假设]，**不计入**。` : "") +
+    (unassessed > 0 ? ` ${unassessed} 条没填 impact —— 报告无法判断是否过线。` : ""),
   verifyConfirmed: "已复现 —— 下面的命令真的运行过，结果符合跑之前声明的预期",
   verifyNotConfirmed: "**未复现** —— 跑过了，但结果**不符合**跑之前声明的预期：要么发现是错的，要么预期是错的",
   noFindings:
@@ -460,6 +473,13 @@ const SEC_EN: SecStrings = {
   probesOnNote: (v, t) => `**${v}/${t}** were run and matched the expectation stated before the run.`,
   verifyHeading: "**Verification**",
   verifyRedacted: "_Credentials (password / token / JWT shapes) were replaced with \`***\` — **best-effort**, the original was not kept, and it is not guaranteed to catch everything._",
+  contractTitle: "## Acceptance bar (what counted as a result)",
+  contractNote:
+    "The start point is **no valid session / password / token**; the path is unbounded in hops; **each hop must be driven by the previous hop's product** (parallel bugs are not a chain); the end point is **arbitrary command execution under any service account** — file read only, blind injection only, a fixed command only, or DB superuser only **do not count**. Full text, editable: `.pi-loopsec/contract.md`.",
+  contractRows: (reached, total, withAssumptions, unassessed) =>
+    `**Reached the bar: ${reached}/${total}** finding(s).` +
+    (withAssumptions > 0 ? ` ${withAssumptions} carry [assumption] hops and are NOT counted.` : "") +
+    (unassessed > 0 ? ` ${unassessed} have no impact recorded — the report cannot tell whether they reached it.` : ""),
   verifyConfirmed: "REPRODUCED — the command below was actually run and matched the expectation stated before it",
   verifyNotConfirmed: "**NOT REPRODUCED** — it was run and did NOT match the pre-stated expectation: either the finding is wrong or the expectation was",
   noFindings:

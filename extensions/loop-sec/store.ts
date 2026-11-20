@@ -1092,6 +1092,13 @@ function normalizeFinding(value: unknown): SecFinding | null {
     // this. Each one was written to the log and silently dropped on the way back in
     // with no error anywhere, because the record that lost it still validated.
     ...(chainOf.length >= 2 ? { chainOf } : {}),
+    // THE EIGHTH FIELD THIS NORMALIZER HAS HAD TO LEARN ABOUT. `impact` and `assumptions` decide whether
+    // the report can say a finding reached the contract's bar; losing them on reload would silently turn a
+    // reached bar into "not assessed".
+    ...(typeof o.impact === "string" && o.impact ? { impact: o.impact } : {}),
+    ...(Array.isArray(o.assumptions) && o.assumptions.some((x) => typeof x === "string" && x)
+      ? { assumptions: (o.assumptions as unknown[]).filter((x): x is string => typeof x === "string" && !!x) }
+      : {}),
     ...(normalizeStepList(o.path).length > 0 ? { path: normalizeStepList(o.path) } : {}),
     ...(normalizeVerification(o.verification) ? { verification: normalizeVerification(o.verification)! } : {}),
     ...(normalizeBlockers(o.blockers).length > 0 ? { blockers: normalizeBlockers(o.blockers) } : {}),
@@ -1349,6 +1356,10 @@ function normalizeFindingPatch(value: unknown): SecFindingPatch | null {
   if (Array.isArray(o.path)) {
     const path = normalizeStepList(o.path);
     if (path.length > 0) patch.path = path;
+  }
+  if (typeof o.impact === "string" && o.impact) patch.impact = o.impact;
+  if (Array.isArray(o.assumptions)) {
+    patch.assumptions = (o.assumptions as unknown[]).filter((x): x is string => typeof x === "string" && !!x);
   }
   if (Array.isArray(o.chainOf)) {
     const chain = o.chainOf.filter((x): x is string => typeof x === "string" && !!x);

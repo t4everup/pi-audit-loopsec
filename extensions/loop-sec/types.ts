@@ -69,6 +69,35 @@ export type Severity = "critical" | "high" | "medium" | "low" | "info";
 
 export const SEVERITIES: readonly Severity[] = ["critical", "high", "medium", "low", "info"];
 
+/**
+ * 攻击者实际得到什么 —— 契约【终点】的封闭词表。
+ *
+ * 封闭而不是自由文本，是为了让报告能**数**「过没过线」，而不是靠 grep prose 里的 rce。
+ * 前三个就是那条线（任意命令执行，任意服务账户）；其余明确**不是**链的终点。
+ */
+export const FINDING_IMPACTS = [
+  "rce-arbitrary",
+  "rce-via-component",
+  "rce-scheduled",
+  "auth-bypass",
+  "file-read",
+  "file-write",
+  "blind-injection",
+  "fixed-command",
+  "db-superuser",
+  "info-disclosure",
+  "other",
+] as const;
+export type FindingImpact = (typeof FINDING_IMPACTS)[number] | (string & {});
+
+/** Impacts that satisfy the contract 的【终点】。 */
+export const IMPACTS_REACHING_THE_BAR: readonly string[] = ["rce-arbitrary", "rce-via-component", "rce-scheduled"];
+
+export function reachesTheBar(impact?: string): boolean {
+  return !!impact && IMPACTS_REACHING_THE_BAR.includes(impact);
+}
+
+
 /** Rank for comparison: lower is worse, so `severityRank(a) <= severityRank(b)`
  * means "a is at least as bad as b". */
 export function severityRank(severity: Severity): number {
@@ -1696,6 +1725,20 @@ export interface SecFinding {
    * `hypothesis_combine` sets by refusing a `spawnedFrom` that names anything
    * unconfirmed.
    */
+  /**
+   * WHAT THE ATTACKER ACTUALLY GETS — the contract 的【终点】，记成字段。
+   *
+   * 契约说「任意命令执行」算终点，「仅文件读 / 仅盲注 / 仅固定命令」不算。那是模型的判断，但必须**可见**：
+   * 一份报告里盲注和认证前 RCE 齐平列在同一严重度列里，就回答不了「这次到底过没过线」。
+   */
+  impact?: FindingImpact;
+  /**
+   * 只标了 [假设] 而没读实的跳 —— 契约的【纪律】。
+   *
+   * 一条链若某跳是「假如可达」，它和每一跳都读过的那条**不是同一个发现**。列出假设才能让差别可见，
+   * 而不是埋在 prose 里；而且**带假设的发现不能被算作达到终点**。
+   */
+  assumptions?: string[];
   chainOf?: string[];
   /**
    * The result of ACTUALLY RUNNING something against the claim, when it was run.
@@ -1844,6 +1887,10 @@ export interface SecFindingPatch {
   /** Link the finding back to the surface item it came out of. */
   surfaceId?: string;
   /** The findings this one combines. See `SecFinding.chainOf`. */
+  /** Replace the impact claim. See SecFinding.impact. */
+  impact?: FindingImpact;
+  /** Replace the assumption list. See SecFinding.assumptions. */
+  assumptions?: string[];
   chainOf?: string[];
   /** The result of a verification run. See `SecVerification`. */
   verification?: SecVerification;

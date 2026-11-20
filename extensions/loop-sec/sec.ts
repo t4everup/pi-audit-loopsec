@@ -79,6 +79,8 @@ import {
   type SecSurfaceKind,
   type SecSurfacePatch,
   type SecVerification,
+  FINDING_IMPACTS,
+  reachesTheBar,
   type SecVerifyInput,
   type Severity,
   type TreeSnapshot,
@@ -161,6 +163,10 @@ export interface FindingInput {
   surfaceId?: string;
   /** The call chain, one step per hop. */
   path?: SecFindingStep[];
+  /** What the attacker gets — the contract's 【终点】. See SecFinding.impact. */
+  impact?: string;
+  /** Hops that are [假设] rather than established. See SecFinding.assumptions. */
+  assumptions?: string[];
   /** The findings this one combines. Two or more, all of which must already exist. */
   chainOf?: string[];
   /**
@@ -222,6 +228,11 @@ export function validateFinding(input: FindingInput): Result<FindingInput> {
   }
   if (typeof input.category !== "string" || input.category.trim() === "") {
     errors.push("category is required (free-form here, but it is how the report groups findings)");
+  }
+  if (input.impact !== undefined && !(FINDING_IMPACTS as readonly string[]).includes(input.impact)) {
+    // A CLOSED VOCABULARY, because the report COUNTS "reached the bar". Free text would make that count a
+    // grep, and the contract's 【终点】 would be whatever the reader re-interpreted it as.
+    errors.push(`impact must be one of ${FINDING_IMPACTS.join("|")} (got "${input.impact}")`);
   }
   // BLOCKERS ARE STATES OF THE WORLD, and a blank one is not a state. Capped at 6 because a finding
   // gated by more than six independent things is not one finding — it is a description of the
@@ -336,6 +347,8 @@ export function recordFinding(projectRoot: string, input: FindingInput, at = now
     ...(typeof input.poc === "string" && input.poc ? { poc: input.poc } : {}),
     ...(input.surfaceId ? { surfaceId: input.surfaceId } : {}),
     ...(input.path && input.path.length > 0 ? { path: input.path } : {}),
+    ...(input.impact ? { impact: input.impact } : {}),
+    ...(input.assumptions && input.assumptions.length > 0 ? { assumptions: [...input.assumptions] } : {}),
     ...(chain.length >= 2 ? { chainOf: [...chain] } : {}),
     ...((input.blockers ?? []).length > 0 ? { blockers: input.blockers!.map((b) => b.trim()) } : {}),
     ...(input.deepen === true ? { deepen: true } : {}),
@@ -2786,6 +2799,24 @@ export function renderSecReport(
     lines.push(`- **${t.stoppedBecause}**: ${loop.stopReason ?? loop.pausedReason ?? t.stillRunning}`);
   }
   lines.push("");
+
+  // ---- THE ACCEPTANCE BAR, STATED ------------------------------------------------
+  //
+  // Before the findings, and with a COUNT, because the whole point of the contract is that a list of
+  // findings is not the deliverable — "did this run reach arbitrary command execution from an
+  // unauthenticated start" is. A report that prints ten findings and never answers that is the failure
+  // mode the bar exists to prevent.
+  {
+    const reached = findings.filter((f) => reachesTheBar(f.impact) && (f.assumptions ?? []).length === 0);
+    const withAssumptions = findings.filter((f) => (f.assumptions ?? []).length > 0).length;
+    const unassessed = findings.filter((f) => !f.impact).length;
+    lines.push(t.contractTitle);
+    lines.push("");
+    lines.push(t.contractNote);
+    lines.push("");
+    lines.push(t.contractRows(reached.length, findings.length, withAssumptions, unassessed));
+    lines.push("");
+  }
 
   // ---- THE CAVEAT, BEFORE THE FINDINGS ------------------------------------
   //

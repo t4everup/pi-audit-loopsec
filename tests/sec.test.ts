@@ -50,7 +50,7 @@ import { acquireTurnLock, releaseTurnLock, turnLockDir } from "../extensions/loo
 // language tag" failed with `got "bash"` — the test was correct and the assertion was reading a file
 // outside the test.
 process.env.PI_LOOPSC_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "loopsec-home-"));
-import { loopCommandName, type SecFindingStep } from "../extensions/loop-sec/types.ts";
+import { loopCommandName, reachesTheBar, type SecFindingStep } from "../extensions/loop-sec/types.ts";
 import {
   appendSecLedger,
   SEC_DIG_BUDGET,
@@ -4348,4 +4348,88 @@ test("the same process may re-enter its own lock — the settle has to", () => {
   releaseTurnLock(cwd);
   assert.equal(fs.existsSync(turnLockDir(cwd)), false);
   if (mine.ok) mine.release();
+});
+
+// =================================================================
+// THE CONTRACT — what counts as a result, stated once and kept in view
+// =================================================================
+
+test("the FULL contract is injected in round 1 and a DIGEST after that", () => {
+  // A page of rules repeated forty times is wallpaper: the model stops reading it and the operator stops
+  // seeing whether it was followed. Full text once, where the run decides what it is doing; then a digest.
+  const cwd = seeded();
+  startSec(cwd, "挖掘认证前rce", 99, 2);
+  const first = tickLoop(cwd, loadSec(cwd).snapshot);
+  assert.match(first.brief!, /本次审计的验收标准（贯穿所有轮次）/, "the full text on the first round");
+  assert.match(first.brief!, /【终点】/);
+  assert.match(first.brief!, /任意服务账户/, "including the endpoint bar, verbatim");
+
+  submitSecRecon(cwd, NOTE);
+  const second = tickLoop(cwd, loadSec(cwd).snapshot);
+  assert.match(second.brief!, /验收标准（摘要/, "after the first round it is a digest");
+  assert.match(second.brief!, /不算终点/, "and the digest still carries the exclusion");
+});
+
+test("the contract file is SEEDED into the project, and an edit is what gets injected", () => {
+  // Per-target tightening without touching code — a narrower scope, a forbidden technique.
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 2);
+  tickLoop(cwd, loadSec(cwd).snapshot);
+  const file = path.join(cwd, ".pi-loopsec", "contract.md");
+  assert.equal(fs.existsSync(file), true, "seeded on the first brief");
+
+  fs.writeFileSync(file, "# 本项目额外约束\n\n只允许测试 /admin 前缀下的入口。\n", "utf-8");
+  const brief = tickLoop(cwd, loadSec(cwd).snapshot).brief!;
+  assert.match(brief, /只允许测试 \/admin 前缀下的入口/, "the edit reaches the model");
+  assert.ok(fs.readFileSync(file, "utf-8").includes("只允许测试"), "and the plugin did not overwrite the edit");
+});
+
+test("impact is a CLOSED vocabulary, and only the RCE forms reach the bar", () => {
+  const cwd = seeded();
+  withSurface(cwd, 1);
+  const bad = recordFinding(cwd, {
+    title: "x", category: "rce", severity: "high", file: "a.py", line: 1, evidence: "e", impact: "rce-ish",
+  });
+  assert.equal(bad.ok, false, "free text would turn the bar count into a grep");
+  assert.match(bad.ok ? "" : bad.errors.join(" "), /impact must be one of/);
+
+  assert.equal(reachesTheBar("rce-arbitrary"), true);
+  assert.equal(reachesTheBar("file-read"), false, "the contract says file read is not the end");
+  assert.equal(reachesTheBar("blind-injection"), false);
+  assert.equal(reachesTheBar(undefined), false);
+});
+
+test("impact and assumptions survive the log — the eighth field this normalizer had to learn", () => {
+  const cwd = seeded();
+  withSurface(cwd, 1);
+  const f = recordFinding(cwd, {
+    title: "认证前 RCE", category: "rce", severity: "critical", file: "a.py", line: 9, evidence: "exec(x)",
+    preAuth: true, impact: "rce-arbitrary", assumptions: ["任务队列真的会被 worker 消费"],
+  });
+  assert.equal(f.ok, true, f.ok ? "" : f.errors.join("; "));
+  const back = loadSec(cwd).snapshot.findings[0]!;
+  assert.equal(back.impact, "rce-arbitrary");
+  assert.deepEqual(back.assumptions, ["任务队列真的会被 worker 消费"]);
+});
+
+test("the report states the bar and COUNTS how many findings reached it", () => {
+  const cwd = seeded();
+  withSurface(cwd, 1);
+  recordFinding(cwd, {
+    title: "认证前 RCE", category: "rce", severity: "critical", file: "a.py", line: 9, evidence: "e",
+    preAuth: true, impact: "rce-arbitrary",
+  });
+  recordFinding(cwd, {
+    title: "只能读文件", category: "arbitrary-file-read", severity: "medium", file: "b.py", line: 2, evidence: "e",
+    impact: "file-read",
+  });
+  recordFinding(cwd, {
+    title: "有假设的链", category: "rce", severity: "high", file: "c.py", line: 3, evidence: "e",
+    impact: "rce-arbitrary", assumptions: ["中间那跳没读"],
+  });
+  const s = loadSec(cwd).snapshot;
+  const report = renderSecReport(s, s.loop);
+  assert.match(report, /验收标准（本次运行按这个算结果）/);
+  assert.match(report, /达到【终点】: 1\/3/, "only the one with no assumptions counts");
+  assert.match(report, /1 条带 \[假设\]/, "and the assumption-bearing one is named as excluded");
 });

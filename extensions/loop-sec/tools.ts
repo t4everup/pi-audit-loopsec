@@ -14,7 +14,15 @@
 import { defineTool, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
-import { SEVERITIES, SEC_SURFACE_KINDS, clip, type SecFindingPatch, type SecSurfaceKind, type Severity } from "./types.js";
+import {
+  SEVERITIES,
+  SEC_SURFACE_KINDS,
+  clip,
+  reachesTheBar,
+  type SecFindingPatch,
+  type SecSurfaceKind,
+  type Severity,
+} from "./types.js";
 import { recallRecords, sameFileNeighbours, showRecord, recordObservation, clearSurface, digSurface, recordFinding, recordSurface, reopenSurface, submitSecRecon, surfaceProgress, updateFinding, updateSurface, verifyFinding } from "./sec.js";
 import { loadSec } from "./store.js";
 import { noteSecToolCall } from "./activity.js";
@@ -139,6 +147,18 @@ export function registerSecTools(pi: ExtensionAPI): void {
               "Say there is MORE HERE. Set it when the round produced something worth turning over — a proven primitive nobody exercised, a root cause that probably holds in five more handlers, a piece that only becomes dangerous combined with another finding. The loop then spends its next rounds deepening THIS finding instead of moving to the next item on the work list. Separate from \"blockers\": blockers say why it does not work yet, deepen says there is more to find.",
           }),
         ),
+        impact: Type.Optional(
+          Type.String({
+            description:
+              "WHAT THE ATTACKER GETS — the contract end point. One of: rce-arbitrary | rce-via-component | rce-scheduled (these REACH the bar), auth-bypass | file-read | file-write | blind-injection | fixed-command | db-superuser | info-disclosure | other (these do NOT). Closed vocabulary: the report COUNTS how many findings reached the bar, and free text would turn that count into a grep.",
+          }),
+        ),
+        assumptions: Type.Optional(
+          Type.Array(Type.String(), {
+            description:
+              "Hops that are [假设] rather than established (the contract discipline). A finding with assumptions cannot be counted as reaching the bar — list them instead of writing them into prose.",
+          }),
+        ),
         blockers: Type.Optional(
           Type.Array(Type.String(), {
             description:
@@ -163,6 +183,8 @@ export function registerSecTools(pi: ExtensionAPI): void {
           ...(params.path && params.path.length > 0 ? { path: params.path } : {}),
           ...(params.chainOf && params.chainOf.length > 0 ? { chainOf: params.chainOf } : {}),
           ...(params.blockers && params.blockers.length > 0 ? { blockers: params.blockers } : {}),
+          ...(params.impact ? { impact: params.impact } : {}),
+          ...(params.assumptions && params.assumptions.length > 0 ? { assumptions: params.assumptions } : {}),
           ...(params.deepen === true ? { deepen: true } : {}),
         });
         if (!result.ok) {
@@ -172,6 +194,35 @@ export function registerSecTools(pi: ExtensionAPI): void {
         const where = f.location ? ` ${f.location.file}:${f.location.line}` : "";
         // THE COMBINATION QUESTION, ASKED MECHANICALLY. Nothing in this mode prompts it otherwise, and it
         // is the question that turns two mediums into one critical.
+        // ---- THE CONTRACT, APPLIED TO THIS FINDING --------------------------------------
+        //
+        // A wall of rules the model reads once is wallpaper. This is the part it cannot ignore: the
+        // response says whether this finding MEETS the bar, and if not, what the chain still needs.
+        const contractLines: string[] = [];
+        if (reachesTheBar(f.impact)) {
+          contractLines.push(
+            "",
+            `★ 达到【终点】: ${f.impact}` +
+              (f.preAuth === true ? " + 认证前 —— 这就是本次要的结果。" : "，但还不是认证前（preAuth 未定为 true）。"),
+          );
+        } else if (f.impact) {
+          contractLines.push(
+            "",
+            `未达【终点】: ${f.impact} 不算终点（契约明确排除：仅文件读 / 仅盲注 / 仅固定命令 / 仅 DB 超级用户）。` +
+              "把它当作链条**中间能力**，接着问：这个能力能驱动哪一跳？",
+          );
+        } else {
+          contractLines.push(
+            "",
+            `【终点】未填（impact）—— 报告无法统计这次是否过线。补：\`sec_update ${f.id} impact=...\``,
+          );
+        }
+        if (f.assumptions && f.assumptions.length > 0) {
+          contractLines.push(
+            `【纪律】：有 ${f.assumptions.length} 跳是 [假设]，所以它**不能被算作达到终点**，直到每跳被验证：`,
+            ...f.assumptions.map((a) => `  [假设] ${a}`),
+          );
+        }
         const near = sameFileNeighbours(loadSec(root).snapshot, f);
         const nearLines: string[] = [];
         if (near.findings.length > 0) {
@@ -200,6 +251,7 @@ export function registerSecTools(pi: ExtensionAPI): void {
             "NOTE: this mode has no verification tier, no falsification attempt and no challenge round.",
             "The finding is recorded as your claim plus the artifact you attached, and nothing more.",
             "If it matters, re-run the objective under /loop, where it gets all three.",
+            ...contractLines,
             ...nearLines,
           ].join("\n"),
           { findingId: f.id, total: loadSec(root).snapshot.findings.length },

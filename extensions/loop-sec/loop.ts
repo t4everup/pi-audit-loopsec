@@ -129,6 +129,7 @@ import { markNotesDelivered, pendingNotes, renderNotesSection, renderNotesStatus
 import { loadSettings, lockTtlMsOf, reportLanguageOf } from "./settings.js";
 import { secToolCallCount } from "./activity.js";
 import { acquireTurnLock, releaseTurnLock } from "./lock.js";
+import { ensureContractFile, renderContractDigest, renderContractFull } from "./contract.js";
 import {
   SEC_DIG_BUDGET,
   appendSecLedger,
@@ -1618,7 +1619,30 @@ export function withNotes(brief: string, snapshot: TreeSnapshot): string {
  * `renderSecAnalyzeBrief`); this block only carries what is true for every
  * brief in every round.
  */
-export function withBriefExtras(brief: string, snapshot: TreeSnapshot, lang: ReportLanguage): string {
+export function withBriefExtras(
+  brief: string,
+  snapshot: TreeSnapshot,
+  lang: ReportLanguage,
+  projectRoot?: string,
+): string {
+  // ---- THE CONTRACT, ON EVERY BRIEF ------------------------------------------------
+  //
+  // The objective ("挖掘认证前rce") is a DIRECTION. A model reading it literally hunts one
+  // unauthenticated entry into one sink, and the result that matters in this mode is usually a CHAIN —
+  // an unauthenticated entry plus one primitive already recorded, reaching arbitrary command execution.
+  // So the acceptance bar rides along with every brief.
+  //
+  // FULL TEXT ONCE, DIGEST EVERY ROUND AFTER. A page of rules repeated forty times is wallpaper: the
+  // model stops reading it and the operator stops seeing whether it was followed. The first recon round
+  // is where the run decides what it is doing, so that is where the whole thing goes.
+  const contractFull = snapshot.loop ? reconSections(snapshot) === 0 : false;
+  const contractText = projectRoot
+    ? contractFull
+      ? ensureContractFile(projectRoot) || renderContractFull()
+      : renderContractDigest()
+    : "";
+  if (projectRoot && contractFull) ensureContractFile(projectRoot);
+
   const focus = snapshot.loop?.focus ?? [];
   const withFocus = focus.length > 0 ? afterBanner(brief, renderFocus(focus)) : brief;
   const p = (...parts: string[]): string => parts.join("\n\n");
@@ -1638,7 +1662,8 @@ export function withBriefExtras(brief: string, snapshot: TreeSnapshot, lang: Rep
           "**Use the ids the tools return** (F-xxxx / S-xxxx); do not invent your own scheme.",
           "The content fences open with the project's tag (default `c`) — a HINT to the viewer, never a claim about the file.",
         );
-  return withNotes(`${withFocus}\n${languageNote}`, snapshot);
+  const withContract = contractText ? afterBanner(withFocus, contractText) : withFocus;
+  return withNotes(`${withContract}\n${languageNote}`, snapshot);
 }
 
 export function renderFocus(focus: readonly string[]): string {
@@ -1929,6 +1954,7 @@ export function tickLoop(projectRoot: string, snapshot: TreeSnapshot, opts: Tick
       }),
       snapshot,
       lang,
+      projectRoot,
     );
     // THE OBJECTIVE HIT, at the TOP of the summary.
     //
