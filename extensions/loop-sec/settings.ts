@@ -195,7 +195,7 @@ export const DEFAULT_SETTINGS: HypothesisSettings = {
   // to break. The model can always close early with `pursuitClosed` once it concludes.
   pursuitRounds: 3,
   reconRounds: 2,
-  lockTtlMs: 600_000,
+  lockTtlMs: 1_800_000,
   allowDestructiveProbes: false,
   // zh by default: this extension's operating instructions are Chinese-first,
   // and a report nobody on the team can read is not a deliverable.

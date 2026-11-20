@@ -129,7 +129,7 @@ import { markNotesDelivered, pendingNotes, renderNotesSection, renderNotesStatus
 import { loadSettings, lockTtlMsOf, reportLanguageOf } from "./settings.js";
 import { secToolCallCount } from "./activity.js";
 import { acquireTurnLock, releaseTurnLock } from "./lock.js";
-import { ensureContractFile, renderContractDigest, renderContractFull } from "./contract.js";
+import { contractPath, ensureContractFile, renderContractDigest, renderContractFull } from "./contract.js";
 import {
   SEC_DIG_BUDGET,
   appendSecLedger,
@@ -1639,7 +1639,9 @@ export function withBriefExtras(
   const contractText = projectRoot
     ? contractFull
       ? ensureContractFile(projectRoot) || renderContractFull()
-      : renderContractDigest()
+      : renderContractDigest(
+          projectRoot ? path.relative(projectRoot, contractPath(projectRoot)).split(path.sep).join("/") : ".pi-loopsec/contract.md",
+        )
     : "";
   if (projectRoot && contractFull) ensureContractFile(projectRoot);
 
@@ -1663,6 +1665,16 @@ export function withBriefExtras(
           "The content fences open with the project's tag (default `c`) — a HINT to the viewer, never a claim about the file.",
         );
   const withContract = contractText ? afterBanner(withFocus, contractText) : withFocus;
+  // THE READ SIDE, IN ONE LINE, ON EVERY BRIEF.
+  //
+  // It used to live in the analyze brief only, so a SURFACE round enumerated without knowing it could
+  // search what the run already had, and a PURSUE round attacked a gate without knowing the parent run's
+  // observations were reachable. One line, not the full explanation — the analyze brief still carries that.
+  const readSide =
+    "**可检索：** sec_recall <关键词> 查历轮观察/发现/clearance · sec_show <id> 取完整记录 · sec_observe 写一条可定位的事实";
+
+  const withRead = afterBanner(withContract, readSide);
+
   return withNotes(`${withContract}\n${languageNote}`, snapshot);
 }
 
@@ -1926,13 +1938,18 @@ export function tickLoop(projectRoot: string, snapshot: TreeSnapshot, opts: Tick
     // examined and the run moved to the next S-xxx: the closest result it could produce was filed
     // and abandoned in the same round. Bounded by `pursuitBudget`, so it cannot eat the run.
     const pursuitBudget = pursuitRoundsOf(projectRoot);
+    // A GRANTED BUDGET IS PART OF THE DECISION, not a footnote: `nextPursuit` filters on the budget, so a
+    // finding the model escalated for has to be measured against its OWN effective budget.
+    const budgetFor = (f: { pursuitBonus?: number }): number => pursuitBudget + (f.pursuitBonus ?? 0);
     const probesAllowed = loadSettings(projectRoot).settings.allowCommandProbes;
     // THE GLOBAL DEPTH GUARD. The per-finding budget bounds ONE finding; this bounds the run — see
     // `depthAllowed`. When it blocks, the finding keeps its remaining budget and is picked again
     // after the sweep has caught up, so this is "not yet", never "no".
     const pursuitAllowed = depthAllowed(snapshot);
     const pursuitTarget =
-      reconPhaseOver(snapshot, reconRounds) && pursuitAllowed ? nextPursuit(snapshot, pursuitBudget, probesAllowed) : null;
+      reconPhaseOver(snapshot, reconRounds) && pursuitAllowed
+        ? nextPursuit(snapshot, Math.max(...[pursuitBudget, ...snapshot.findings.map((f) => budgetFor(f))]), probesAllowed)
+        : null;
     // THE RECON PHASE OUTRANKS AN ITEM, and the two must agree: `secRoundBrief` uses the same
     // `reconPhaseOver` predicate, so a round can never get a recon brief with an `analyze` label
     // (or the reverse) — and the plateau counts those two kinds differently. Counted in SECTIONS,
@@ -1946,6 +1963,7 @@ export function tickLoop(projectRoot: string, snapshot: TreeSnapshot, opts: Tick
         digBudget,
         reconRounds,
         pursuitBudget,
+        pursuitBonusFor: (id: string) => snapshot.findings.find((f) => f.id === id)?.pursuitBonus ?? 0,
         probesAllowed,
         pursuitAllowed,
         lastRound: previous ? `Last round (${previous.round}): ${previous.detail}` : null,

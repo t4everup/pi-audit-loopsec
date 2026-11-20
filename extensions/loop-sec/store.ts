@@ -1092,6 +1092,9 @@ function normalizeFinding(value: unknown): SecFinding | null {
     // this. Each one was written to the log and silently dropped on the way back in
     // with no error anywhere, because the record that lost it still validated.
     ...(chainOf.length >= 2 ? { chainOf } : {}),
+    ...(typeof o.pursuitBonus === "number" && Number.isFinite(o.pursuitBonus) && o.pursuitBonus > 0
+      ? { pursuitBonus: Math.max(0, Math.floor(o.pursuitBonus)) }
+      : {}),
     // THE EIGHTH FIELD THIS NORMALIZER HAS HAD TO LEARN ABOUT. `impact` and `assumptions` decide whether
     // the report can say a finding reached the contract's bar; losing them on reload would silently turn a
     // reached bar into "not assessed".
@@ -1256,6 +1259,9 @@ function normalizeSurface(value: unknown): SecSurface | null {
     title: o.title,
     ...(location ? { location } : {}),
     ...(categories.length > 0 ? { categories } : {}),
+    ...(typeof o.digBonus === "number" && Number.isFinite(o.digBonus) && o.digBonus > 0
+      ? { digBonus: Math.max(0, Math.floor(o.digBonus)) }
+      : {}),
     ...(Array.isArray(o.requires) && o.requires.some((r) => typeof r === "string" && !!r)
       ? { requires: (o.requires as unknown[]).filter((r): r is string => typeof r === "string" && !!r) }
       : {}),
@@ -1300,6 +1306,7 @@ function normalizeSurfacePatch(value: unknown): SecSurfacePatch | null {
   const guard = normalizeLocation(o.guardLocation);
   if (guard) patch.guardLocation = guard;
   if (typeof o.priority === "number" && Number.isFinite(o.priority)) patch.priority = Math.floor(o.priority);
+  if (typeof o.digBonus === "number" && Number.isFinite(o.digBonus)) patch.digBonus = Math.max(0, Math.floor(o.digBonus));
   if (typeof o.digRounds === "number" && Number.isFinite(o.digRounds)) patch.digRounds = Math.max(0, Math.floor(o.digRounds));
   if (typeof o.attempts === "number" && Number.isFinite(o.attempts)) patch.attempts = Math.max(0, Math.floor(o.attempts));
   if (typeof o.examinedAt === "string" && o.examinedAt) patch.examinedAt = o.examinedAt;
@@ -1333,6 +1340,7 @@ function applySurfacePatch(surface: SecSurface, patch: SecSurfacePatch): SecSurf
     ...(patch.findingId !== undefined ? { findingId: patch.findingId } : {}),
     ...(patch.categories !== undefined ? { categories: patch.categories } : {}),
     ...(patch.requires !== undefined ? { requires: patch.requires } : {}),
+    ...(patch.digBonus !== undefined ? { digBonus: patch.digBonus } : {}),
     ...(patch.title !== undefined ? { title: patch.title } : {}),
     ...(patch.location !== undefined ? { location: patch.location } : {}),
   };
@@ -1358,6 +1366,7 @@ function normalizeFindingPatch(value: unknown): SecFindingPatch | null {
     if (path.length > 0) patch.path = path;
   }
   if (typeof o.impact === "string" && o.impact) patch.impact = o.impact;
+  if (typeof o.pursuitBonus === "number" && Number.isFinite(o.pursuitBonus)) patch.pursuitBonus = Math.max(0, Math.floor(o.pursuitBonus));
   if (Array.isArray(o.assumptions)) {
     patch.assumptions = (o.assumptions as unknown[]).filter((x): x is string => typeof x === "string" && !!x);
   }
@@ -1399,6 +1408,7 @@ function applyFindingPatch(finding: SecFinding, patch: SecFindingPatch): SecFind
     ...(patch.pursuitSpent !== undefined ? { pursuitSpent: patch.pursuitSpent } : {}),
     ...(patch.pursuitClosed !== undefined ? { pursuitClosed: patch.pursuitClosed } : {}),
     ...(patch.deepen !== undefined ? { deepen: patch.deepen } : {}),
+    ...(patch.pursuitBonus !== undefined ? { pursuitBonus: patch.pursuitBonus } : {}),
   };
 }
 

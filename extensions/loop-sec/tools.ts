@@ -23,7 +23,7 @@ import {
   type SecSurfaceKind,
   type Severity,
 } from "./types.js";
-import { recallRecords, sameFileNeighbours, showRecord, recordObservation, clearSurface, digSurface, recordFinding, recordSurface, reopenSurface, submitSecRecon, surfaceProgress, updateFinding, updateSurface, verifyFinding } from "./sec.js";
+import { escalateItem, recallRecords, sameFileNeighbours, showRecord, recordObservation, clearSurface, digSurface, recordFinding, recordSurface, reopenSurface, submitSecRecon, surfaceProgress, updateFinding, updateSurface, verifyFinding } from "./sec.js";
 import { loadSec } from "./store.js";
 import { noteSecToolCall } from "./activity.js";
 
@@ -784,6 +784,52 @@ export function registerSecTools(pi: ExtensionAPI): void {
         },
       }),
     );
+
+    pi.registerTool(
+      defineTool({
+        name: "sec_escalate",
+        label: "Ask for MORE rounds on one item",
+        description:
+          "Ask the loop for extra rounds on ONE finding (F-xxxx: its pursuit budget) or ONE surface item (S-xxxx: its dig budget). Every depth budget in this mode is a constant — three pursuit rounds, two dig rounds — and those caps exist so one lead cannot starve the run. They also mean the party that has READ THE CODE could not say this one needs six more rounds: priority changes the order and deepen changes the reason, neither changes the AMOUNT. This does. GRANTED and CLAMPED (12 extra per item), and the response always states the effective budget, because a model that asked for 40 and got 12 must know it got 12. The reason is required: say WHAT IS LEFT.",
+        promptSnippet: "sec_escalate — this lead needs more rounds than the cap allows",
+        promptGuidelines: [
+          "Ask when you can name the missing hop: the guard only reads the query, the handler reads the body — one more round tells me whether that is exploitable.",
+          "Do NOT ask to keep a vague direction alive. A reason that does not name what is left is refused, and rightly.",
+          "The grant is per ITEM and capped at 12 extra. The response tells you the effective budget; plan against that number, not the one you asked for.",
+          "An escalated finding still has to end: sec_finding, sec_clear, or pursuitClosed with the reason.",
+        ],
+        parameters: Type.Object({
+          id: Type.String({ description: "F-0001 (pursuit budget) or S-0003 (dig budget)." }),
+          rounds: Type.Number({ description: "How many MORE rounds. Capped at 12 extra per item." }),
+          reason: Type.String({
+            description:
+              "What is LEFT — the specific hop you can close with those rounds. At least 20 characters; it is important is not a reason.",
+          }),
+        }),
+        async execute(_id, params, _signal, _onUpdate, ctx) {
+          const root = projectRootOf(ctx);
+          const result = escalateItem(root, { id: params.id ?? "", rounds: params.rounds ?? 0, reason: params.reason ?? "" });
+          if (!result.ok) {
+            return text(
+              `Escalation REJECTED — nothing changed:\n${result.errors.map((e) => `  - ${e}`).join("\n")}`,
+            );
+          }
+          const v = result.value;
+          return text(
+            [
+              `${v.id} now has ${v.effective} round(s) total (normal budget + ${v.bonus} granted).`,
+              "",
+              v.kind === "finding"
+                ? "The loop will keep deepening it up to that budget, and it is exempt from the global depth ratio while it has a grant."
+                : "That item will keep coming back for depth up to that budget before it falls to the back of the queue.",
+              "",
+              "The reason was recorded as an observation, so the grant is auditable in the record.",
+            ].join("\n"),
+            { id: v.id, bonus: v.bonus, effective: v.effective },
+          );
+        },
+      }),
+    );
 }
 
 /** The tool names a /loopsec brief may name, for the brief builders in loop.ts. */
@@ -792,6 +838,7 @@ export const SEC_TOOL_NAMES = [
   "sec_observe",
   "sec_recall",
   "sec_show",
+  "sec_escalate",
   "sec_surface",
   "sec_finding",
   "sec_clear",

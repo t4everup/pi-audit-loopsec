@@ -83,10 +83,10 @@ export function renderContractFull(): string {
 }
 
 /** The six-line reminder, for every round after the first. */
-export function renderContractDigest(): string {
+export function renderContractDigest(where = ".pi-loopsec/contract.md"): string {
   const one = (s: string): string => s.split("\n")[0]!.replace(/。$/, "");
   return [
-    "--- 验收标准（摘要，全文见 `.pi-loopsec/contract.md`）---",
+    `--- 验收标准（摘要，全文见 ${where}）---`,
     ...CONTRACT_DEFAULT.map((c, i) => `  ${i + 1}. **${c.head}** ${one(c.body)}`),
     "  → 每一跳由上一跳的产物驱动；只能读文件/只能盲注/只能跑固定命令 **不算终点**。",
   ].join("\n");

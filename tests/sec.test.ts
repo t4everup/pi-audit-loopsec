@@ -74,12 +74,14 @@ import {
   secCoverage,
   secLedgerPath,
   secReportPath,
+  MAX_ESCALATION_ROUNDS,
   MAX_ITEM_ATTEMPTS,
   PURSUIT_MIN_SEVERITY,
   SEC_IMPLICIT_AUTH_GATE,
   depthReasons,
   gatesOfFinding,
   deepWrapUp,
+  escalateItem,
   hasAnswered,
   isBlocked,
   unsatisfiedRequires,
@@ -2708,16 +2710,18 @@ test("a standing pre-auth hit is still reported, but not as news", () => {
   assert.equal(later.summary!.some((l) => l.includes("已记录：")), false, "not announced as new again");
 });
 
-test("clearing an item REQUIRES the guard's location, and the refusal names both ways out", () => {
-  // A clearance is what BOUNDS the attack surface, so it carries as much weight as a finding — and
-  // "the role check is enforced in the decorator" with no line cannot be checked by anybody.
+test("a clearance WITHOUT a guard location is recorded, and marked uncheckable", () => {
+  // The rule used to refuse it, which forced a model that had established "this module is never built" to
+  // either invent a line number or record nothing — and recording nothing means the next round reads the
+  // same files again. A weaker result that is LABELLED is worth more than no result.
   const cwd = seeded();
   withSurface(cwd, 1);
-  const noLoc = clearSurface(cwd, "S-0001", "check_auth() runs before dispatch and the route is not in the public table");
-  assert.equal(noLoc.ok, false, "a reason alone is not a clearance");
-  assert.match(noLoc.ok ? "" : noLoc.errors.join(" "), /without the guard's LOCATION/);
-  assert.match(noLoc.ok ? "" : noLoc.errors.join(" "), /file=<path> line=<n>/, "and it shows the exact shape");
-  assert.equal(loadSec(cwd).snapshot.surfaces[0]!.status, "open", "nothing was recorded");
+  const noLoc = clearSurface(cwd, "S-0001", "整个 internal/legacy 目录不在构建里，这条路径在生产二进制中根本不存在");
+  assert.equal(noLoc.ok, true, noLoc.ok ? "" : noLoc.errors.join("; "));
+  assert.match(noLoc.warnings.join(" "), /WITHOUT a guard location/, "it says so as a warning");
+  assert.match(noLoc.warnings.join(" "), /UNCCHECKABLE/);
+  assert.equal(loadSec(cwd).snapshot.surfaces[0]!.status, "cleared", "the result is kept");
+  assert.equal(loadSec(cwd).snapshot.surfaces[0]!.guardLocation, undefined, "and the absence is visible");
 
   const good = clearSurface(cwd, "S-0001", "check_auth() runs before dispatch and the route is not in the public table", {
     file: "src/auth/session.c",
@@ -2739,12 +2743,15 @@ test("the guard location survives the log, and the report prints it next to the 
   assert.match(report, /守卫位置：src\/auth\/session\.c:7/, "a reader can open the line");
 });
 
-test("updateSurface cannot smuggle a clearance past the location requirement", () => {
+test("updateSurface still refuses a clearance with NO reason — that is the rule that stayed", () => {
   const cwd = seeded();
   withSurface(cwd, 1);
-  const bypass = updateSurface(cwd, "S-0001", { status: "cleared", clearedReason: "a long enough reason that names no line at all" });
-  assert.equal(bypass.ok, false, "the pre-write check covers the other path in");
-  assert.match(bypass.ok ? "" : bypass.errors.join(" "), /reason AND the guard's location/);
+  const bypass = updateSurface(cwd, "S-0001", { status: "cleared" });
+  assert.equal(bypass.ok, false, "a clearance that says nothing at all is still refused");
+  assert.match(bypass.ok ? "" : bypass.errors.join(" "), /without a reason/);
+  // With a reason and no line: accepted, because the location is optional now.
+  const withReason = updateSurface(cwd, "S-0001", { status: "cleared", clearedReason: "整个目录不在构建里，路径不存在" });
+  assert.equal(withReason.ok, true);
 });
 
 test("focus REORDERS the work list — a scoped item is assigned before an earlier one", () => {
@@ -3960,7 +3967,7 @@ test("reopening the prerequisite RE-BLOCKS the dependent", () => {
   assert.equal(isBlocked(loadSec(cwd).snapshot, loadSec(cwd).snapshot.surfaces[1]!), true, "the answer was withdrawn");
 });
 
-test("a cycle is REFUSED — an item that can never unblock must not enter the queue", () => {
+test("a cycle loses the EDGE, not the item — a bad dependency must not delete a place", () => {
   const cwd = seeded();
   startSec(cwd, "x", 99, 1);
   submitSecRecon(cwd, NOTE);
@@ -3968,25 +3975,28 @@ test("a cycle is REFUSED — an item that can never unblock must not enter the q
   recordSurface(cwd, { title: "B", kind: "sink", file: "b.py", line: 2, requires: ["S-0001"] });
   const cyc = recordSurface(cwd, { title: "C", kind: "sink", file: "c.py", line: 3, requires: ["S-0002"] });
   assert.equal(cyc.ok, true);
-  // Now make S-0001 depend on S-0003 → closes the loop.
+  // S-0001 requiring S-0003 closes the loop: the EDGE is dropped and named; the item keeps its others.
   const bad = updateSurface(cwd, "S-0001", { requires: ["S-0003"] });
-  assert.equal(bad.ok, false);
-  assert.match(bad.ok ? "" : bad.errors.join(" "), /cycle/);
+  assert.equal(bad.ok, true, "the update itself succeeds");
+  assert.match(bad.warnings.join(" "), /cycle/);
+  assert.deepEqual(loadSec(cwd).snapshot.surfaces[0]!.requires ?? [], [], "the offending edge is gone");
+  assert.equal(loadSec(cwd).snapshot.surfaces.length, 3, "and the item is still there");
 });
 
-test("a prerequisite that does not exist, and self-reference, are both refused", () => {
+test("a missing prerequisite and a self-reference lose the EDGE, not the item", () => {
   const cwd = seeded();
   startSec(cwd, "x", 99, 1);
   submitSecRecon(cwd, NOTE);
   const missing = recordSurface(cwd, { title: "A", kind: "sink", file: "a.py", line: 1, requires: ["S-0099"] });
-  assert.equal(missing.ok, false);
-  assert.match(missing.ok ? "" : missing.errors.join(" "), /does not exist/);
+  assert.equal(missing.ok, true, "a bad dependency must not delete the item");
+  assert.match(missing.warnings.join(" "), /not on this run's attack surface/);
+  assert.equal(loadSec(cwd).snapshot.surfaces[0]!.requires, undefined, "the edge is gone");
 
   recordSurface(cwd, { title: "B", kind: "sink", file: "b.py", line: 1 });
-  // S-0001 is the next id; requiring itself is refused at update time too.
   const self = updateSurface(cwd, "S-0001", { requires: ["S-0001"] });
-  assert.equal(self.ok, false);
-  assert.match(self.ok ? "" : self.errors.join(" "), /itself/);
+  assert.equal(self.ok, true);
+  assert.match(self.warnings.join(" "), /self-reference/);
+  assert.deepEqual(loadSec(cwd).snapshot.surfaces[0]!.requires ?? [], []);
 });
 
 test("requires survives the log, and an EMPTY patch list CLEARS the dependencies", () => {
@@ -4384,14 +4394,18 @@ test("the contract file is SEEDED into the project, and an edit is what gets inj
   assert.ok(fs.readFileSync(file, "utf-8").includes("只允许测试"), "and the plugin did not overwrite the edit");
 });
 
-test("impact is a CLOSED vocabulary, and only the RCE forms reach the bar", () => {
+test("an unknown impact is a WARNING, not a refusal — the artifact matters more than the label", () => {
+  // Refusing the finding over the WORD would throw away its evidence: a real pre-auth RCE lost because the
+  // model wrote "rce" instead of "rce-arbitrary". Stored verbatim, counted as unclassified, and named.
   const cwd = seeded();
   withSurface(cwd, 1);
   const bad = recordFinding(cwd, {
     title: "x", category: "rce", severity: "high", file: "a.py", line: 1, evidence: "e", impact: "rce-ish",
   });
-  assert.equal(bad.ok, false, "free text would turn the bar count into a grep");
-  assert.match(bad.ok ? "" : bad.errors.join(" "), /impact must be one of/);
+  assert.equal(bad.ok, true, "the FINDING is recorded");
+  assert.match(bad.warnings.join(" "), /not in the vocabulary/);
+  assert.equal(loadSec(cwd).snapshot.findings[0]!.impact, "rce-ish", "stored verbatim, so sec_update can fix it");
+  assert.equal(reachesTheBar("rce-ish"), false, "and it does not count as reaching the bar");
 
   assert.equal(reachesTheBar("rce-arbitrary"), true);
   assert.equal(reachesTheBar("file-read"), false, "the contract says file read is not the end");
@@ -4432,4 +4446,76 @@ test("the report states the bar and COUNTS how many findings reached it", () => 
   assert.match(report, /验收标准（本次运行按这个算结果）/);
   assert.match(report, /达到【终点】: 1\/3/, "only the one with no assumptions counts");
   assert.match(report, /1 条带 \[假设\]/, "and the assumption-bearing one is named as excluded");
+});
+
+// =================================================================
+// ESCALATION — the model can ask for more rounds, and the loop clamps it
+// =================================================================
+
+test("the model can ask for MORE rounds on a finding, and receives an effective budget", () => {
+  // Every depth budget was a constant, so the party that had read the code could change the ORDER and the
+  // REASON but never the AMOUNT. This is the amount.
+  const cwd = seeded();
+  withSurface(cwd, 1);
+  const f = recordFinding(cwd, {
+    title: "认证前 RCE 差一跳", category: "rce", severity: "critical", file: "a.py", line: 9, evidence: "e", preAuth: true,
+  });
+  if (!f.ok) return assert.fail("must record");
+  const r = escalateItem(cwd, { id: f.value.id, rounds: 5, reason: "守卫只读 query，处理器读 body，只差一跳就能认证前触发" });
+  assert.equal(r.ok, true, r.ok ? "" : r.errors.join("; "));
+  assert.equal(r.value.bonus, 5);
+  assert.equal(r.value.effective, loadSettings(cwd).settings.pursuitRounds + 5, "the response states the EFFECTIVE budget");
+  assert.equal(loadSec(cwd).snapshot.findings[0]!.pursuitBonus, 5, "and it survives the log");
+  // The grant is auditable: the reason is an observation in the record.
+  assert.match(loadSec(cwd).snapshot.observations.at(-1)!.text, /守卫只读 query/);
+});
+
+test("the grant is CLAMPED per item — a model asking for 40 gets 12", () => {
+  const cwd = seeded();
+  withSurface(cwd, 1);
+  const f = recordFinding(cwd, { title: "x", category: "rce", severity: "high", file: "a.py", line: 1, evidence: "e" });
+  if (!f.ok) return assert.fail("must record");
+  escalateItem(cwd, { id: f.value.id, rounds: 40, reason: "这个方向后面还有很长一条链要走，需要更多轮次才能到底" });
+  assert.equal(loadSec(cwd).snapshot.findings[0]!.pursuitBonus, MAX_ESCALATION_ROUNDS, "clamped, not refused");
+  // A second ask tops up to the cap rather than stacking past it.
+  const again = escalateItem(cwd, { id: f.value.id, rounds: 8, reason: "还差最后一跳没有验证：守卫读 query、处理器读 body，八轮足够确认" });
+  assert.equal(again.ok, true);
+  assert.equal(again.value.bonus, MAX_ESCALATION_ROUNDS, "12 is the ceiling, however many times you ask");
+});
+
+test("a reason that names nothing is REFUSED — the grant is not a mood", () => {
+  const cwd = seeded();
+  withSurface(cwd, 1);
+  const f = recordFinding(cwd, { title: "x", category: "rce", severity: "high", file: "a.py", line: 1, evidence: "e" });
+  if (!f.ok) return assert.fail("must record");
+  const vague = escalateItem(cwd, { id: f.value.id, rounds: 5, reason: "很重要" });
+  assert.equal(vague.ok, false);
+  assert.match(vague.ok ? "" : vague.errors.join(" "), /at least 20 characters/);
+  const zero = escalateItem(cwd, { id: f.value.id, rounds: 0, reason: "守卫只读 query，处理器读 body，只差一跳就能触发" });
+  assert.equal(zero.ok, false, "asking for zero more rounds is not an escalation");
+});
+
+test("a surface item can be escalated too — the DIG budget", () => {
+  const cwd = seeded();
+  withSurface(cwd, 1);
+  const r = escalateItem(cwd, { id: "S-0001", rounds: 3, reason: "这条路径还没追到底，需要再三轮把 sink 那头读清" });
+  assert.equal(r.ok, true, r.ok ? "" : r.errors.join("; "));
+  assert.equal(r.value.kind, "surface");
+  assert.equal(loadSec(cwd).snapshot.surfaces[0]!.digBonus, 3);
+  // And digSurface honours it: the item can be dug past the default budget.
+  digSurface(cwd, "S-0001");
+  digSurface(cwd, "S-0001");
+  const third = digSurface(cwd, "S-0001");
+  assert.equal(third.ok, true, "the third dig is allowed because of the grant");
+});
+
+test("an unknown id is refused with the ids that DO exist", () => {
+  const cwd = seeded();
+  withSurface(cwd, 1);
+  const bad = escalateItem(cwd, { id: "F-9999", rounds: 3, reason: "这条需要更多轮次，理由足够长可以通过校验" });
+  assert.equal(bad.ok, false);
+  assert.match(bad.ok ? "" : bad.errors.join(" "), /Recorded:/);
+  const badId = escalateItem(cwd, { id: "nonsense", rounds: 3, reason: "这条需要更多轮次，理由足够长可以通过校验" });
+  assert.equal(badId.ok, false);
+  assert.match(badId.ok ? "" : badId.errors.join(" "), /must be F-xxxx/);
 });

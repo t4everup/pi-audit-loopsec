@@ -1739,6 +1739,17 @@ export interface SecFinding {
    * 而不是埋在 prose 里；而且**带假设的发现不能被算作达到终点**。
    */
   assumptions?: string[];
+  /**
+   * EXTRA PURSUIT ROUNDS THE MODEL ASKED FOR, granted by the loop.
+   *
+   * The per-finding budget and the global depth caps are CONSTANTS, so the model — the only party that has
+   * read the code — could influence WHICH item is next (priority) and WHY (deepen), but never HOW MANY
+   * rounds a breakthrough gets. That is the wrong place for the judgement: "the guard only reads the
+   * query, I need four more rounds on this" is something the model knows and the scheduler cannot.
+   *
+   * GRANTED, NOT CLAIMED: `sec_escalate` asks with a reason and the loop clamps the total per item.
+   */
+  pursuitBonus?: number;
   chainOf?: string[];
   /**
    * The result of ACTUALLY RUNNING something against the claim, when it was run.
@@ -1907,6 +1918,8 @@ export interface SecFindingPatch {
   pursuitClosed?: string;
   /** Say there is MORE HERE and the loop should deepen this finding. See `SecFinding.deepen`. */
   deepen?: boolean;
+  /** See SecFinding.pursuitBonus. */
+  pursuitBonus?: number;
 }
 
 /**
@@ -2001,6 +2014,8 @@ export interface SecSurface {
    */
   guardLocation?: EvidenceLocation;
   examinedAt?: string;
+  /** Extra DIG rounds the model asked for. See SecFinding.pursuitBonus. */
+  digBonus?: number;
   /**
    * How many rounds of DEPTH this item has been given. See `sec_dig`.
    *
@@ -2082,6 +2097,8 @@ export interface SecSurfacePatch {
   categories?: string[];
   title?: string;
   location?: EvidenceLocation;
+  /** See SecSurface.digBonus. */
+  digBonus?: number;
 }
 
 export interface TreeSnapshot {

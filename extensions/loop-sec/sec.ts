@@ -131,6 +131,102 @@ export const SEC_SURFACE_SOFT_CAP = 60;
  */
 export const MAX_ITEM_ATTEMPTS = 3;
 
+/**
+ * The most EXTRA rounds one item may ever be granted, on top of its normal budget.
+ *
+ * The model asks; this is the ceiling on the answer. A cap exists for the same reason the plateau does —
+ * one lead must not eat the whole run — but it is a ceiling on a NEGOTIATION rather than a wall, which
+ * is the difference that matters: the model can always say WHY it needs more, and the loop decides.
+ */
+export const MAX_ESCALATION_ROUNDS = 12;
+
+/** A reason shorter than this is not a reason; it is a shrug with a number attached. */
+const ESCALATE_MIN_REASON = 20;
+
+export interface EscalationInput {
+  /** F-xxxx for the pursuit budget, S-xxxx for the dig budget. */
+  id: string;
+  rounds: number;
+  reason: string;
+}
+
+/**
+ * The model asking for MORE rounds on ONE item, with a reason.
+ *
+ * WHY THIS IS A TOOL AND NOT A SETTING. Every depth budget in this mode was a constant — three pursuit
+ * rounds, two dig rounds, at most three consecutive depth rounds and half of the last ten. Those caps
+ * exist so one lead cannot starve the run, but they also meant the party that had READ THE CODE could not
+ * say "this one needs six more rounds". `priority` changes the order and `deepen` changes the reason;
+ * neither changes the AMOUNT. This does.
+ *
+ * GRANTED, CLAMPED, AND EXPLAINED. The grant is capped at MAX_ESCALATION_ROUNDS per item, and the response
+ * always states the effective budget — a model that asks for 40 and gets 12 must know it got 12, or it
+ * will plan a 40-round chain and abandon it half way.
+ */
+export function escalateItem(projectRoot: string, input: EscalationInput, at = nowIso()): Result<{ id: string; bonus: number; effective: number; kind: "finding" | "surface" }> {
+  const id = (input.id ?? "").trim().toUpperCase();
+  const rounds = Math.floor(Number(input.rounds));
+  const reason = (input.reason ?? "").trim();
+  if (!/^[FS]-\d+$/.test(id)) {
+    return { ok: false, errors: [`id must be F-xxxx (a finding's pursuit budget) or S-xxxx (an item's dig budget), got "${input.id}"`] };
+  }
+  if (!Number.isFinite(rounds) || rounds <= 0) {
+    return { ok: false, errors: ["rounds must be a positive whole number — say how many MORE rounds this needs"] };
+  }
+  if (reason.length < ESCALATE_MIN_REASON) {
+    return {
+      ok: false,
+      errors: [
+        `reason must be at least ${ESCALATE_MIN_REASON} characters (got ${reason.length}). State WHAT IS LEFT: ` +
+          `"守卫只读 query，处理器读 body，只差一跳就能认证前触发" — not "this is important".`,
+      ],
+    };
+  }
+  const snapshot = loadSec(projectRoot).snapshot;
+  if (id.startsWith("F-")) {
+    const f = snapshot.findings.find((x) => x.id === id);
+    if (!f) {
+      const known = snapshot.findings.map((x) => x.id).join(", ") || "(none recorded yet)";
+      return { ok: false, errors: [`${id} is not a finding of this run. Recorded: ${known}`] };
+    }
+    const bonus = Math.min(MAX_ESCALATION_ROUNDS, (f.pursuitBonus ?? 0) + rounds);
+    const updated = updateFinding(projectRoot, id, { pursuitBonus: bonus }, at);
+    if (!updated.ok) return { ok: false, errors: updated.errors };
+    // The reason is kept as an observation, so the grant is auditable in the record rather than only in
+    // the conversation that asked for it.
+    // The reason is recorded as an observation so the grant is auditable — anchored on the finding's own
+    // location, because an observation without one is refused (and rightly: a fact nobody can open is a
+    // guess). A finding with only an evidence excerpt has no line, so the grant lives in the log alone.
+    if (f.location) {
+      recordObservation(
+        projectRoot,
+        { text: `[预算申请] ${id} + ${bonus} 轮：${reason}`, findingId: id, location: f.location },
+        0,
+        at,
+      );
+    }
+    return { ok: true, value: { id, bonus, effective: pursuitRoundsOf(projectRoot) + bonus, kind: "finding" }, warnings: [] };
+  }
+  const item = snapshot.surfaces.find((x) => x.id === id);
+  if (!item) {
+    const known = snapshot.surfaces.map((x) => x.id).join(", ") || "(none recorded yet)";
+    return { ok: false, errors: [`${id} is not on this run's attack surface. Recorded: ${known}`] };
+  }
+  const bonus = Math.min(MAX_ESCALATION_ROUNDS, (item.digBonus ?? 0) + rounds);
+  const updated = updateSurface(projectRoot, id, { digBonus: bonus }, at);
+  if (!updated.ok) return { ok: false, errors: updated.errors };
+  if (item.location) {
+    recordObservation(
+      projectRoot,
+      { text: `[预算申请] ${id} + ${bonus} dig 轮：${reason}`, surfaceId: id, location: item.location },
+      0,
+      at,
+    );
+  }
+  return { ok: true, value: { id, bonus, effective: SEC_DIG_BUDGET + bonus, kind: "surface" }, warnings: [] };
+}
+
+
 /** The sec report's file name. Distinct from REPORT.md so the two modes coexist. */
 export const SEC_REPORT_FILE = "SEC-REPORT.md";
 /** The running journal, one section per round. */
@@ -229,11 +325,16 @@ export function validateFinding(input: FindingInput): Result<FindingInput> {
   if (typeof input.category !== "string" || input.category.trim() === "") {
     errors.push("category is required (free-form here, but it is how the report groups findings)");
   }
-  if (input.impact !== undefined && !(FINDING_IMPACTS as readonly string[]).includes(input.impact)) {
-    // A CLOSED VOCABULARY, because the report COUNTS "reached the bar". Free text would make that count a
-    // grep, and the contract's 【终点】 would be whatever the reader re-interpreted it as.
-    errors.push(`impact must be one of ${FINDING_IMPACTS.join("|")} (got "${input.impact}")`);
-  }
+  // AN UNKNOWN IMPACT IS A WARNING, NOT A REFUSAL.
+  //
+  // The vocabulary is closed so the report can COUNT "reached the bar", but refusing the finding over the
+  // WORD would throw away its artifact — a real pre-auth RCE lost because the model wrote "rce" instead
+  // of "rce-arbitrary". The evidence is the thing this mode cannot afford to drop; the label is a label.
+  // It is stored verbatim, counted as unclassified, and the tool response names the allowed values.
+  const impactWarning =
+    input.impact !== undefined && !(FINDING_IMPACTS as readonly string[]).includes(input.impact)
+      ? `impact "${input.impact}" is not in the vocabulary (${FINDING_IMPACTS.join("|")}) — the finding was RECORDED, and it counts as unclassified. Fix it with sec_update if you want it counted against the bar.`
+      : null;
   // BLOCKERS ARE STATES OF THE WORLD, and a blank one is not a state. Capped at 6 because a finding
   // gated by more than six independent things is not one finding — it is a description of the
   // deployment, and the loop would spend its whole pursuit budget reading it.
@@ -244,7 +345,9 @@ export function validateFinding(input: FindingInput): Result<FindingInput> {
   if (blockers.length > 6) {
     errors.push(`\`blockers\` has ${blockers.length} entries — a finding gated by more than six independent things is not one finding. Name the one that matters most.`);
   }
-  return errors.length === 0 ? { ok: true, value: input, warnings: [] } : { ok: false, errors };
+  return errors.length === 0
+    ? { ok: true, value: input, warnings: impactWarning ? [impactWarning] : [] }
+    : { ok: false, errors };
 }
 
 /** Next free `F-####` id. */
@@ -283,6 +386,7 @@ export function sameFileNeighbours(
 export function recordFinding(projectRoot: string, input: FindingInput, at = nowIso()): Result<SecFinding> {
   const check = validateFinding(input);
   if (!check.ok) return { ok: false, errors: check.errors };
+  const softWarnings = [...check.warnings];
   const snapshot = loadSec(projectRoot).snapshot;
   // SINK DEDUPLICATION. Two findings at the same file:line are almost always the same
   // bug found twice under different titles — and a report that counts it twice inflates
@@ -308,6 +412,7 @@ export function recordFinding(projectRoot: string, input: FindingInput, at = now
         ok: true,
         value: dupe,
         warnings: [
+          ...softWarnings,
           `already recorded as ${dupe.id} — same sink (${loc.file}:${loc.line}) and category (${input.category}).`,
           `To retitle, re-grade or add a PoC, use sec_update ${dupe.id} — do not record it again.`,
         ],
@@ -362,7 +467,7 @@ export function recordFinding(projectRoot: string, input: FindingInput, at = now
   if (input.surfaceId && snapshot.surfaces.some((x) => x.id === input.surfaceId)) {
     updateSurface(projectRoot, input.surfaceId, { status: "examined", findingId: finding.id }, at);
   }
-  return { ok: true, value: finding, warnings: [] };
+  return { ok: true, value: finding, warnings: softWarnings };
 }
 
 export function updateFinding(projectRoot: string, id: string, patch: SecFindingPatch, at = nowIso()): Result<SecFinding> {
@@ -1095,32 +1200,33 @@ export function recordSurface(projectRoot: string, input: SurfaceInput, at = now
   // A prerequisite that does not exist is refused like a cycle is: an item waiting on an answer that can
   // never arrive looks exactly like an item waiting its turn, and the run would quietly carry a dead
   // entry to the end. `requires` is also cleaned of duplicates and of itself.
-  const requires = [...new Set((input.requires ?? []).map((r) => r.trim().toUpperCase()).filter(Boolean))];
+  let requires = [...new Set((input.requires ?? []).map((r) => r.trim().toUpperCase()).filter(Boolean))];
+  // A BAD DEPENDENCY LOSES THE EDGE, NOT THE ITEM.
+  //
+  // Refusing the record threw away a place the model had just found, over a field that exists to help
+  // ORDERING. The item is recorded; an edge naming something missing, itself, or closing a cycle is
+  // DROPPED with a reason in the warnings, so the model can fix it with sec_update and still has its item.
+  const dependencyWarnings: string[] = [];
   if (requires.length > 0) {
-    if (requires.includes(newId)) {
-      return { ok: false, errors: [`${newId} cannot require itself — that item would never be given a round.`] };
-    }
-    const missing = requires.filter((r) => !snapshot.surfaces.some((x) => x.id === r));
+    const known = snapshot.surfaces.map((x) => x.id).join(", ") || "(none yet)";
+    const selfRef = requires.filter((r) => r === newId);
+    if (selfRef.length > 0) dependencyWarnings.push(`dropped self-reference ${selfRef.join(", ")} — an item cannot wait on itself.`);
+    const missing = requires.filter((r) => r !== newId && !snapshot.surfaces.some((x) => x.id === r));
     if (missing.length > 0) {
-      const known = snapshot.surfaces.map((x) => x.id).join(", ") || "(none yet)";
-      return {
-        ok: false,
-        errors: [
-          `${newId} requires ${missing.join(", ")}, which does not exist. Recorded items: ${known}`,
-          "A prerequisite must be an item already on the list — waiting on an answer that can never arrive is not a plan.",
-        ],
-      };
+      dependencyWarnings.push(
+        `dropped ${missing.join(", ")} — not on this run's attack surface yet (recorded: ${known}). Record it with sec_surface, then sec_update ${newId} requires=[...].`,
+      );
     }
-    const cycle = wouldCycle(snapshot, newId, requires);
-    if (cycle) {
-      return {
-        ok: false,
-        errors: [
-          `${newId} requiring ${requires.join(", ")} would close a cycle through ${cycle}.`,
-          "A cycle never unblocks: every item in it would sit in the queue forever and look like it was merely waiting.",
-        ],
-      };
+    const kept = requires.filter((r) => !selfRef.includes(r) && !missing.includes(r));
+    const safe: string[] = [];
+    for (const r of kept) {
+      if (wouldCycle(snapshot, newId, [r])) {
+        dependencyWarnings.push(`dropped ${r} — that edge would close a cycle, and a cycle never unblocks.`);
+      } else {
+        safe.push(r);
+      }
     }
+    requires = safe;
   }
 
   const surface: SecSurface = {
@@ -1147,13 +1253,15 @@ export function recordSurface(projectRoot: string, input: SurfaceInput, at = now
   return {
     ok: true,
     value: surface,
-    warnings:
-      total >= SEC_SURFACE_SOFT_CAP
+    warnings: [
+      ...dependencyWarnings,
+      ...(total >= SEC_SURFACE_SOFT_CAP
         ? [
             `SURFACE AT ${total} ITEMS (soft ceiling ${SEC_SURFACE_SOFT_CAP}). It was recorded — refusing it would lose it — but the run is now committed to at least ${open} more round(s).`,
             "Analyse before enumerating further: `sec_surface` again only for a place that matters MORE than what is already waiting.",
           ]
-        : [],
+        : []),
+    ],
   };
 }
 
@@ -1193,22 +1301,37 @@ export function clearSurface(
   // The guard is not always in the handler: a framework default lives in the config, a middleware in
   // the pipeline registration, a base class in the base class. Those are lines too, and they are the
   // right ones to cite.
-  if (!guardLocation || !guardLocation.file || !(guardLocation.line > 0)) {
-    return {
-      ok: false,
-      errors: [
-        `${id} cannot be cleared without the guard's LOCATION — a clearance nobody can open is not a clearance.`,
-        "Pass the line that enforces it:  sec_clear id=<id> reason=\"<which guard>\" file=<path> line=<n>",
-        "A framework default or middleware is fine to cite: point at where it is configured or registered.",
-      ],
-    };
-  }
-  return updateSurface(
+  // WITHOUT A LOCATION IT IS STILL A RESULT — a weaker one, and SAID SO.
+  //
+  // The rule used to refuse the clearance outright, which forced a model that had genuinely established
+  // "this whole module is never built" to either invent a line number or record nothing. Recording nothing
+  // is worse: the item stays open and a later round reads the same files again. So it is accepted and
+  // marked UNCCHECKABLE in the report — which is what it is — instead of being made unrecordable.
+  const noLocation = !guardLocation || !guardLocation.file || !(guardLocation.line > 0);
+  const patched = updateSurface(
     projectRoot,
     id,
-    { status: "cleared", clearedReason: text, guardLocation: { file: guardLocation.file, line: Math.max(1, Math.floor(guardLocation.line)) } },
+    {
+      status: "cleared",
+      clearedReason: text,
+      ...(noLocation ? {} : { guardLocation: { file: guardLocation!.file, line: Math.max(1, Math.floor(guardLocation!.line)) } }),
+    },
     at,
   );
+  if (!patched.ok) return patched;
+  return {
+    ok: true,
+    value: patched.value,
+    warnings: [
+      ...patched.warnings,
+      ...(noLocation
+        ? [
+            `${id} was cleared WITHOUT a guard location. That is recorded, and the report marks it UNCCHECKABLE — ` +
+              "nobody can open the line that supposedly guards it. Pass file=<path> line=<n> when there is one.",
+          ]
+        : []),
+    ],
+  };
 }
 
 /**
@@ -1241,11 +1364,13 @@ export function digSurface(
     };
   }
   const spent = item.digRounds ?? 0;
-  if (spent >= digBudget) {
+  // A GRANTED DIG BUDGET IS THE ONE THAT APPLIES to this item (see `escalateItem`).
+  const budgetForItem = digBudget + (item.digBonus ?? 0);
+  if (spent >= budgetForItem) {
     return {
       ok: false,
       errors: [
-        `${id} has had ${spent} depth round(s), which is the budget (${digBudget}).`,
+        `${id} has had ${spent} depth round(s), which is the budget (${budgetForItem}).`,
         "Finish it: `sec_finding` if you found something, `sec_clear` with the guard if you did not.",
         "A depth round that never ends is the same as never deciding.",
       ],
@@ -1298,27 +1423,36 @@ export function updateSurface(
   const snapshot = loadSec(projectRoot).snapshot;
   // A PATCH THAT CHANGES DEPENDENCIES GETS THE SAME CHECKS as a fresh record — otherwise `sec_update`
   // becomes the way to introduce a cycle that `sec_surface` refuses.
+  // Same rule as recordSurface: keep the item, drop the offending edges, say which and why.
+  const dependencyWarnings: string[] = [];
   if (patch.requires !== undefined) {
     const wanted = [...new Set(patch.requires.map((r) => r.trim().toUpperCase()).filter(Boolean))];
-    if (wanted.includes(id)) {
-      return { ok: false, errors: [`${id} cannot require itself — that item would never be given a round.`] };
-    }
-    const missing = wanted.filter((r) => !snapshot.surfaces.some((x) => x.id === r));
+    const selfRef = wanted.filter((r) => r === id);
+    const missing = wanted.filter((r) => r !== id && !snapshot.surfaces.some((x) => x.id === r));
+    if (selfRef.length > 0) dependencyWarnings.push(`dropped self-reference ${selfRef.join(", ")}.`);
     if (missing.length > 0) {
-      return { ok: false, errors: [`${missing.join(", ")} is not on this run's attack surface — record it with sec_surface first.`] };
+      dependencyWarnings.push(`dropped ${missing.join(", ")} — not on this run's surface yet. Record it with sec_surface first.`);
     }
-    const cycle = wouldCycle(snapshot, id, wanted);
-    if (cycle) {
-      return { ok: false, errors: [`requiring ${wanted.join(", ")} would close a cycle through ${cycle}.`] };
+    const kept = wanted.filter((r) => !selfRef.includes(r) && !missing.includes(r));
+    const accepted: string[] = [];
+    const dropped: string[] = [];
+    for (const r of kept) {
+      if (wouldCycle(snapshot, id, [r])) dropped.push(r);
+      else accepted.push(r);
     }
-    patch = { ...patch, requires: wanted };
+    if (dropped.length > 0) {
+      dependencyWarnings.push(`dropped ${dropped.join(", ")} — each would close a cycle, and a cycle never unblocks.`);
+    }
+    patch = { ...patch, requires: accepted };
   }
 
   const existing = snapshot.surfaces.find((s) => s.id === id);
   if (!existing) return { ok: false, errors: [`${id} is not on this run's attack surface`] };
   const after = applySurfacePatchForCheck(existing, patch);
-  if (after.status === "cleared" && (!after.clearedReason || !after.guardLocation)) {
-    return { ok: false, errors: [`${id} cannot be cleared without a reason AND the guard's location — see clearSurface`] };
+  // A REASON IS REQUIRED; THE GUARD LOCATION IS NOT (see clearSurface — an unlocatable clearance is
+  // recorded and marked uncheckable rather than made unrecordable).
+  if (after.status === "cleared" && !after.clearedReason) {
+    return { ok: false, errors: [`${id} cannot be cleared without a reason — see clearSurface`] };
   }
   // The timestamp is STAMPED here rather than taken from the caller, and it is part
   // of the patch because that is the only way it reaches the log. An earlier version
@@ -1332,7 +1466,7 @@ export function updateSurface(
     return { ok: false, errors: ["the update could not be written to the log"] };
   }
   const written = loadSec(projectRoot).snapshot.surfaces.find((s) => s.id === id)!;
-  return { ok: true, value: written, warnings: [] };
+  return { ok: true, value: written, warnings: dependencyWarnings };
 }
 
 /** Local mirror of the store's patch application, for the pre-write check only. */
@@ -1392,7 +1526,7 @@ export function nextOpenSurface(snapshot: TreeSnapshot, digBudget = SEC_DIG_BUDG
    * waits (see `MAX_ITEM_ATTEMPTS`).
    */
   const rank = (s: SecSurface): number => {
-    if (s.status === "digging" && (s.digRounds ?? 0) < digBudget) return 2;
+    if (s.status === "digging" && (s.digRounds ?? 0) < digBudget + (s.digBonus ?? 0)) return 2;
     // PROMOTION OUTRANKS EXHAUSTION. The exhausted rule exists to stop an item from eating
     // the plateau unattended, not to forbid it — a model that believes it is close says so
     // with `sec_update <id> priority=1`, and that has to work or the deprioritisation becomes
@@ -1404,7 +1538,7 @@ export function nextOpenSurface(snapshot: TreeSnapshot, digBudget = SEC_DIG_BUDG
     // `status === "open"`, so a mid-dig item with a spent budget kept rank 0 and was handed
     // every round while digRounds grew past the budget without limit.
     const attemptsSpent = (s.attempts ?? 0) >= MAX_ITEM_ATTEMPTS;
-    const digSpent = s.status === "digging" && (s.digRounds ?? 0) >= digBudget;
+    const digSpent = s.status === "digging" && (s.digRounds ?? 0) >= digBudget + (s.digBonus ?? 0);
     return attemptsSpent || digSpent ? -1 : 0;
   };
   // `focus` REORDERS, it does not merely decorate. It used to be rendered as a banner at the top
@@ -1974,6 +2108,14 @@ export interface SecBriefOptions {
    * must read the same number, and the brief should not read the settings file per round.
    */
   pursuitBudget?: number;
+  /**
+   * Extra rounds already GRANTED to one finding (`sec_escalate`).
+   *
+   * The brief prints `pursuit N/M`, and M has to be the budget THAT FINDING actually has — otherwise a
+   * model that asked for and received six more rounds reads "3/3, budget spent" and gives up on its own
+   * granted work.
+   */
+  pursuitBonusFor?: (id: string) => number;
   /**
    * How many RECON rounds the run takes. See `HypothesisSettings.reconRounds`.
    *
