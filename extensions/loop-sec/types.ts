@@ -1818,6 +1818,42 @@ export interface SecFinding {
  * two, not the author's reading of the output — a run that exits 0 when the author
  * predicted a refusal is a DISCONFIRMATION, and it is recorded as one.
  */
+/**
+ * The verdict, from the run and nothing else.
+ *
+ * ONE function, called by the writer and by the log reader, for the same reason `confirmed` is recomputed
+ * on read: a verdict the log can state independently of the run it summarises is a verdict a tampered log
+ * can contradict.
+ *
+ * THE ORDER OF THE CHECKS IS THE POINT. A run whose precondition did not hold says NOTHING about the
+ * finding, whatever its exit code — so that is decided first. Then a run that never finished (timeout,
+ * killed by signal) is inconclusive, because "did not complete" is not "did not work". Only then does the
+ * expectation decide between reproduced and disconfirmed.
+ */
+/**
+ * WHY a run could not settle the finding.
+ *
+ * A CODE, not a sentence: the record outlives the report's language setting, and a stored English sentence
+ * inside a Chinese report is a mixed-language artefact nobody wants to read. The report localises.
+ */
+export type InconclusiveCause = "precondition" | "timeout" | "signal";
+
+export function verdictOf(run: {
+  exitCode: number | null;
+  timedOut: boolean;
+  expectExit: "zero" | "nonzero";
+  expectOutput?: string | null;
+  output: string;
+  preconditionHeld?: boolean;
+}): { verdict: "reproduced" | "disconfirmed" | "inconclusive"; cause?: InconclusiveCause } {
+  if (run.preconditionHeld === false) return { verdict: "inconclusive", cause: "precondition" };
+  if (run.timedOut) return { verdict: "inconclusive", cause: "timeout" };
+  if (run.exitCode === null) return { verdict: "inconclusive", cause: "signal" };
+  const exitOk = run.expectExit === "zero" ? run.exitCode === 0 : run.exitCode !== 0;
+  const outputOk = !run.expectOutput || run.expectOutput === null ? true : run.output.includes(run.expectOutput);
+  return { verdict: exitOk && outputOk ? "reproduced" : "disconfirmed" };
+}
+
 export interface SecVerification {
   /**
    * Secrets were found in the output and replaced with `***`.
@@ -1849,7 +1885,29 @@ export interface SecVerification {
   expectExit: "zero" | "nonzero";
   /** The output substring the verdict was judged against, when one was given. */
   expectOutput?: string;
-  /** Whether the run matched that expectation. */
+  /**
+   * WHAT THE RUN SETTLED — three states, not two.
+   *
+   *   reproduced    the run matched the expectation stated before it
+   *   disconfirmed  the run finished and contradicted it
+   *   inconclusive  the run CANNOT speak to the finding: it timed out, it was killed, or the precondition
+   *                 did not hold (no session, service down, wrong environment)
+   *
+   * The third state is why this exists. A two-valued verdict recorded "the service was down" as "the
+   * finding is wrong", and the report then said a vulnerability did not hold on the strength of a run that
+   * never tested it.
+   */
+  verdict: "reproduced" | "disconfirmed" | "inconclusive";
+  /** Why the run was inconclusive. Present exactly when the verdict is. */
+  inconclusiveCause?: InconclusiveCause;
+  /** The precondition as stated before the run, when one was. */
+  precondition?: string;
+  /**
+   * Whether that precondition held. STORED, not derived: whether a session existed is something the model
+   * observed, not something an exit code encodes, so the log is the only place it can come from.
+   */
+  preconditionHeld?: boolean;
+  /** Derived: `verdict === "reproduced"`. Kept so a reader written against the old field still works. */
   confirmed: boolean;
 }
 
@@ -1863,6 +1921,22 @@ export interface SecVerifyInput {
   expectOutput?: string;
   /** Optional exit-code expectation; defaults to "zero". */
   expectExit?: "zero" | "nonzero";
+  /**
+   * What has to HOLD for this run to mean anything, stated before it.
+   *
+   * "a valid session cookie", "the service is up on 8080", "the table exists". Without this field the only
+   * outcomes are reproduced and disconfirmed, and a run against a service that is down gets recorded as
+   * evidence that the finding is wrong.
+   */
+  precondition?: string;
+  /**
+   * Did that precondition actually hold?
+   *
+   * `false` makes the run INCONCLUSIVE whatever the command did. `undefined` means the model did not say,
+   * which is not the same as "yes" — it is treated as satisfied, because a model that never mentioned a
+   * precondition is claiming the run was valid.
+   */
+  preconditionHeld?: boolean;
 }
 
 /**

@@ -139,6 +139,13 @@ export interface SecStrings {
   verifyHeading: string;
   /** Printed under a verification whose output had secrets replaced. */
   verifyRedacted: string;
+  verifyReproduced: string;
+  verifyDisconfirmed: string;
+  /** The third state: the run could not speak to the finding, and why. */
+  /** `cause` is a code: precondition | timeout | signal | other. */
+  verifyInconclusive: (cause: string) => string;
+  /** Label for the precondition line, when the run declared one. */
+  verifyPrecondition: string;
   /** The contract, restated at the top of the report: what counted as the result. */
   contractTitle: string;
   contractNote: string;
@@ -314,6 +321,17 @@ const SEC_ZH: SecStrings = {
   probesOnNote: (v, t) => `其中 **${v}/${t}** 条跑过命令，且结果符合跑之前声明的预期。`,
   verifyHeading: "**验证**",
   verifyRedacted: "_输出里识别到口令 / token / JWT 的形态，已替换为 \`***\` —— **尽力而为**，原值未保存，也不保证全部识别。_",
+  verifyPrecondition: "前提",
+  verifyReproduced: "**已复现** —— 跑过命令，结果**符合**跑之前声明的预期",
+  verifyDisconfirmed: "**已证伪** —— 跑完了，结果**不符合**跑之前声明的预期：要么发现是错的，要么预期是错的",
+  verifyInconclusive: (cause) =>
+    cause === "precondition"
+      ? "**无法判定** —— **声明的前提没有成立**，所以这次运行没有检验这条发现：它既不算证实也不算证伪。"
+      : cause === "timeout"
+        ? "**无法判定** —— 命令**在时间预算内没有跑完**，被杀了。没有跑完不等于不成立。"
+        : cause === "signal"
+          ? "**无法判定** —— 命令被信号终止，没有退出码。没有跑完不等于不成立。"
+          : "**无法判定** —— 这次运行无法判定。",
   contractTitle: "## 验收标准（本次运行按这个算结果）",
   contractNote:
     "起点是**未持有任何有效会话/口令/token**；路径不限跳数；**每一跳必须由上一跳的产物驱动**（并列不算链）；终点是**任意服务账户执行攻击者指定的命令** —— 仅文件读 / 仅盲注 / 仅固定命令 / 仅 DB 超级用户 **不算**。全文在 `.pi-loopsec/contract.md`，可改。",
@@ -477,6 +495,17 @@ const SEC_EN: SecStrings = {
   probesOnNote: (v, t) => `**${v}/${t}** were run and matched the expectation stated before the run.`,
   verifyHeading: "**Verification**",
   verifyRedacted: "_Credentials (password / token / JWT shapes) were replaced with \`***\` — **best-effort**, the original was not kept, and it is not guaranteed to catch everything._",
+  verifyPrecondition: "Precondition",
+  verifyReproduced: "**Reproduced** — ran, and the result matched the expectation stated before the run",
+  verifyDisconfirmed: "**Disconfirmed** — it ran, and the result contradicted the stated expectation: either the finding is wrong or the expectation was",
+  verifyInconclusive: (cause) =>
+    cause === "precondition"
+      ? "**Inconclusive** — **the stated precondition did not hold**, so this run did not test the finding: it is neither confirmation nor refutation."
+      : cause === "timeout"
+        ? "**Inconclusive** — the command **did not finish inside the time budget** and was killed. Not finishing is not the same as not holding."
+        : cause === "signal"
+          ? "**Inconclusive** — the command was terminated by a signal and produced no exit code. Not finishing is not the same as not holding."
+          : "**Inconclusive** — this run could not settle it.",
   contractTitle: "## Acceptance bar (what counted as a result)",
   contractNote:
     "The start point is **no valid session / password / token**; the path is unbounded in hops; **each hop must be driven by the previous hop's product** (parallel bugs are not a chain); the end point is **arbitrary command execution under any service account** — file read only, blind injection only, a fixed command only, or DB superuser only **do not count**. Full text, editable: `.pi-loopsec/contract.md`.",

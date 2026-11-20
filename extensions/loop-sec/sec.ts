@@ -81,6 +81,7 @@ import {
   type SecSurfacePatch,
   type SecVerification,
   FINDING_IMPACTS,
+  verdictOf,
   reachesTheBar,
   type SecVerifyInput,
   type Severity,
@@ -582,6 +583,14 @@ export function redactSecrets(text: string): { text: string; changed: boolean } 
   return { text: out, changed };
 }
 
+/** The cause, in the language the briefs use. */
+function causeZh(cause: "precondition" | "timeout" | "signal" | undefined): string {
+  if (cause === "precondition") return "声明的前提没有成立";
+  if (cause === "timeout") return "命令在时间预算内没有跑完，被杀了";
+  if (cause === "signal") return "命令被信号终止，没有退出码";
+  return "这次运行无法判定";
+}
+
 export function verifyFinding(
   projectRoot: string,
   id: string,
@@ -661,8 +670,14 @@ export function verifyFinding(
   const clipped = redacted.text;
   const expectExit = input.expectExit === "nonzero" ? "nonzero" : "zero";
   const expectOutput = input.expectOutput && input.expectOutput.trim() ? input.expectOutput : null;
-  const exitOk = exitCode !== null && (expectExit === "zero" ? exitCode === 0 : exitCode !== 0);
-  const outputOk = expectOutput === null ? true : clipped.includes(expectOutput);
+  const judged = verdictOf({
+    exitCode,
+    timedOut,
+    expectExit,
+    ...(expectOutput !== null ? { expectOutput } : {}),
+    output: clipped,
+    ...(input.preconditionHeld !== undefined ? { preconditionHeld: input.preconditionHeld } : {}),
+  });
   const verification: SecVerification = {
     at,
     command,
@@ -673,7 +688,11 @@ export function verifyFinding(
     expect,
     expectExit,
     ...(expectOutput !== null ? { expectOutput } : {}),
-    confirmed: !timedOut && exitOk && outputOk,
+    ...(input.precondition ? { precondition: input.precondition.trim() } : {}),
+    ...(input.preconditionHeld !== undefined ? { preconditionHeld: input.preconditionHeld } : {}),
+    verdict: judged.verdict,
+    ...(judged.cause ? { inconclusiveCause: judged.cause } : {}),
+    confirmed: judged.verdict === "reproduced",
   };
 
   const written = updateFinding(projectRoot, id, { verification }, at);
@@ -682,14 +701,20 @@ export function verifyFinding(
   return {
     ok: true,
     value: verification,
-    warnings: verification.confirmed
-      ? []
-      : [
-          timedOut
-            ? `the command did not finish within ${settings.commandTimeoutMs}ms and was KILLED — recorded as NOT confirmed.`
-            : `the run did NOT match the stated expectation (exit ${exitCode ?? "killed"}${expectOutput ? ", output substring missing" : ""}) — recorded as NOT confirmed.`,
-          "A disconfirmed run is a result: either the finding is wrong, or the expectation was. Fix whichever is wrong rather than re-running until it agrees.",
-        ],
+    warnings:
+      judged.verdict === "reproduced"
+        ? []
+        : judged.verdict === "inconclusive"
+          ? [
+              `INCONCLUSIVE（无法判定）— ${causeZh(judged.cause)}。`,
+              "That is not a disconfirmation: nothing about the finding was tested. Fix the environment or the",
+              "precondition and run it again; do NOT record this as evidence against the finding.",
+            ]
+          : [
+              `the run finished and did NOT match the stated expectation (exit ${exitCode}${expectOutput ? ", output substring missing" : ""}) — recorded as DISCONFIRMED.`,
+              "A disconfirmed run is a result: either the finding is wrong, or the expectation was. Fix whichever",
+              "is wrong rather than re-running until it agrees.",
+            ],
   };
 }
 
@@ -3567,12 +3592,21 @@ function renderSecFinding(
       `${t.verifyCommand}  ${v.command}`,
       `${t.verifyExit}  ${v.timedOut ? t.verifyTimeout : (v.exitCode ?? "?")}`,
       `${t.verifyExpect}  ${v.expect}`,
+      ...(v.precondition ? [`${t.verifyPrecondition}  ${v.precondition}`] : []),
       "",
       t.verifyOutput,
     ];
     for (const line of v.output.split("\n")) body.push(`  ${line}`);
     fenced(t.verifyHeading, body.join("\n"));
-    lines.push(v.confirmed ? t.verifyConfirmed : t.verifyNotConfirmed);
+    // THREE STATES. The old line said "not confirmed" for a timeout and for a genuine mismatch alike,
+    // which told the reader a vulnerability did not hold on the strength of a run that never tested it.
+    lines.push(
+      v.verdict === "reproduced"
+        ? t.verifyReproduced
+        : v.verdict === "disconfirmed"
+          ? t.verifyDisconfirmed
+          : t.verifyInconclusive(v.inconclusiveCause ?? "other"),
+    );
     // THE OUTPUT IS NOT VERBATIM WHEN SECRETS WERE FOUND, and the report has to say so: a reader who
     // assumes these are the exact bytes would draw a wrong conclusion about a value that is now "***".
     if (v.redacted === true) {

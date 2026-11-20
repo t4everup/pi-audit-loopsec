@@ -681,7 +681,9 @@ test("the report shows the run, the expectation and the verdict, and counts them
   assert.match(report, /\*\*验证\*\*/);
   assert.match(report, /命令 {2}curl -s http:\/\/TARGET\/x/);
   assert.match(report, /跑前预期 {2}HTTP 200 且回显命令输出/);
-  assert.match(report, /未复现/, "and the verdict is printed as a NOT-reproduced one");
+  // Three states now: this run finished and contradicted the expectation, so it is DISCONFIRMED — not the
+  // old catch-all "not reproduced", which said the same thing about a timeout.
+  assert.match(report, /已证伪/, "and the verdict is printed as a DISCONFIRMED one");
   // The finding that was NOT run says exactly that, rather than borrowing the other's credit.
   assert.match(report, /_未经验证：无等级 · 无证伪 · 无对抗复核_/);
 });
@@ -4746,4 +4748,115 @@ test("coverageEveryRounds=1 measures every round — the old behaviour, still av
   const r1 = loadSec(cwd).snapshot.loop!.round;
   const after = secCoverage(loadSec(cwd).snapshot, cwd);
   assert.equal(after.measuredAtRound, r1, `remeasured every round, not stale from ${r0}`);
+});
+
+// =================================================================
+// THE THIRD VERDICT — a run that never tested the finding
+// =================================================================
+
+test("a TIMEOUT is INCONCLUSIVE, not a disconfirmation", () => {
+  // The two-valued verdict recorded "the command did not finish" as "the finding is wrong", and the report
+  // then said a vulnerability did not hold on the strength of a run that never completed.
+  const cwd = seeded();
+  startSec(cwd);
+  saveSettings(cwd, { allowCommandProbes: true, commandTimeoutMs: 1_000 });
+  const f = recordFinding(cwd, { title: "慢接口", category: "ssrf", severity: "high", file: "a.py", line: 1, evidence: "e" });
+  if (!f.ok) return assert.fail("must record");
+  const r = verifyFinding(cwd, f.value.id, {
+    command: `node -e "setTimeout(()=>{}, 30000)"`,
+    expect: "should answer quickly",
+  });
+  assert.equal(r.ok, true, r.ok ? "" : r.errors.join("; "));
+  const v = loadSec(cwd).snapshot.findings[0]!.verification!;
+  assert.equal(v.verdict, "inconclusive", "the run did not finish, so it settled nothing");
+  assert.equal(v.confirmed, false, "and confirmed stays false for compatibility");
+  assert.equal(v.inconclusiveCause, "timeout", "the cause is a stable code, not a sentence");
+  assert.match(r.warnings.join(" "), /INCONCLUSIVE/);
+  assert.match(r.warnings.join(" "), /not a disconfirmation|NOT a disconfirmation|nothing about the finding/i);
+  // The report says so rather than claiming the finding is wrong.
+  const report = renderSecReport(loadSec(cwd).snapshot, loadSec(cwd).snapshot.loop);
+  assert.match(report, /无法判定/);
+});
+
+test("a precondition that did NOT hold makes the run inconclusive, whatever the exit code", () => {
+  const cwd = seeded();
+  startSec(cwd);
+  saveSettings(cwd, { allowCommandProbes: true });
+  const f = recordFinding(cwd, { title: "需要会话的洞", category: "auth-bypass", severity: "high", file: "a.py", line: 1, evidence: "e" });
+  if (!f.ok) return assert.fail("must record");
+  const r = verifyFinding(cwd, f.value.id, {
+    command: "echo ok",
+    expect: "200 with the admin body",
+    precondition: "有一个有效的管理员会话 cookie",
+    preconditionHeld: false,
+  });
+  assert.equal(r.ok, true);
+  const v = loadSec(cwd).snapshot.findings[0]!.verification!;
+  // The command SUCCEEDED (exit 0, output ok) and it is still inconclusive — that ordering is the point.
+  assert.equal(v.exitCode, 0);
+  assert.equal(v.verdict, "inconclusive");
+  assert.equal(v.inconclusiveCause, "precondition");
+  assert.equal(v.precondition, "有一个有效的管理员会话 cookie", "the precondition is kept for the reader");
+});
+
+test("a run that finishes and contradicts the expectation is DISCONFIRMED", () => {
+  const cwd = seeded();
+  startSec(cwd);
+  saveSettings(cwd, { allowCommandProbes: true });
+  const f = recordFinding(cwd, { title: "x", category: "rce", severity: "high", file: "a.py", line: 1, evidence: "e" });
+  if (!f.ok) return assert.fail("must record");
+  verifyFinding(cwd, f.value.id, { command: "echo nope", expect: "prints the payload", expectOutput: "PAYLOAD" });
+  const v = loadSec(cwd).snapshot.findings[0]!.verification!;
+  assert.equal(v.verdict, "disconfirmed");
+  assert.equal(v.inconclusiveCause, undefined, "a disconfirmation has no inconclusive cause");
+});
+
+test("the verdict is RECOMPUTED from the run, so a tampered one cannot claim a third state it did not earn", () => {
+  const cwd = seeded();
+  startSec(cwd);
+  const f = recordFinding(cwd, { title: "x", category: "rce", severity: "high", file: "a.py", line: 1, evidence: "e" });
+  if (!f.ok) return assert.fail("must record");
+  // Write a record that CLAIMS inconclusive while the run plainly reproduced.
+  appendSecEvent(cwd, {
+    type: "finding_updated",
+    at: new Date().toISOString(),
+    id: f.value.id,
+    patch: {
+      verification: {
+        at: new Date().toISOString(),
+        command: "true",
+        output: "OK",
+        exitCode: 0,
+        timedOut: false,
+        expect: "prints OK",
+        expectExit: "zero",
+        expectOutput: "OK",
+        verdict: "inconclusive",
+        confirmed: false,
+      },
+    },
+  } as never);
+  const v = loadSec(cwd).snapshot.findings[0]!.verification!;
+  assert.equal(v.verdict, "reproduced", "the run decides, not the log");
+  assert.equal(v.confirmed, true);
+});
+
+test("the three verdicts are distinguishable in the report", () => {
+  const cwd = seeded();
+  startSec(cwd);
+  saveSettings(cwd, { allowCommandProbes: true });
+  const a = recordFinding(cwd, { title: "repro", category: "rce", severity: "high", file: "a.py", line: 1, evidence: "e" });
+  const b = recordFinding(cwd, { title: "disconf", category: "rce", severity: "high", file: "b.py", line: 2, evidence: "e" });
+  const c = recordFinding(cwd, { title: "inconc", category: "rce", severity: "high", file: "c.py", line: 3, evidence: "e" });
+  if (!a.ok || !b.ok || !c.ok) return assert.fail("must record");
+  verifyFinding(cwd, a.value.id, { command: "echo HIT", expect: "prints HIT", expectOutput: "HIT" });
+  verifyFinding(cwd, b.value.id, { command: "echo MISS", expect: "prints HIT", expectOutput: "HIT" });
+  verifyFinding(cwd, c.value.id, {
+    command: "echo HIT", expect: "prints HIT", expectOutput: "HIT", precondition: "the service is up", preconditionHeld: false,
+  });
+  const report = renderSecReport(loadSec(cwd).snapshot, loadSec(cwd).snapshot.loop);
+  assert.match(report, /已复现/);
+  assert.match(report, /已证伪/);
+  assert.match(report, /无法判定/);
+  assert.match(report, /the service is up/, "and the precondition is printed with the run");
 });

@@ -599,6 +599,18 @@ export function registerSecTools(pi: ExtensionAPI): void {
       ],
       parameters: Type.Object({
         id: Type.String({ description: "The finding id to verify, e.g. F-0001." }),
+        precondition: Type.Optional(
+          Type.String({
+            description:
+              "What has to HOLD for this run to mean anything: a valid session cookie, the service is up on 8080, the table exists. Stated before the run.",
+          }),
+        ),
+        preconditionHeld: Type.Optional(
+          Type.Boolean({
+            description:
+              "Did that precondition hold? false makes the run INCONCLUSIVE whatever the command did — the alternative is recording 'the service was down' as evidence the finding is wrong.",
+          }),
+        ),
         command: Type.String({
           description: "The exact command line to run. It is recorded verbatim so a reader can re-run it.",
         }),
@@ -622,6 +634,8 @@ export function registerSecTools(pi: ExtensionAPI): void {
         const result = verifyFinding(root, params.id, {
           command: params.command,
           expect: params.expect,
+          ...(params.precondition ? { precondition: params.precondition } : {}),
+          ...(typeof params.preconditionHeld === "boolean" ? { preconditionHeld: params.preconditionHeld } : {}),
           ...(params.expectOutput ? { expectOutput: params.expectOutput } : {}),
           ...(params.expectExit ? { expectExit: params.expectExit as "zero" | "nonzero" } : {}),
         });

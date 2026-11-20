@@ -93,6 +93,7 @@ import {
   SEC_SURFACE_KINDS,
   SEVERITIES,
   isVerdict,
+  verdictOf,
 } from "./types.js";
 
 // -----------------------------------------------------------------
@@ -1142,13 +1143,21 @@ function normalizeVerification(value: unknown): SecVerification | undefined {
   const timedOut = o.timedOut === true;
   const output = typeof o.output === "string" ? o.output : "";
   const expect = typeof o.expect === "string" ? o.expect : "";
-  // RECOMPUTED. The log carries the verdict, but the verdict is a function of the run —
-  // trusting the stored boolean would let a tampered log claim a reproduction that the
-  // recorded exit code and output contradict.
   const expectExit = o.expectExit === "nonzero" ? "nonzero" : "zero";
   const expectOutput = typeof o.expectOutput === "string" && o.expectOutput ? o.expectOutput : null;
-  const exitOk = exitCode !== null && (expectExit === "zero" ? exitCode === 0 : exitCode !== 0);
-  const outputOk = expectOutput === null ? true : output.includes(expectOutput);
+  const precondition = typeof o.precondition === "string" && o.precondition ? o.precondition : undefined;
+  // RECOMPUTED, not read. The verdict is a function of the run, so a log claiming "reproduced" beside an
+  // exit code and an output that contradict it is not trusted — the rule `confirmed` has always had.
+  // `preconditionHeld` IS read from the record, because that is a fact the run cannot show: whether the
+  // session existed is something the model observed, not something an exit code encodes.
+  const judged = verdictOf({
+    exitCode,
+    timedOut,
+    expectExit,
+    ...(expectOutput !== null ? { expectOutput } : {}),
+    output,
+    ...(o.preconditionHeld === false ? { preconditionHeld: false } : {}),
+  });
   return {
     at: typeof o.at === "string" ? o.at : "",
     command: o.command,
@@ -1160,7 +1169,11 @@ function normalizeVerification(value: unknown): SecVerification | undefined {
     // Best-effort redaction happened, so the report must not present the output as verbatim.
     ...(o.redacted === true ? { redacted: true } : {}),
     ...(expectOutput !== null ? { expectOutput } : {}),
-    confirmed: !timedOut && exitOk && outputOk,
+    ...(precondition ? { precondition } : {}),
+    ...(o.preconditionHeld === false ? { preconditionHeld: false } : o.preconditionHeld === true ? { preconditionHeld: true } : {}),
+    verdict: judged.verdict,
+    ...(judged.cause ? { inconclusiveCause: judged.cause } : {}),
+    confirmed: judged.verdict === "reproduced",
   };
 }
 
