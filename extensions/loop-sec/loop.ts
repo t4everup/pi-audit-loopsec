@@ -1262,7 +1262,17 @@ export const MAX_DEPTH_RATIO = 0.5;
  * Judged over the CURRENT RUN's rounds only: a `/loopsec resume` continues a run, and counting the
  * previous run's depth rounds would hold the new one responsible for them.
  */
-export function depthAllowed(snapshot: TreeSnapshot): boolean {
+export function depthAllowed(snapshot: TreeSnapshot, exempt = false): boolean {
+  // A GRANTED FINDING IS EXEMPT, and that is the point of granting.
+  //
+  // The caps exist to stop an UNASKED-FOR depth run from starving breadth: three in a row, half of the
+  // last ten. `sec_escalate` is the opposite of unasked-for — the model named the missing hop and the loop
+  // approved extra rounds for it. Applying the ratio to it would hand back with one hand what the grant
+  // gave with the other: "you may have five more rounds, but not two in a row."
+  //
+  // The bound that remains is the per-item cap (MAX_ESCALATION_ROUNDS) plus the plateau, which is enough:
+  // an escalated item can dominate for a while, not forever.
+  if (exempt) return true;
   const rounds = currentRunRounds(snapshot);
   let consecutive = 0;
   for (let i = rounds.length - 1; i >= 0; i--) {
@@ -1945,7 +1955,10 @@ export function tickLoop(projectRoot: string, snapshot: TreeSnapshot, opts: Tick
     // THE GLOBAL DEPTH GUARD. The per-finding budget bounds ONE finding; this bounds the run — see
     // `depthAllowed`. When it blocks, the finding keeps its remaining budget and is picked again
     // after the sweep has caught up, so this is "not yet", never "no".
-    const pursuitAllowed = depthAllowed(snapshot);
+    // The GRANT is per finding, so the exemption is decided per finding — computed after the target is
+    // known, below. Until then the ratio applies, and the target's own grant is ORed in.
+    const targetGranted = snapshot.findings.some((f) => (f.pursuitBonus ?? 0) > 0 && !f.pursuitClosed);
+    const pursuitAllowed = depthAllowed(snapshot, targetGranted);
     const pursuitTarget =
       reconPhaseOver(snapshot, reconRounds) && pursuitAllowed
         ? nextPursuit(snapshot, Math.max(...[pursuitBudget, ...snapshot.findings.map((f) => budgetFor(f))]), probesAllowed)

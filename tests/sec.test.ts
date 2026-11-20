@@ -4519,3 +4519,50 @@ test("an unknown id is refused with the ids that DO exist", () => {
   assert.equal(badId.ok, false);
   assert.match(badId.ok ? "" : badId.errors.join(" "), /must be F-xxxx/);
 });
+
+test("a GRANTED finding is exempt from the depth ratio — the grant is the point", () => {
+  // The ratio exists to stop an UNASKED-FOR depth run from starving breadth. A grant is the opposite:
+  // the model named the missing hop and the loop approved rounds for it. Applying the ratio to it would
+  // hand back with one hand what the grant gave with the other.
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 1);
+  saveSettings(cwd, { pursuitRounds: 3 });
+  submitSecRecon(cwd, NOTE);
+  recordSurface(cwd, { title: "S1", kind: "sink", file: "s.py", line: 1 });
+  recordFinding(cwd, {
+    title: "认证前 RCE 差一跳", category: "rce", severity: "critical", file: "a.py", line: 9,
+    evidence: "e", preAuth: false, deepen: true,
+  });
+  const escalated = escalateItem(cwd, {
+    id: "F-0001", rounds: 6, reason: "守卫只读 query，处理器读 body，只差一跳就能认证前触发",
+  });
+  assert.equal(escalated.ok, true);
+
+  // Burn past MAX_CONSECUTIVE_DEPTH, which would otherwise stop the depth run.
+  const kinds: string[] = [];
+  for (let i = 0; i < MAX_CONSECUTIVE_DEPTH + 2; i++) {
+    tickLoop(cwd, loadSec(cwd).snapshot);
+    noteSecToolCall();
+    kinds.push(loadSec(cwd).snapshot.roundRecords.at(-1)!.kind);
+  }
+  assert.ok(
+    kinds.filter((k) => k === "pursue").length >= MAX_CONSECUTIVE_DEPTH + 1,
+    `the escalated finding keeps getting rounds: ${kinds.join(",")}`,
+  );
+  assert.equal(depthAllowed(loadSec(cwd).snapshot), false, "without the grant the ratio would have blocked it");
+  assert.equal(depthAllowed(loadSec(cwd).snapshot, true), true, "the grant is what lifts it");
+});
+
+test("without a grant the ratio still bites — breadth is still protected", () => {
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 1);
+  submitSecRecon(cwd, NOTE);
+  recordSurface(cwd, { title: "S1", kind: "sink", file: "s.py", line: 1 });
+  recordFinding(cwd, { title: "deep", category: "rce", severity: "high", file: "a.py", line: 1, evidence: "e", deepen: true });
+  for (let i = 0; i < MAX_CONSECUTIVE_DEPTH; i++) {
+    tickLoop(cwd, loadSec(cwd).snapshot);
+    noteSecToolCall();
+  }
+  assert.equal(depthAllowed(loadSec(cwd).snapshot), false, "three in a row still blocks");
+  assert.equal(depthAllowed(loadSec(cwd).snapshot, false), false, "and no grant means no exemption");
+});
