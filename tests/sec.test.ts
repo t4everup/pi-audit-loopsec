@@ -36,7 +36,7 @@ import {
 } from "../extensions/loop-sec/store.ts";
 import { DEPTH_RATIO_WINDOW, MAX_CONSECUTIVE_DEPTH, MAX_DEPTH_RATIO, depthAllowed, renderFocus } from "../extensions/loop-sec/loop.ts";
 import { evaluateRound, pauseAfterRounds, pauseLoop, resumeLoop, startLoop, stopLoop, tickLoop } from "../extensions/loop-sec/loop.ts";
-import { advanceRuns, endDeepRun, parkOnSendFailure, pickNextRun, startDeepRun } from "../extensions/loop-sec/loop.ts";
+import { advanceRuns, endDeepRun, parkOnSendFailure, pickNextRun, startDeepRun, withBriefExtras } from "../extensions/loop-sec/loop.ts";
 import { loadSettings, saveSettings } from "../extensions/loop-sec/settings.ts";
 import { LOOP_VERBS, parseArgs, tailAfterVerb } from "../extensions/loop-sec/args.ts";
 import { noteSecToolCall, secToolCallCount } from "../extensions/loop-sec/activity.ts";
@@ -628,9 +628,10 @@ test("a verification verdict is RECOMPUTED from the run, so a tampered one canno
   );
 });
 
-test("the brief's FOUND SO FAR list is bounded, and says how many it hid", () => {
-  // Unbounded, this list grows one line per finding and rides every brief: a run with 60
-  // findings re-sent all 60 every round, crowding out the item the round was about.
+test("FOUND SO FAR is bounded at TWELVE and says how many it hid", () => {
+  // Unbounded, this list grows one line per finding and rides every brief: a run with 60 findings re-sent
+  // all 60 every round, crowding out the item the round was about. The cap was 30 — with `sec_show` and
+  // `sec_recall` in place it can be 12, because nothing is lost by not printing it.
   const cwd = seeded();
   withSurface(cwd, 1);
   for (let i = 0; i < 35; i++) {
@@ -642,12 +643,19 @@ test("the brief's FOUND SO FAR list is bounded, and says how many it hid", () =>
       line: i + 1,
     });
   }
-  const r = tickLoop(cwd, loadSec(cwd).snapshot);
-  const brief = r.brief!;
+  const brief = renderSecAnalyzeBrief(
+    loadSec(cwd).snapshot,
+    "x",
+    2,
+    loadSec(cwd).snapshot.surfaces.find((s) => s.status === "open")!,
+  );
   const listed = brief.split("\n").filter((l) => /^ {2}F-\d{4} \[/.test(l)).length;
-  assert.ok(listed <= 30, `the list must be bounded; it listed ${listed}`);
-  assert.match(brief, /\+5 more, worst-first/, "and it states exactly how many were hidden");
+  assert.equal(listed, 12, `the list is bounded at 12; it listed ${listed}`);
+  assert.match(brief, /\+23 more, worst-first/, "and it states exactly how many were hidden");
   assert.match(brief, /FOUND SO FAR \(35\)/, "while still stating the true total");
+  assert.match(brief, /sec_show <F-id>/, "and how to reach the rest");
+  // The WORST are the ones shown, because that is what a re-report would duplicate.
+  assert.match(brief, /\[critical\]|\[high\]/, "the visible twelve are the worst-first ones");
 });
 
 test("the report shows the run, the expectation and the verdict, and counts them in the summary", () => {
@@ -2358,25 +2366,38 @@ test("the brief says you may ask for another round, and that it is budgeted", ()
   assert.match(brief, /a trace that never ends is the same as never deciding/);
 });
 
-test("ALREADY CLEARED is no longer cut at 12, and says when it truncates", () => {
-  // Past twelve clearances the oldest reasons fell out of the brief, so the model could not
-  // tell WHY an area had been ruled out — and a model that cannot see its own exclusions
-  // re-litigates them or contradicts them.
+test("the cleared list is bounded at TWELVE, states the rest, and the newest are kept", () => {
+  // The section exists so the model does not re-litigate what was already ruled out. It used to show 40;
+  // with `sec_recall` in place 12 is enough, and the NEWEST are the ones kept — the most recent reasoning is
+  // the reasoning the current item is most likely to touch.
   const cwd = seeded();
   startSec(cwd, "挖掘认证前rce漏洞", 99);
   submitSecRecon(cwd, NOTE);
-  for (let i = 0; i < 20; i++) recordSurface(cwd, { title: `area ${i} reaches a sink without the guard the code relies on`, kind: "file", file: "src/a.c", line: 1 });
-  // Clear 20 of 21, leaving one OPEN. With nothing open the next round is a SURFACE round,
-  // which carries no ALREADY CLEARED section at all — and the test would then pass without
-  // testing anything.
+  for (let i = 0; i < 20; i++) {
+    recordSurface(cwd, { title: `area ${i} reaches a sink without the guard`, kind: "sink", file: `src/f${i}.c`, line: 1 });
+  }
+  // One left OPEN, so the round is an ANALYZE round (a surface round carries no cleared section).
   recordSurface(cwd, { title: "the one still open", kind: "file", file: "src/a.c", line: 1 });
   for (const s of loadSec(cwd).snapshot.surfaces.slice(0, 20)) {
-    clearSurface(cwd, s.id, `guard ${s.id}: check_auth() runs at router.c:88 before dispatch and this path is not public`, { file: "src/auth/session.c", line: 1 });
+    clearSurface(cwd, s.id, `guard ${s.id}: check_auth() runs at router.c:88 before dispatch and this path is not public`, {
+      file: "src/router.c",
+      line: 88,
+    });
   }
-  const brief = tickLoop(cwd, loadSec(cwd).snapshot).brief!;
-  const shown = (brief.match(/^ {2}S-\d{4} {2}/gm) ?? []).length;
-  assert.ok(shown >= 15, `the oldest reasons must not fall out; only ${shown} shown of 20`);
-  assert.match(brief, /area 0 reaches a sink/, "including the FIRST one cleared");
+  const brief = renderSecAnalyzeBrief(
+    loadSec(cwd).snapshot,
+    "x",
+    2,
+    loadSec(cwd).snapshot.surfaces.find((s) => s.status === "open")!,
+  );
+  // Count only what is UNDER the cleared heading — the round's own item line has the same shape.
+  const clearedPart = brief.slice(brief.indexOf("--- ALREADY CLEARED ---"));
+  const shown = (clearedPart.match(/^ {2}S-\d{4} {2}/gm) ?? []).length;
+  assert.equal(shown, 12, `twelve shown of 20; got ${shown}`);
+  assert.match(brief, /\+8 earlier clearance\(s\)/, "the hidden count is stated");
+  assert.match(brief, /sec_recall/, "and how to search the rest");
+  assert.match(brief, /area 19 /, "the NEWEST clearance is kept");
+  assert.ok(!brief.includes("area 0 reaches"), "the oldest is the one that falls out");
 });
 
 test("digging shows up in the report, as neither cleared nor unread", () => {
@@ -3772,14 +3793,18 @@ test("sec_show returns the WHOLE record — the thing the brief had to truncate"
   assert.equal(showRecord(loadSec(cwd).snapshot, "F-9999"), null, "an unknown id is null, not a guess");
 });
 
-test("the analyze brief tells the model it can ask, and how to reach a truncated record", () => {
+test("the read side is announced ONCE, on every brief — not as a block in one of them", () => {
+  // It used to be a six-line block inside the analyze brief, and the analyze brief is where it was least
+  // needed (that round already has its item). The universal one-liner is what a surface or pursue round
+  // gets, and the block was duplicating it.
   const cwd = seeded();
   withSurface(cwd, 2);
-  const item = loadSec(cwd).snapshot.surfaces[0]!;
-  const brief = renderSecAnalyzeBrief(loadSec(cwd).snapshot, "x", 3, item);
-  assert.match(brief, /sec_recall <关键词>/, "the read side is announced");
-  assert.match(brief, /sec_show <id>/);
+  const brief = withBriefExtras("STUB BRIEF", loadSec(cwd).snapshot, "zh", cwd);
+  assert.match(brief, /sec_recall/, "the read side is announced");
+  assert.match(brief, /sec_show/, "including the way to a truncated record");
   assert.match(brief, /sec_observe/, "and the write side that makes recall useful");
+  // Exactly one mention of each — duplication is what the slimming removed.
+  assert.equal((brief.match(/可检索：/g) ?? []).length, 1, "one line, not two");
 });
 
 test("a truncated findings list says how to reach the rest", () => {
@@ -3790,9 +3815,9 @@ test("a truncated findings list says how to reach the rest", () => {
       title: `finding ${i}`, category: "rce", severity: "high", file: `f${i}.py`, line: i + 1, evidence: "e",
     });
   }
-  const item = loadSec(cwd).snapshot.surfaces[0]!;
+  const item = loadSec(cwd).snapshot.surfaces.find((s) => s.status === "open")!;
   const brief = renderSecAnalyzeBrief(loadSec(cwd).snapshot, "x", 3, item);
-  assert.match(brief, /\+3 more/, "the count is still honest");
+  assert.match(brief, /\+21 more/, "12 shown, the rest counted — the count is still honest");
   assert.match(brief, /sec_show <F-id>/, "and it names the way to open one");
 });
 

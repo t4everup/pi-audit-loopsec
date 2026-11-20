@@ -1710,7 +1710,7 @@ export function withBriefExtras(
 
   const withRead = afterBanner(withContract, readSide);
 
-  return withNotes(`${withContract}\n${languageNote}`, snapshot);
+  return withNotes(`${withRead}\n${languageNote}`, snapshot);
 }
 
 export function renderFocus(focus: readonly string[]): string {

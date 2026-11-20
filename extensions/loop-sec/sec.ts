@@ -1918,7 +1918,7 @@ export function renderSecReconBrief(
  * enough to recognise anything the model is about to re-report. Everything past that is a
  * number, because the brief is not a pager.
  */
-const FINDINGS_SHOWN = 30;
+const FINDINGS_SHOWN = 12;
 
 /**
  * The severity floor for pursuing a finding's blockers.
@@ -2838,13 +2838,6 @@ export function renderSecAnalyzeBrief(
   // THE READ SIDE, SAID ONCE PER ROUND. The brief carries 30 findings and 40 clearances and stops
   // there; the model has to know the rest is reachable, or a truncated record is a lost record and the
   // round re-reads a file somebody already covered.
-  lines.push("**You can ASK this run what it already knows:**");
-  lines.push("  - `sec_recall <关键词>` — 历轮的观察 / 发现 / clearance 里按关键字检索（符号、路径片段、路由、表名）；");
-  lines.push("  - `sec_show <id>` — 打开一条完整记录（简报截断的那些在这里）；");
-  lines.push("  - `sec_observe` — 把本轮读到的**事实**写下来（不是发现），下一轮才不用重新读这个文件。");
-  lines.push("");
-  lines.push("先 `sec_recall` 再读文件：别人查过的东西，答案在这里，这一轮就省下来了。");
-  lines.push("");
   for (const category of item.categories ?? []) {
     lines.push(renderSecLadder(category));
     lines.push("");
@@ -2902,7 +2895,7 @@ export function renderSecAnalyzeBrief(
     // the model could not tell WHY an area had been ruled out — and a model that cannot see
     // its own exclusions will re-litigate them, or contradict them. The count is stated
     // rather than silently implied by the list length.
-    const CLEARED_SHOWN = 40;
+    const CLEARED_SHOWN = 12;
     for (const s of cleared.slice(-CLEARED_SHOWN)) {
       lines.push(`  ${s.id}  ${clip(s.title, 80)} — ${clip(s.clearedReason ?? "", 90)}`);
     }
