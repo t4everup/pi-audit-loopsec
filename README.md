@@ -22,17 +22,24 @@ git clone https://github.com/t4everup/pi-audit-loopsec
 ## The round loop
 
 ```text
-/start <objective>          one command; no contract, no finish line
+/loopsec "<objective>"      one command; no contract, no finish line
    │
-   ├─ round 1   recon       read the project once, submit the note (sec_recon)
-   ├─ round 2   surface     enumerate the attack surface into a work list (sec_surface)
-   ├─ round 3+  analyze     work ONE item, all the way down (sec_finding / sec_clear)
-   │                            ├─ the item is assigned by the loop, not chosen by the model
-   │                            ├─ a depth round (sec_dig) is budgeted, never automatic
-   │                            ├─ examining an item and finding it GUARDED is a RESULT,
-   │                            │   recorded (sec_clear) — the report shows it
-   │                            └─ "looked at it, no conclusion" is its own status
-   └─ the report regenerates EVERY round; watch it fill in
+   ├─ recon       map the project, then read the request lifecycle and the auth wiring
+   │              (2 rounds by default; the note SETS THE CEILING)
+   ├─ pursue      a finding one hop from the objective — depth beats the plan
+   │              (3 rounds per finding, capped, and exempt while it holds a grant)
+   ├─ combine     one slot spent asking whether two recorded findings form a CHAIN
+   │              (every 6 rounds; pursuit outranks it, the plan does not)
+   └─ surface / analyze
+                  ├─ surface: enumerate the attack surface into a work list
+                  │  └─ "all examined" means ENUMERATE MORE, not "finished"
+                  └─ analyze: work ONE item, all the way down
+                     ├─ the item is ASSIGNED by the loop, not chosen by the model
+                     ├─ a depth round (sec_dig) is budgeted, never automatic
+                     ├─ examining an item and finding it GUARDED is a RESULT (sec_clear)
+                     ├─ blocked items (requires=) are not candidates until their prereq answers
+                     └─ "looked at it, no conclusion" is its own status
+   the report regenerates EVERY round; watch it fill in
 ```
 
 Plateau: `plateau=8` (default) consecutive unproductive rounds stop the run.
@@ -55,12 +62,43 @@ acceptance checklist for a version that is safe to run unattended.
 | `sec_verify` | run ONE command against a finding, with its `expect` stated first |
 | `sec_observe` | write down a **fact** the code showed you (not a finding) — `file:line`, or `files` for a module/build |
 | `sec_recall` | search what the run has established: observations, findings AND clearances |
-| `sec_show` | open one record in full — the brief truncates at 30 findings / 40 clearances |
+| `sec_show` | open one record in full — the brief truncates at **12** findings and **12** clearances |
+| `sec_escalate` | ask for MORE rounds on ONE item, with a reason — granted, clamped at +12 |
 
-The write tools all existed before; `sec_observe` / `sec_recall` / `sec_show` are the **read
-side**. Without them the brief was the only channel and had to truncate, and a truncated record
-with no way back is a lost record: a round would re-read a file somebody had already cleared.
-The brief can now stay small, because nothing has to be carried in it.
+`sec_observe` / `sec_recall` / `sec_show` are the **read side**. Without them the brief was the only
+channel and had to truncate, and a truncated record with no way back is a lost record: a round would
+re-read a file somebody had already cleared. The brief can now stay small, because nothing has to be
+carried in it.
+
+### Asking for more rounds — `sec_escalate`
+
+Every depth budget used to be a constant, so the only party that had READ THE CODE could change the
+order (`priority`) and the reason (`deepen`) but never the amount. That is the wrong place for the
+judgement:
+
+```text
+sec_escalate id=F-0008 rounds=5 reason="守卫只读 query，处理器读 body，只差一跳就能认证前触发"
+```
+
+- **granted and clamped**: +12 rounds per item, however many times you ask;
+- **the reason is required** (20+ chars) and must say what is LEFT — "it is important" is refused;
+- the response always states the **effective** budget, because a model that asked for 40 and got 12
+  must know it got 12;
+- an escalated finding is **exempt from the depth ratio** (3 in a row / half of the last 10), because
+  that ratio exists to stop an UNASKED-FOR depth run from starving breadth;
+- the reason is recorded as an observation, so the grant is auditable in the record.
+
+### A COMBINE round — the pair is a slot, not a paragraph
+
+The contract says "各自独立成立的漏洞并列不算一条链". That is a rule, and a rule a busy round can skip. So
+one round every six is spent on it, with three things the analyze brief cannot give: the **full**
+findings list (that one truncates at 12), **what each finding offers** derived mechanically from its
+class (写文件 / 读文件 / 出网·触内网 / 跨过一道访问控制 / 一个凭据 / 执行代码), and the three questions
+that separate a chain from a coincidence (does A's product feed B, where is the gap, does the START
+still hold).
+
+A pass that concludes "these do not combine" is a result: record it with `sec_observe` and the round
+is not empty. One that writes nothing counts against the plateau.
 
 ### Dependencies — the order of an audit is not its enumeration order
 
@@ -79,6 +117,36 @@ parallel.
 - `requires=[]` **clears** the list — a list that cannot be emptied cannot be corrected;
 - no deadlock by construction: the graph is a DAG, so while any item is open there is always one
   whose prerequisites are satisfied.
+
+## The contract — what counts as a result
+
+The objective is a DIRECTION. A model reading it literally hunts one unauthenticated entry into one
+sink, and the result that matters here is usually a **chain**. So the acceptance bar rides along with
+every brief: **full text in the first recon round**, then a six-line digest on every round after —
+because a page of rules repeated forty times is wallpaper.
+
+```text
+.pi-loopsec/runs/<run>/contract.md     # seeded once, editable per target, and what gets injected
+```
+
+The six clauses: **起点** (no session / password / token — and if a hop needs a credential, GETTING it
+must also be doable unauthenticated), **路径** (unbounded hops; database, cron, queue, file, template,
+log consumer, subprocess, third-party component — middleware is not the end), **组合** (each hop must
+be driven by the previous hop's product; parallel bugs are not a chain), **终点** (arbitrary command
+execution under any service account — file read only, blind injection only, a fixed command only, or
+DB superuser only **do not count**), **基线** (fingerprint the target version; when source and target
+disagree, the diff wins), **纪律** (every claim gives the whole chain; a "maybe" hop is marked
+[假设]; verification prefers read-only, and anything that writes records how to roll back).
+
+IT IS ENFORCED, not just printed. Two finding fields make the bar checkable:
+
+| field | why it is a closed vocabulary |
+|---|---|
+| `impact` | the report **counts** "reached the bar"; free text would turn that count into a grep. `rce-arbitrary / rce-via-component / rce-scheduled` reach it; `file-read / blind-injection / fixed-command / db-superuser / …` explicitly do not. An unknown value is **recorded with a warning**, never refused — the artifact matters more than the label |
+| `assumptions` | hops marked [假设]. A finding with assumptions **cannot** be counted as reaching the bar until each hop is verified |
+
+The report's header states it and counts: `**达到【终点】: 1/3** 条发现`, plus how many are excluded by
+assumptions and how many have no `impact` at all.
 
 ## The command
 
@@ -135,7 +203,7 @@ A sweep gives a finding three rounds (`pursuitRounds`) and then never returns it
 When that is not enough:
 
 ```text
-/loopsec deep F-0008               # work ONE finding, in .pi-loopsec/deep/F-0008/
+/loopsec deep F-0008               # work ONE finding, in .pi-loopsec/runs/<name>/
 /loopsec deep F-0008 30             # with a round cap
 /loopsec deep F-0008 重点关注绕过     # with the operator's own steer
 /loopsec deep status               # sub-questions, new findings, budget
@@ -195,6 +263,44 @@ To change the defaults for every project at once (this is optional now):
 /loopsec config --global allowCommandProbes=true commandTimeoutMs=300000 maxOutputChars=20000
 ```
 
+### Mutation needs its OWN consent
+
+`allowCommandProbes` says this project may be probed. It does not say a probe may **change** something,
+and the model writing the command cannot tell whether the target holds real data. So commands matching
+`DELETE / DROP / TRUNCATE / UPDATE / INSERT / ALTER / GRANT / rm / rmdir / mv / shutdown / mkfs / dd`
+are refused unless `allowDestructiveProbes=true` (default **false**).
+
+The guard is tuned toward letting the audit READ: a leading read-only tool (`rg`, `grep`, `find`,
+`awk`, `sed`, `cat`, `jq`, …) makes the rest of the line data, not instructions, so
+`rg -n 'DELETE FROM' src/` still runs. It is a guard against a slip, not a sandbox — `find . -delete`
+leads with `find` and gets through.
+
+### Probe output is REDACTED, best-effort
+
+A probe's output routinely carries the target's own credentials. Values after
+`password|passwd|pwd|secret|token|api_key|apikey|access_key|private_key` (= or :),
+`Authorization: Bearer <jwt>` and bare JWTs are replaced with `***` **before anything is stored**; the
+original is never kept. It is called best-effort everywhere, including in the report, because it is: a
+blob with no key in front of it is not caught, and `SecVerification.redacted` records that something
+was replaced so a reader does not assume those are the exact bytes.
+
+### Three verdicts, not two
+
+| verdict | meaning |
+|---|---|
+| `reproduced` | the run matched the expectation stated before it |
+| `disconfirmed` | the run finished and contradicted it |
+| **`inconclusive`** | the run **cannot speak to the finding**: it timed out, it was killed, or a declared precondition did not hold |
+
+`sec_verify` takes `precondition` ("a valid session cookie", "the service is up on 8080") and
+`preconditionHeld`. Declaring one and reporting `false` is how the model says "I could not test it" —
+the alternative was recording "the service was down" as evidence the finding is wrong, and then saying
+a vulnerability does not hold on the strength of a run that never tested it.
+
+The checks run in that order: precondition first (a run without its session says nothing whatever the
+exit code), then "did not finish", then the expectation. The verdict is **recomputed on read** — a log
+that claims `inconclusive` beside an exit code that plainly reproduced is not trusted.
+
 Layers, lowest priority first — a project file still overrides the user one, so a target that must
 not be probed says so locally:
 
@@ -219,11 +325,29 @@ model's opinion of what the output means.
 | `SEC-REPORT.md` | the deliverable, regenerated every round |
 | `SEC-FINDINGS.md` | the per-round journal |
 | `OPERATOR.md` | a mirror of what the operator told the run |
-| `settings.json` | optional; `reportLanguage` (zh default), `fenceLanguage` (`c`), `pursuitRounds`, `reconRounds`, `allowCommandProbes` |
+| `settings.json` | optional; see the table below |
 | `active.json` | `{current, turn}` — which run your commands mean, and which run the in-flight round is working |
 | `runs/<name>/` | one directory per run: its own `tree.jsonl`, `SEC-REPORT.md`, `recon.md`, `settings.json` |
 | `recon.md` | the recon note mirrored for re-reading (or a deep run's seed) |
+| `contract.md` | the acceptance bar injected into every brief — editable per target |
+| `turn.lock/` | one round at a time across PROCESSES (an atomic `mkdir`; `owner.json` names the pid) |
 | `deep/<F-id>/` | a deep run's own `tree.jsonl`, `SEC-REPORT.md`, `recon.md`, `settings.json` |
+
+### Settings that matter
+
+| setting | default | what it changes |
+|---|---|---|
+| `allowCommandProbes` | **true** | may a probe RUN at all (300s / 20k bounds) |
+| `allowDestructiveProbes` | **false** | may a probe MUTATE (DELETE / DROP / rm / …) |
+| `pursuitRounds` | 3 | depth rounds per finding, before `sec_escalate` can add more |
+| `reconRounds` | 2 | recon sections before the surface phase |
+| `coverageEveryRounds` | 5 | how often the project walk runs |
+| `lockTtlMs` | 1800000 | how long a round lock survives a dead process |
+| `commandTimeoutMs` | 300000 | per-probe time budget |
+| `maxOutputChars` | 20000 | per-probe output cap (after redaction) |
+| `maxFilesScanned` | 4000 | the coverage walk budget |
+| `reportLanguage` / `fenceLanguage` | zh / c | the report |
+| `focus` | none | reorders the work list; never filters a finding |
 
 **One ROUND in flight, many runs live.** The eight tools resolve `active.json`'s turn
 claim, so the round being worked determines where its writes go. That is why several runs
@@ -235,6 +359,27 @@ held descriptor. A torn last line is repaired, never silently swallowed.
 A pre-existing sec project whose state still sits in `.pi-hypothesis/` migrates by
 renaming the directory — the log format did not change. A project that ran the old
 hypothesis modes keeps its `.pi-hypothesis/` untouched and unread.
+
+## Performance — what a round costs
+
+Two things dominated a long run and both are bounded now.
+
+**The coverage walk** reads the project tree (up to `maxFilesScanned`, 4000 by default) to find
+directories nothing has cited. Its output goes only into the report — the model never sees it and no
+decision reads it. On a 3000-file project a fresh walk is **~1.2s**; it now runs every
+`coverageEveryRounds` rounds (default **5**) and the report prints which round the figure is from.
+`/loopsec report` always walks: an operator asking for the report wants the number now.
+
+**The log fold** re-read and re-parsed the whole append-only log on every `loadSec` call, and a round
+calls it three to four times. It is memoised on the log's `(size, mtime)` — an append changes the size,
+so the memo cannot serve stale state — measured at **5.8ms → 2.1ms** per load on a 600-event log. Every
+caller gets its own arrays, so one caller's `push` cannot corrupt the cache.
+
+If a run feels slow on a large target, raise `coverageEveryRounds` before anything else:
+
+```text
+/loopsec config coverageEveryRounds=20
+```
 
 ## The report
 
@@ -276,6 +421,17 @@ which subtrees were never touched.
   recorded state; the model's words are quoted verbatim.
 - **Domain knowledge lives in the extension, not a skill file** — the per-class
   ladders are questions, never conclusions.
+- **The plugin SCHEDULES; the model decides.** What the loop controls: which item is next (rank, then
+  `focus`, then `priority`), when depth outranks the plan, when a combine pass is due, the totals
+  (plateau, round cap, +12 escalation). What the model controls: what is worth deepening (`deepen`),
+  what should be looked at first (`priority`), how many rounds a breakthrough needs (`sec_escalate`),
+  and every conclusion. A cap that decides the model's judgement is a bug; a cap that bounds one lead
+  from starving the run is not.
+- **A refusal must never destroy evidence.** A wrong `impact` word, a clearance with no line, a
+  dependency naming a missing item — each of those is a WARNING that keeps the record, not a refusal
+  that drops it. The one hard refusal left is "no artifact": that is what the mode is.
+- **Absence is stated, never implied.** "No gates recorded" is not "no gates needed"; "not measured"
+  is not "fully covered"; "not falsified" is not "correct".
 
 ## Removed: the hypothesis modes
 
