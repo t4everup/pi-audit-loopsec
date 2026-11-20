@@ -1105,6 +1105,11 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
           );
           return;
         }
+      } else if (advanced.skipped) {
+        // NOT AN ENDING. Another process holds the round lock, so this window simply had no turn: say so
+        // once and stop. Treating it as terminal rewrote the whole report and announced "idle" on every
+        // settle of a locked project.
+        ctx.ui.notify(`No round here: ${advanced.idleReason ?? "another process holds the round lock"}`, "info");
       } else if (result.action !== "sent") {
         // A terminal tick produces neither a summary nor a brief, so without
         // this branch the goal ends SILENTLY: the only signal is the widget

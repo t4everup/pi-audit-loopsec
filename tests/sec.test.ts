@@ -40,7 +40,7 @@ import { advanceRuns, endDeepRun, parkOnSendFailure, pickNextRun, startDeepRun }
 import { loadSettings, saveSettings } from "../extensions/loop-sec/settings.ts";
 import { LOOP_VERBS, parseArgs, tailAfterVerb } from "../extensions/loop-sec/args.ts";
 import { noteSecToolCall, secToolCallCount } from "../extensions/loop-sec/activity.ts";
-import { acquireTurnLock, turnLockDir } from "../extensions/loop-sec/lock.ts";
+import { acquireTurnLock, releaseTurnLock, turnLockDir } from "../extensions/loop-sec/lock.ts";
 
 // THE SUITE MUST NOT READ THIS MACHINE'S USER-LEVEL SETTINGS.
 //
@@ -80,6 +80,7 @@ import {
   depthReasons,
   gatesOfFinding,
   deepWrapUp,
+  hasAnswered,
   isBlocked,
   unsatisfiedRequires,
   objectiveHits,
@@ -3911,16 +3912,40 @@ test("a blocked item is NOT dispatched — the prerequisite gets the round first
   assert.equal(nextOpenSurface(loadSec(cwd).snapshot)!.id, "S-0002", "with the prerequisite answered, it is next");
 });
 
-test("a prerequisite that is merely EXAMINED does not unblock — only cleared does", () => {
-  // "examined" includes an item that produced a finding; it has not ANSWERED the question the dependent
-  // one rests on. Using the weaker bar would let a chain advance on an unanswered premise.
+test("a prerequisite that produced a FINDING unblocks — a finding is an answer", () => {
+  // The bug this replaces: the bar was "cleared", and recording a finding sets the item to `examined`.
+  // So the chain deadlocked at the exact moment the prerequisite produced something interesting — the
+  // dependent stayed blocked, and the prerequisite had already left the candidate pool, so nothing could
+  // ever unblock it. Found by audit, after the first version shipped.
   const cwd = seeded();
   startSec(cwd, "x", 99, 1);
   submitSecRecon(cwd, NOTE);
   recordSurface(cwd, { title: "A", kind: "sink", file: "a.py", line: 1 });
   recordSurface(cwd, { title: "B", kind: "sink", file: "b.py", line: 2, requires: ["S-0001"] });
-  updateSurface(cwd, "S-0001", { status: "examined" });
-  assert.equal(isBlocked(loadSec(cwd).snapshot, loadSec(cwd).snapshot.surfaces[1]!), true, "examined is not answered");
+  assert.equal(isBlocked(loadSec(cwd).snapshot, loadSec(cwd).snapshot.surfaces[1]!), true, "open is not answered");
+
+  recordFinding(cwd, {
+    title: "A 里有个注入", category: "sqli", severity: "high", file: "a.py", line: 1, evidence: "q", surfaceId: "S-0001",
+  });
+  assert.equal(loadSec(cwd).snapshot.surfaces[0]!.status, "examined", "recording a finding marks it examined, never cleared");
+  assert.equal(
+    isBlocked(loadSec(cwd).snapshot, loadSec(cwd).snapshot.surfaces[1]!),
+    false,
+    "the dependent is unblocked — the question WAS answered, just not with a clearance",
+  );
+  assert.equal(hasAnswered(loadSec(cwd).snapshot.surfaces[0]!), true);
+});
+
+test("an item still being WORKED does not unblock its dependents", () => {
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 1);
+  submitSecRecon(cwd, NOTE);
+  recordSurface(cwd, { title: "A", kind: "sink", file: "a.py", line: 1 });
+  recordSurface(cwd, { title: "B", kind: "sink", file: "b.py", line: 2, requires: ["S-0001"] });
+  assert.equal(isBlocked(loadSec(cwd).snapshot, loadSec(cwd).snapshot.surfaces[1]!), true, "open");
+  digSurface(cwd, "S-0001");
+  assert.equal(loadSec(cwd).snapshot.surfaces[0]!.status, "digging");
+  assert.equal(isBlocked(loadSec(cwd).snapshot, loadSec(cwd).snapshot.surfaces[1]!), true, "still being worked is not an answer");
 });
 
 test("reopening the prerequisite RE-BLOCKS the dependent", () => {
@@ -4056,19 +4081,22 @@ test("a second window cannot take a round while the first holds the lock", () =>
   // The failure this exists to stop: two windows on one project, both writing the single turn claim, so
   // the loser's tool calls resolve to the winner's run and its finding lands in another audit's log.
   const cwd = seeded();
-  const first = acquireTurnLock(cwd, { ttlMs: 600_000 });
+  // A different pid is what "another window" means: re-entrancy within one process is by design, since
+  // the lock's lifetime is the round and the settle re-enters it.
+  const other = 999_999;
+  const first = acquireTurnLock(cwd, { ttlMs: 600_000, pid: other });
   assert.equal(first.ok, true);
   const second = acquireTurnLock(cwd, { ttlMs: 600_000 });
   assert.equal(second.ok, false, "the second window must not work a round");
   assert.match(second.ok ? "" : second.reason, /another process is working a round/);
-  assert.match(second.ok ? "" : second.reason, new RegExp(`pid ${process.pid}`), "and it names the holder");
+  assert.match(second.ok ? "" : second.reason, new RegExp(`pid ${other}`), "and it names the holder");
   if (first.ok) first.release();
 });
 
 test("advanceRuns SKIPS when another process holds the lock, and says so", () => {
   const cwd = seeded();
   runIn(cwd, "挖掘认证前rce");
-  const held = acquireTurnLock(cwd, { ttlMs: 600_000 });
+  const held = acquireTurnLock(cwd, { ttlMs: 600_000, pid: 999_999 });
   assert.equal(held.ok, true);
   const before = loadSec(cwd).snapshot.loop?.round;
 
@@ -4285,4 +4313,39 @@ test("a finding with no location gets no neighbours rather than a wrong guess", 
   const f = recordFinding(cwd, { title: "无位置的断言", category: "other", severity: "low", evidence: "一段摘录" });
   assert.equal(f.ok, true);
   assert.deepEqual(sameFileNeighbours(loadSec(cwd).snapshot, f.ok ? f.value : ({} as never)), { findings: [], cleared: [] });
+});
+
+test("the lock is held for the DURATION of the round, not just the dispatch", () => {
+  // The hole this closes: releasing at the moment the brief is sent meant a second window could acquire
+  // the lock, see the first window's turn claim, SETTLE that round and dispatch its own — two turns in
+  // flight in two processes.
+  const cwd = seeded();
+  runIn(cwd, "挖掘认证前rce");
+  const first = advanceRuns(cwd);
+  assert.ok(first.sent, "a round was dispatched");
+
+  const otherDuring = acquireTurnLock(cwd, { ttlMs: 600_000, pid: 999_999 });
+  assert.equal(otherDuring.ok, false, "another window cannot take it while the round is in flight");
+  assert.match(otherDuring.ok ? "" : otherDuring.reason, /another process/);
+
+  // Pause, then settle: the round ends and NOTHING is dispatched, so the lock is released.
+  pauseLoop(cwd, loadSec(cwd).snapshot, "test");
+  advanceRuns(cwd);
+  const otherAfter = acquireTurnLock(cwd, { ttlMs: 600_000, pid: 999_999 });
+  assert.equal(otherAfter.ok, true, "once the round is over the lock is free");
+  if (otherAfter.ok) otherAfter.release();
+});
+
+test("the same process may re-enter its own lock — the settle has to", () => {
+  const cwd = seeded();
+  runIn(cwd, "挖掘认证前rce");
+  const mine = acquireTurnLock(cwd, { ttlMs: 600_000 });
+  assert.equal(mine.ok, true);
+  // Re-entrancy is by pid: without it a settle would be refused by the lock its own dispatch took.
+  const again = acquireTurnLock(cwd, { ttlMs: 600_000 });
+  assert.equal(again.ok, true);
+  assert.equal(again.ok && again.reentrant, true, "marked re-entrant, so the caller knows not to release twice");
+  releaseTurnLock(cwd);
+  assert.equal(fs.existsSync(turnLockDir(cwd)), false);
+  if (mine.ok) mine.release();
 });

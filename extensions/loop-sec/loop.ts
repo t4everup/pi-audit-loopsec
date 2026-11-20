@@ -128,7 +128,7 @@ function appendLoopEvent(projectRoot: string, kind: AuditLoopKind, event: TreeEv
 import { markNotesDelivered, pendingNotes, renderNotesSection, renderNotesStatus, writeOperatorMirror } from "./notes.js";
 import { loadSettings, lockTtlMsOf, reportLanguageOf } from "./settings.js";
 import { secToolCallCount } from "./activity.js";
-import { DEFAULT_LOCK_TTL_MS, acquireTurnLock } from "./lock.js";
+import { acquireTurnLock, releaseTurnLock } from "./lock.js";
 import {
   SEC_DIG_BUDGET,
   appendSecLedger,
@@ -816,6 +816,15 @@ export interface AdvanceResult {
   sent?: { run: string; dir: string; round: number; brief?: string; summary?: string[] };
   /** Why nothing was sent: every run paused, stopped, at its cap, or a claim that would not write. */
   idleReason?: string;
+  /**
+   * Nothing was sent because ANOTHER PROCESS holds the round lock.
+   *
+   * Separate from `idleReason` because the driver treats "nothing sent" as a TERMINAL tick — it writes
+   * the report and announces the run ended. A skip is not an ending: the other window is working, this
+   * one simply has no turn. Without this flag every settle on a locked project rewrote the report and
+   * reported the run as idle.
+   */
+  skipped?: boolean;
 }
 
 /**
@@ -837,11 +846,21 @@ export function advanceRuns(projectRoot: string, opts: { at?: string; dryRun?: b
   // The TTL comes from settings so an operator can shorten it; a released lock is removed in a `finally`
   // so an exception cannot leave the project wedged.
   const lock = acquireTurnLock(projectRoot, { ttlMs: lockTtlMsOf(projectRoot) });
-  if (!lock.ok) return { idleReason: lock.reason };
+  if (!lock.ok) return { idleReason: lock.reason, skipped: true };
+  let keep = false;
   try {
-    return advanceRunsLocked(projectRoot, opts);
+    const result = advanceRunsLocked(projectRoot, opts);
+    // THE LOCK'S LIFETIME IS THE ROUND, NOT THE CALL.
+    //
+    // Releasing it as soon as the brief is sent left the hole this closes: window A dispatches round 1 and
+    // drops the lock; window B's next settle acquires it, sees A's turn claim, SETTLES A's round and
+    // dispatches B's — two turns in flight in two processes, both writing one claim, which is the
+    // misattribution the lock exists to prevent. So the lock is kept while a round is in flight and
+    // dropped when the round is over (settled, or nothing dispatched).
+    keep = !!result.sent;
+    return result;
   } finally {
-    lock.release();
+    if (!keep) releaseTurnLock(projectRoot);
   }
 }
 
@@ -1732,7 +1751,12 @@ export function tickLoop(projectRoot: string, snapshot: TreeSnapshot, opts: Tick
         ...current,
         awaitingRound: null,
         silentStreak,
-        stallRounds: counts ? current.stallRounds + 1 : 0,
+        // THREE CASES, not two. `produced` resets the counter; a COUNTING empty round advances it; and
+        // an EXEMPT silent round leaves it exactly where it was. Writing `counts ? +1 : 0` collapsed the
+        // last two, so one interrupted turn erased a run's accumulated stalls — five empty rounds then
+        // an interruption put the counter back to zero, and the plateau took five rounds longer to fire
+        // every time.
+        stallRounds: previous.produced ? 0 : counts ? current.stallRounds + 1 : current.stallRounds,
       };
     } else {
       // The record is missing (a torn write, or a wipe). Clearing the fence is

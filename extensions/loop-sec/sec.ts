@@ -937,7 +937,27 @@ export function unsatisfiedRequires(snapshot: TreeSnapshot, item: SecSurface): s
   const req = item.requires ?? [];
   if (req.length === 0) return [];
   const byId = new Map(snapshot.surfaces.map((s) => [s.id, s]));
-  return req.filter((id) => byId.get(id)?.status !== "cleared");
+  return req.filter((id) => {
+    const dep = byId.get(id);
+    if (!dep) return true; // the answer it was supposed to give is not in the record
+    return !hasAnswered(dep);
+  });
+}
+
+/**
+ * Has this item ANSWERED the question a dependent one rests on?
+ *
+ * NOT "is it cleared". The commonest outcome of analysing an item is a FINDING, and recording one sets
+ * the item to `examined` — never `cleared`. Requiring `cleared` therefore deadlocked the chain at the
+ * exact moment the prerequisite produced something interesting: the dependent stayed blocked, and the
+ * prerequisite had left the candidate pool, so nothing could ever unblock it. Measured by audit.
+ *
+ * The bar is "it is no longer being worked": `cleared` (a negative answer), or `examined` (a finding, or
+ * an explicit conclusion recorded by the operator). Both are conclusions with an artifact; `open` and
+ * `digging` are not.
+ */
+export function hasAnswered(item: SecSurface): boolean {
+  return item.status === "cleared" || item.status === "examined";
 }
 
 /**

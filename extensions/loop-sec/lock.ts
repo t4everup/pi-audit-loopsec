@@ -37,8 +37,32 @@ export interface LockOwner {
 }
 
 export type LockResult =
-  | { ok: true; release: () => void; tookOver?: LockOwner }
+  | { ok: true; release: () => void; reentrant?: boolean }
   | { ok: false; reason: string; holder?: LockOwner };
+
+/**
+ * Remove the lock IF THIS PROCESS OWNS IT.
+ *
+ * Separate from the `release` closure because the lock now outlives the call that took it: `advanceRuns`
+ * keeps it while a round is in flight (that is what stops a second window from settling somebody else's
+ * round) and drops it when the round is over. A handle that only lives as long as one call cannot express
+ * that, and a blind remove would delete another process's lock.
+ */
+export function releaseTurnLock(projectRoot: string): void {
+  const dir = turnLockDir(projectRoot);
+  const holder = readOwner(dir);
+  if (!holder) {
+    // Unreadable owner: only remove when the directory is ours by mtime-freshness is NOT knowable, so
+    // leave it — the TTL will clear it rather than risk deleting a live lock.
+    return;
+  }
+  if (holder.pid !== process.pid) return;
+  try {
+    fs.rmSync(dir, { recursive: true, force: true });
+  } catch {
+    /* the TTL will clear it */
+  }
+}
 
 export function turnLockDir(projectRoot: string): string {
   return path.join(secBaseDir(projectRoot), TURN_LOCK_NAME);
@@ -83,13 +107,16 @@ function ageOfMs(dir: string, now: number): number {
  */
 export function acquireTurnLock(
   projectRoot: string,
-  opts: { ttlMs?: number; at?: number; run?: string; round?: number } = {},
+  opts: { ttlMs?: number; at?: number; run?: string; round?: number; pid?: number } = {},
 ): LockResult {
   const dir = turnLockDir(projectRoot);
   const now = opts.at ?? Date.now();
   const ttl = opts.ttlMs ?? DEFAULT_LOCK_TTL_MS;
+  // `pid` is a TEST seam: re-entrancy is decided by pid, so a test that wants to represent a SECOND
+  // window has to present a different one. In production it is always this process.
+  const self = opts.pid ?? process.pid;
   const me: LockOwner = {
-    pid: process.pid,
+    pid: self,
     at: new Date(now).toISOString(),
     ...(opts.run ? { run: opts.run } : {}),
     ...(typeof opts.round === "number" ? { round: opts.round } : {}),
@@ -122,8 +149,16 @@ export function acquireTurnLock(
     if (code !== "EEXIST") {
       return { ok: false, reason: `could not create ${TURN_LOCK_NAME}: ${(error as Error).message}` };
     }
-    // Held. Take it over only if the owner is stale.
+    // Held — by ANOTHER PROCESS, or by US.
+    //
+    // The lock's lifetime is the ROUND, not the call: it is taken when a brief is sent and released when
+    // that round is settled. So the same process must be able to re-enter it on the settle, or the settle
+    // would be refused by its own lock. Re-entrancy is by pid, which is the only identity a second call
+    // in this process has.
     const holder = readOwner(dir);
+    if (holder && holder.pid === self) {
+      return { ok: true, release: () => {}, reentrant: true };
+    }
     const age = ageOfMs(dir, now);
     if (age <= ttl) {
       return {
