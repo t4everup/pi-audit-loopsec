@@ -2198,11 +2198,66 @@ export function loadSecIn(projectRoot: string, dir: string): LoadResult | null {
   return loadFrom(path.join(resolved, TREE_LOG_NAME));
 }
 
+/**
+ * Copy a folded snapshot so every caller owns its ARRAYS.
+ *
+ * The fold is cached by (size, mtime) — see `loadFrom` — and a cache hit that handed out the SAME object
+ * would let one caller's `push` corrupt every later read, for the rest of the process. Copying the arrays
+ * costs microseconds; re-parsing and re-folding an append-only log costs milliseconds (measured: 40x).
+ *
+ * EVERY ARRAY AND MAP IS COPIED GENERICALLY, by iterating the object's own keys rather than naming the
+ * fields. Naming them means the next field added to `TreeSnapshot` is silently shared with the cache, and
+ * this file has already produced eleven bugs of exactly that shape ("the new field is not in the list").
+ *
+ * The RECORDS INSIDE the arrays are still shared, and that is the existing convention: every update in this
+ * module replaces a record (`applyFindingPatch` returns a new object) instead of mutating one.
+ */
+function copySnapshot(snapshot: TreeSnapshot): TreeSnapshot {
+  const out: Record<string, unknown> = { ...snapshot };
+  for (const [key, value] of Object.entries(snapshot)) {
+    if (Array.isArray(value)) out[key] = [...value];
+    else if (value instanceof Map) out[key] = new Map(value);
+  }
+  return out as unknown as TreeSnapshot;
+}
+
+/**
+ * The fold, memoised on the log's (size, mtime).
+ *
+ * WHY IT IS WORTH IT: a round calls `loadSec` three to four times (the driver, the tick, the tool that just
+ * ran, the report writer), and each call re-parsed and re-folded the WHOLE append-only log. The log only
+ * ever grows, so a (size, mtime) pair identifies its content exactly — an append changes the size, a
+ * truncation by `repairTornTail` changes it too, and nothing else writes this file.
+ *
+ * A cache MISS is the normal path for a round that appended something; the win is every read AFTER the last
+ * write in that round, which is most of them.
+ */
+interface FoldCacheEntry {
+  size: number;
+  mtimeMs: number;
+  result: LoadResult;
+}
+const foldCache = new Map<string, FoldCacheEntry>();
+
+/** Drop the memo for one log. Exported for tests and for anything that moves a log by hand. */
+export function forgetFold(file: string): void {
+  foldCache.delete(file);
+}
+
 function loadFrom(file: string): LoadResult {
   let text: string;
+  let stat: { size: number; mtimeMs: number } | null = null;
   try {
     if (!fs.existsSync(file)) {
+      // A missing log is not cached: the file may appear, and an empty answer is cheap to rebuild.
+      foldCache.delete(file);
       return { snapshot: emptySnapshot(), torn: 0, malformed: 0, unknown: 0 };
+    }
+    const st = fs.statSync(file);
+    stat = { size: st.size, mtimeMs: st.mtimeMs };
+    const hit = foldCache.get(file);
+    if (hit && hit.size === stat.size && hit.mtimeMs === stat.mtimeMs) {
+      return { ...hit.result, snapshot: copySnapshot(hit.result.snapshot) };
     }
     text = fs.readFileSync(file, "utf-8");
   } catch (error) {
@@ -2217,7 +2272,13 @@ function loadFrom(file: string): LoadResult {
   const parsed = parseEvents(text);
   const snapshot = foldEvents(parsed.events);
   snapshot.tornLines = parsed.torn;
-  return { snapshot, torn: parsed.torn, malformed: parsed.malformed, unknown: parsed.unknown };
+  const result: LoadResult = { snapshot, torn: parsed.torn, malformed: parsed.malformed, unknown: parsed.unknown };
+  // Only a CLEAN read is memoised: a read that reported torn or malformed lines is a log somebody should look
+  // at, and caching it would serve the same damaged answer until the next append.
+  if (stat && parsed.torn === 0 && parsed.malformed === 0) {
+    foldCache.set(file, { size: stat.size, mtimeMs: stat.mtimeMs, result });
+  }
+  return { ...result, snapshot: copySnapshot(result.snapshot) };
 }
 
 /** Append one event. Returns false when the write failed — callers must

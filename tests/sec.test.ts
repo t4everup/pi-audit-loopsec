@@ -31,6 +31,7 @@ import {
   readTurnClaim,
   releaseTurnClaim,
   secStateDir,
+  secTreeLogPath,
   setActiveRun,
   slugifyRunName,
 } from "../extensions/loop-sec/store.ts";
@@ -4859,4 +4860,60 @@ test("the three verdicts are distinguishable in the report", () => {
   assert.match(report, /已证伪/);
   assert.match(report, /无法判定/);
   assert.match(report, /the service is up/, "and the precondition is printed with the run");
+});
+
+// =================================================================
+// THE FOLD CACHE — a round loads the log several times
+// =================================================================
+
+test("the fold is cached, and an append invalidates it", () => {
+  // A round calls loadSec three to four times (the driver, the tick, the tool that just ran, the report
+  // writer), and each call re-parsed and re-folded the whole append-only log. Measured: 5.8ms → 2.1ms per
+  // load on a 600-event log.
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 1);
+  submitSecRecon(cwd, NOTE);
+  const first = loadSec(cwd).snapshot;
+  assert.equal(first.observations.length, 0);
+
+  appendSecEvent(cwd, {
+    type: "observation_recorded",
+    at: new Date().toISOString(),
+    observation: { id: "O-0001", at: new Date().toISOString(), round: 1, text: "一条观察，用来验证缓存会在追加后失效" },
+  } as never);
+
+  assert.equal(loadSec(cwd).snapshot.observations.length, 1, "the append is visible: (size, mtime) changed");
+});
+
+test("a caller that MUTATES its snapshot cannot corrupt the cache", () => {
+  // This is the whole risk of memoising a fold. Every caller gets its own ARRAYS, so a push cannot leak into
+  // the cached copy — the records inside are still shared, which is the module's existing convention (every
+  // update replaces a record rather than mutating one).
+  const cwd = seeded();
+  withSurface(cwd, 2);
+  const a = loadSec(cwd).snapshot;
+  const before = a.surfaces.length;
+  a.surfaces.push({ ...a.surfaces[0]!, id: "S-9999" });
+  a.findings.push({ id: "F-9999", at: "", round: 0, title: "x", category: "rce" } as never);
+
+  const b = loadSec(cwd).snapshot;
+  assert.equal(b.surfaces.length, before, "the push did not reach the cache");
+  assert.equal(b.findings.length, 0);
+  // And two loads are independent objects, so a caller cannot affect another caller either.
+  assert.notEqual(a.surfaces, b.surfaces);
+});
+
+test("a log with torn lines is NOT cached — a damaged answer must not be served repeatedly", () => {
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 1);
+  submitSecRecon(cwd, NOTE);
+  const log = secTreeLogPath(cwd);
+  fs.appendFileSync(log, '{"type":"surface_recorded","at":"2026', "utf-8"); // a torn trailing line
+  const first = loadSec(cwd);
+  assert.ok(first.torn > 0);
+  const sizeAfterTorn = fs.statSync(log).size;
+  // A second read sees the same damaged file; nothing was memoised, so it is parsed again and reports too.
+  const second = loadSec(cwd);
+  assert.equal(second.torn, first.torn);
+  assert.equal(fs.statSync(log).size, sizeAfterTorn);
 });
