@@ -1426,7 +1426,9 @@ export type RoundKind =
   /** `/loopSEC`: enumerate the attack surface into a work list. */
   | "surface"
   /** `/loopSEC`: work ONE item on that list, all the way down. */
-  | "analyze";
+  | "analyze"
+  /** `/loopSEC`: spend one round asking whether two recorded findings form a chain. */
+  | "combine";
 
 export const ROUND_KINDS: readonly RoundKind[] = [
   "recon",
@@ -1439,6 +1441,7 @@ export const ROUND_KINDS: readonly RoundKind[] = [
   "dig",
   "surface",
   "analyze",
+  "combine",
 ];
 
 export interface RoundRecord {

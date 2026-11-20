@@ -80,6 +80,7 @@ import {
   SEC_IMPLICIT_AUTH_GATE,
   depthReasons,
   gatesOfFinding,
+  COMBINE_COOLDOWN,
   deepWrapUp,
   escalateItem,
   hasAnswered,
@@ -1646,7 +1647,10 @@ test("the sec loop is not refused for having no tree, but /loop still is", () =>
 // is the MODEL's rate rather than the loop's structure — so what is pinned here is
 // that the loop keeps making progress and does not thrash, not a particular share.
 
-test("a long run never re-enumerates a place it already has", () => {
+// SLOW BY CONSTRUCTION: every tick walks the project for the coverage section of the report. It is a
+// real cost (see STABILITY.md 3.6) and this is the test that measures it, so the timeout is raised here
+// rather than the assertion weakened.
+test("a long run never re-enumerates a place it already has", { timeout: 60_000 }, () => {
   const cwd = seeded();
   startSec(cwd, "挖掘认证前rce漏洞", 8);
   submitSecRecon(cwd, NOTE);
@@ -1815,7 +1819,10 @@ test("FOUND SO FAR marks which findings are already chains", () => {
   recordFinding(cwd, { title: "a", category: "rce", file: "src/a.c", line: 1 });
   recordFinding(cwd, { title: "b", category: "rce", file: "src/b.c", line: 1 });
   recordFinding(cwd, { title: "the two together reach root", category: "rce", chainOf: ["F-0001", "F-0002"] });
-  const brief = tickLoop(cwd, loadSec(cwd).snapshot).brief!;
+  // Render the ANALYZE brief directly: with three findings the scheduler may spend the next round on
+  // COMBINE instead, and this test is about how the analyze brief marks a chain.
+  const s = loadSec(cwd).snapshot;
+  const brief = renderSecAnalyzeBrief(s, "x", 2, s.surfaces[0]!);
   assert.match(brief, /⛓ combines F-0001 \+ F-0002/);
   assert.match(brief, /CHAINS ALREADY RECORDED \(1\)/);
 });
@@ -2592,7 +2599,7 @@ test("attempts survives the store round trip", () => {
 // The three guards that keep the new machinery honest
 // -----------------------------------------------------------------
 
-test("the depth reflex has a GLOBAL bound: three in a row, then the sweep goes first", () => {
+test("the depth reflex has a GLOBAL bound: three in a row, then breadth goes first", () => {
   // The per-finding budget bounds ONE finding; nothing bounded the run. Ten high findings with
   // `deepen` gave thirty depth rounds and no preference for the work list — and the plateau could not
   // stop it, because a depth round that produces anything resets the stall counter.
@@ -2603,7 +2610,6 @@ test("the depth reflex has a GLOBAL bound: three in a row, then the sweep goes f
   for (let i = 0; i < 8; i++) {
     recordSurface(cwd, { title: `S${i}`, kind: "sink", file: `s${i}.py`, line: i + 1 });
   }
-  // Five findings that all want depth, each with a budget of nine rounds.
   for (let i = 0; i < 5; i++) {
     recordFinding(cwd, {
       title: `deep ${i}`, category: "rce", severity: "high", file: `f${i}.py`, line: i + 1, evidence: "e", deepen: true,
@@ -2615,8 +2621,15 @@ test("the depth reflex has a GLOBAL bound: three in a row, then the sweep goes f
     tickLoop(cwd, loadSec(cwd).snapshot);
     kinds.push(loadSec(cwd).snapshot.roundRecords.at(-1)!.kind);
   }
-  // Three depth rounds, then an analyze round — the sweep is not starved.
-  assert.deepEqual(kinds.slice(0, 4), ["pursue", "pursue", "pursue", "analyze"], `got ${kinds.join(",")}`);
+  // Three depth rounds, then the sweep: the 4th slot is NOT another pursue. It may be a COMBINE pass
+  // (which is breadth work: comparing what is already recorded) or an analyze — what it may not be is
+  // a fourth consecutive depth round.
+  assert.deepEqual(kinds.slice(0, 3), ["pursue", "pursue", "pursue"], `got ${kinds.join(",")}`);
+  assert.notEqual(kinds[3], "pursue", `the 4th round must not be depth: ${kinds.join(",")}`);
+  assert.ok(
+    kinds.slice(3).some((k) => k === "analyze" || k === "combine" || k === "surface"),
+    `breadth was served: ${kinds.join(",")}`,
+  );
 });
 
 test("the ratio cap holds the reflex even when no run of three happened", () => {
@@ -4565,4 +4578,93 @@ test("without a grant the ratio still bites — breadth is still protected", () 
   }
   assert.equal(depthAllowed(loadSec(cwd).snapshot), false, "three in a row still blocks");
   assert.equal(depthAllowed(loadSec(cwd).snapshot, false), false, "and no grant means no exemption");
+});
+
+// =================================================================
+// THE COMBINE ROUND — a slot for what two findings reach together
+// =================================================================
+
+test("the combine round is SCHEDULED, with the full findings list and what each offers", () => {
+  // Before this the combination question was a paragraph in a brief whose slot was already spent on the
+  // item the loop handed over — the model had to notice the pair in its spare attention.
+  const cwd = seeded();
+  startSec(cwd, "挖掘认证前rce", 99, 1);
+  // Probes off: an unproven HIGH finding is a PURSUIT target, and pursuit outranks combine by design
+  // (finishing a gate you are inside beats looking for a pair). This test is about the combine slot.
+  saveSettings(cwd, { allowCommandProbes: false });
+  submitSecRecon(cwd, NOTE);
+  recordSurface(cwd, { title: "S1", kind: "sink", file: "s.py", line: 1 });
+  recordFinding(cwd, {
+    title: "任意文件写", category: "arbitrary-file-write", severity: "medium", file: "src/cfg/parse.c", line: 12, evidence: "w",
+  });
+  recordFinding(cwd, {
+    title: "配置被解析时执行", category: "rce", severity: "high", file: "src/cfg/loader.c", line: 40, evidence: "exec(x)",
+  });
+
+  const ticked = tickLoop(cwd, loadSec(cwd).snapshot);
+  assert.equal(loadSec(cwd).snapshot.roundRecords.at(-1)!.kind, "combine", "the round is a COMBINE pass");
+  assert.match(ticked.brief!, /SEC ROUND \d+ — COMBINE/);
+  assert.match(ticked.brief!, /并列不算一条链/, "the contract clause, verbatim");
+  assert.match(ticked.brief!, /能提供：写文件（路径可控）/, "what one finding OFFERS");
+  assert.match(ticked.brief!, /能提供：执行代码/, "and what the other offers — the comparison the round is for");
+  assert.match(ticked.brief!, /chainOf=\[/, "and the exact call to record the chain");
+});
+
+test("the combine round does not run every round — a cooldown keeps the plan moving", () => {
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 1);
+  saveSettings(cwd, { allowCommandProbes: false });
+  submitSecRecon(cwd, NOTE);
+  for (let i = 0; i < 6; i++) recordSurface(cwd, { title: `S${i}`, kind: "sink", file: `s${i}.py`, line: i + 1 });
+  recordFinding(cwd, { title: "a", category: "ssrf", severity: "high", file: "a.py", line: 1, evidence: "e" });
+  recordFinding(cwd, { title: "b", category: "path-traversal", severity: "high", file: "b.py", line: 2, evidence: "e" });
+
+  const kinds: string[] = [];
+  for (let i = 0; i < 14; i++) {
+    tickLoop(cwd, loadSec(cwd).snapshot);
+    noteSecToolCall();
+    kinds.push(loadSec(cwd).snapshot.roundRecords.at(-1)!.kind);
+  }
+  const combines = kinds.filter((k) => k === "combine").length;
+  assert.ok(combines >= 1, `it does run: ${kinds.join(",")}`);
+  assert.ok(combines <= Math.ceil(14 / COMBINE_COOLDOWN) + 1, `but not every round: ${kinds.join(",")}`);
+  assert.ok(kinds.includes("surface") || kinds.includes("analyze"), `the plan still moves: ${kinds.join(",")}`);
+});
+
+test("a combine round that records a chain is productive; one that records nothing is not", () => {
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 1);
+  saveSettings(cwd, { allowCommandProbes: false });
+  submitSecRecon(cwd, NOTE);
+  recordSurface(cwd, { title: "S1", kind: "sink", file: "s.py", line: 1 });
+  recordFinding(cwd, { title: "a", category: "ssrf", severity: "high", file: "a.py", line: 1, evidence: "e" });
+  recordFinding(cwd, { title: "b", category: "path-traversal", severity: "high", file: "b.py", line: 2, evidence: "e" });
+
+  // An empty combine pass: it asked the question and wrote nothing, so it counts against the plateau.
+  tickLoop(cwd, loadSec(cwd).snapshot); // dispatches the combine round
+  modelActed();
+  tickLoop(cwd, loadSec(cwd).snapshot); // settles it, empty
+  const rec = loadSec(cwd).snapshot.roundRecords.find((r) => r.kind === "combine")!;
+  const empty = evaluateRound(loadSec(cwd).snapshot, rec, false);
+  assert.equal(empty.produced, false, "asked and wrote nothing");
+
+  // A combine pass that records a conclusion IS a result — even when it concludes "no pair".
+  const cwd2 = seeded();
+  startSec(cwd2, "x", 99, 1);
+  saveSettings(cwd2, { allowCommandProbes: false });
+  submitSecRecon(cwd2, NOTE);
+  recordSurface(cwd2, { title: "S1", kind: "sink", file: "s.py", line: 1 });
+  recordFinding(cwd2, { title: "a", category: "ssrf", severity: "high", file: "a.py", line: 1, evidence: "e" });
+  recordFinding(cwd2, { title: "b", category: "path-traversal", severity: "high", file: "b.py", line: 2, evidence: "e" });
+  tickLoop(cwd2, loadSec(cwd2).snapshot);
+  modelActed();
+  recordObservation(cwd2, {
+    text: "看过 F-0001 和 F-0002：SSRF 只能出网，读文件那条在另一个进程里，两者驱动不了彼此",
+    location: { file: "a.py", line: 1 },
+  });
+  tickLoop(cwd2, loadSec(cwd2).snapshot);
+  const rec2 = loadSec(cwd2).snapshot.roundRecords.find((r) => r.kind === "combine")!;
+  const concluded = evaluateRound(loadSec(cwd2).snapshot, rec2, false);
+  assert.equal(concluded.produced, true, "the negative conclusion is written down, so the round is not wasted");
+  assert.match(concluded.detail, /conclusion/);
 });

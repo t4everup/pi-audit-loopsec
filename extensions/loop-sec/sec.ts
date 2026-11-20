@@ -1118,6 +1118,156 @@ export function wouldCycle(snapshot: TreeSnapshot, id: string, requires: readonl
 }
 
 // -----------------------------------------------------------------
+// THE COMBINE ROUND — spending a round on what two findings reach together
+// -----------------------------------------------------------------
+//
+// The contract tells every brief that "各自独立成立的漏洞并列不算一条链" and that a chain's hops must be
+// driven by each other. That is a RULE, not a slot: the model reads it, then spends the round on the item
+// the loop handed over, and the combination question is whatever it has time left for. The three most
+// expensive chains in a real audit — SSRF + an internal admin panel, upload + traversal + a parser, an
+// auth bypass in one file + a sink in another — each need a round whose ONLY job is to see the pair.
+//
+// So one round is allocated to it, with three things the analyze brief cannot give:
+//   * the FULL findings list (that brief truncates at 30, which is exactly the field a chain hides in);
+//   * what each finding OFFERS, derived mechanically from its class — a reader comparing ten one-line
+//     titles will not notice that one gives a file write and another executes a file;
+//   * the contract's clause, verbatim, because "parallel bugs are not a chain" is the part that is easy
+//     to launder.
+
+/** How many rounds must pass before another combine round. A pass that runs every round stops the audit. */
+export const COMBINE_COOLDOWN = 6;
+
+/** The fewest findings a combine round can be worth starting with — one finding has nothing to pair with. */
+export const COMBINE_MIN_FINDINGS = 2;
+
+/**
+ * Is a combine round due?
+ *
+ * Deliberately cheap and mechanical: enough findings to pair, and no combine round recently. It does NOT
+ * try to guess whether a pair exists — that is the round's question, and a heuristic that answered it
+ * would be a worse answer.
+ */
+export function shouldCombine(snapshot: TreeSnapshot): boolean {
+  if (snapshot.findings.length < COMBINE_MIN_FINDINGS) return false;
+  // `snapshot.roundRecords` rather than `currentRunRounds` (which lives in loop.ts and would make this
+  // module import its own caller). The window is the run's own records either way.
+  const rounds = snapshot.roundRecords;
+  for (let i = rounds.length - 1, back = 0; i >= 0 && back < COMBINE_COOLDOWN; i--, back++) {
+    if (rounds[i]!.kind === "combine") return false;
+  }
+  return true;
+}
+
+/**
+ * What this finding OFFERS a chain, derived mechanically from its class.
+ *
+ * Not an assessment — a restatement of the category in the terms a chain is built from: a value, a write,
+ * a position, a credential, an execution. It exists so ten findings can be compared as PARTS rather than
+ * as titles, which is the comparison the round is for.
+ */
+export function capabilityOf(f: { category: string; impact?: string }): string {
+  const impact = f.impact ?? "";
+  if (impact.startsWith("rce")) return "执行（任意命令）—— 终点，不是中间能力";
+  if (impact === "file-write") return "写文件";
+  if (impact === "file-read") return "读文件";
+  if (impact === "auth-bypass") return "跨过认证（拿到一个位置）";
+  if (impact === "db-superuser") return "数据库高权限";
+  if (impact === "blind-injection") return "只能盲注 —— 契约不算终点";
+  if (impact === "info-disclosure") return "泄露信息";
+  switch (f.category) {
+    case "path-traversal":
+    case "arbitrary-file-read":
+      return "读文件（路径可控）";
+    case "arbitrary-file-write":
+      return "写文件（路径可控）";
+    case "file-upload":
+      return "在服务器上落一个文件";
+    case "ssrf":
+      return "服务器替你去访问（出网 / 触内网）";
+    case "sqli":
+    case "nosqli":
+      return "读/改数据库";
+    case "command-injection":
+    case "ssti":
+    case "deserialization":
+    case "rce":
+      return "执行代码 —— 终点，不是中间能力";
+    case "auth-bypass":
+    case "privilege-escalation":
+    case "idor":
+      return "跨过一道访问控制";
+    case "hardcoded-secret":
+      return "一个凭据";
+    case "xxe":
+      return "读文件 / 出网（解析器代劳）";
+    case "open-redirect":
+      return "把请求引到别处";
+    case "info-disclosure":
+      return "泄露信息（路径、版本、密钥）";
+    case "misconfiguration":
+      return "一个可直接利用的配置";
+    default:
+      return "（未归类的原始能力）";
+  }
+}
+
+/**
+ * The COMBINE round's brief.
+ *
+ * The findings are printed in full — no cap — because the pair is what this round is for, and a truncated
+ * field is where the pair hides. That is the one place in this mode where an uncapped list is right.
+ */
+export function renderSecCombineBrief(snapshot: TreeSnapshot, objective: string, round: number): string {
+  const lines: string[] = [];
+  lines.push(`[SEC ROUND ${round} — COMBINE]`);
+  lines.push("");
+  lines.push(`Objective: ${objective}`);
+  lines.push("");
+  lines.push("这一轮**不分析新地方**。这一轮只做一件事：看已记录的东西能不能拼起来。");
+  lines.push("");
+  lines.push("--- 验收标准里的【组合】（原文）---");
+  lines.push(
+    "链的每一跳必须由**上一跳的产物驱动**（A 写 → B 读 → B 的 sink）。各自独立成立的漏洞**并列不算一条链**。",
+  );
+  lines.push("");
+  lines.push("--- 已经记录的全部发现（没有截断）---");
+  for (const f of snapshot.findings) {
+    const where = f.location ? ` @ ${f.location.file}:${f.location.line}` : "";
+    const auth = f.preAuth === true ? " 认证前" : f.preAuth === false ? " 需认证" : "";
+    const chain = f.chainOf && f.chainOf.length > 0 ? ` ⛓ 链(${f.chainOf.join("+")})` : "";
+    const assumptions = f.assumptions && f.assumptions.length > 0 ? ` [${f.assumptions.length} 个假设]` : "";
+    lines.push(`  ${f.id} [${f.severity ?? "未定级"}${auth}] ${f.category}${chain}${assumptions}${where}`);
+    lines.push(`      ${clip(f.title, 120)}`);
+    lines.push(`      能提供：${capabilityOf(f)}`);
+    if (f.poc) lines.push(`      PoC 已有`);
+  }
+  lines.push("");
+  lines.push("--- 怎么判断一条链 ---");
+  lines.push("对每一对，问三个问题，三个都要答得上才是链：");
+  lines.push("  1. **谁能驱动谁** —— A 的产物是 B 的输入吗？（A 写下的文件，正是 B 解析的那个？）");
+  lines.push("  2. **中间有没有断点** —— A 到 B 之间还缺什么？缺的就写进 `assumptions`，标 `[假设]`。");
+  lines.push("  3. **起点还成立吗** —— 把整条链放到【起点】下看：攻击者一开始什么都没有，仍然走得通吗？");
+  lines.push("     （链中途需要凭据可以，但**拿凭据那一步也必须无认证可完成**。）");
+  lines.push("");
+  lines.push("--- 记下来 ---");
+  lines.push("```");
+  lines.push('sec_finding title="<这两条一起能做什么>" category="<类别>" severity="critical"');
+  lines.push('            chainOf=["F-0001", "F-0007"] impact="rce-arbitrary" preAuth=true');
+  lines.push('            path=[{file:"…",line:1,detail:"A 写下这个"},{file:"…",line:9,detail:"B 读它并执行"}]');
+  lines.push("```");
+  lines.push("");
+  lines.push("**链不需要自己的物证** —— 它的物证就是它的部件，每条部件都已带物证。");
+  lines.push("但你必须写清楚：**这两条一起能到哪里，攻击者因此得到什么**。");
+  lines.push("");
+  lines.push("--- 如果确实连不起来 ---");
+  lines.push(
+    "用 `sec_observe` 记一句结论（哪几对看过、为什么不成立，带 `file:line`）—— **这样这一轮不算空手**，",
+  );
+  lines.push("而且下一轮不用重看。不要为了交差把两条不相干的东西写成一条链。");
+  return lines.join("\n");
+}
+
+// -----------------------------------------------------------------
 // The attack surface — the work list
 // -----------------------------------------------------------------
 //
@@ -3574,6 +3724,10 @@ export function secRoundBrief(
   const pursuitTarget = nextPursuit(snapshot, opts.pursuitBudget ?? 0, opts.probesAllowed === true);
   const depthBlocked = pursuitTarget !== null && opts.pursuitAllowed === false;
   if (pursuitTarget && !depthBlocked) return renderSecPursuitBrief(snapshot, objective, round, pursuitTarget, opts);
+  // A COMBINE ROUND SITS BETWEEN DEPTH AND THE WORK LIST: a gate to open outranks it (that is a
+  // specific finding one hop from the objective), and the plan sits below it (a pair that reaches
+  // further is worth more than the next item's turn).
+  if (shouldCombine(snapshot)) return renderSecCombineBrief(snapshot, objective, round);
   const item = nextOpenSurface(snapshot, opts.digBudget ?? SEC_DIG_BUDGET);
   // A DEEP RUN WITH AN EMPTY LIST IS NOT A SWEEP SHORT OF PLACES — it is a deep run that needs its
   // next sub-questions. Same round kind, opposite instruction, so the branch lives here rather than

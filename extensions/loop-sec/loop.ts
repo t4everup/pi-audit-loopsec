@@ -138,6 +138,7 @@ import {
   gatesOfFinding,
   nextPursuit,
   objectiveHits,
+  shouldCombine,
   deepObjectiveOf,
   renderDeepSeedNote,
   submitDeepSeed,
@@ -1418,7 +1419,31 @@ function judgeRound(snapshot: TreeSnapshot, record: RoundRecord): RoundOutcome {
     // closed with a reason? A refined blocker counts: the model learned something about the gate,
     // and calling that nothing would pay it to give up instead of finishing the trace. Bounded by
     // construction: `pursuitSpent` cannot exceed `pursuitBudget`.
-    if (record.kind === "pursue") {
+    // A COMBINE ROUND, judged on whether it CHANGED anything — a chain recorded, or a conclusion written
+  // down. "I looked at every pair and they do not combine" is a real result and it is recorded with
+  // `sec_observe`, so it counts; a round that asked the question and wrote nothing counts against the
+  // plateau, which is what stops the pass from running every six rounds forever.
+  if (record.kind === "combine") {
+    const added = snapshot.findings.length - (record.findingCountAtStart ?? 0);
+    const observed =
+      record.observationCountAtStart === undefined ? 0 : snapshot.observations.length - record.observationCountAtStart;
+    const detail =
+      added > 0
+        ? `${added} chain(s) recorded — the pair is now a finding in its own right`
+        : observed > 0
+          ? `no chain, ${observed} conclusion(s) recorded — the pairs that do not combine are now written down`
+          : "the pass asked whether anything combines and recorded nothing";
+    return {
+      round: record.round,
+      kind: record.kind,
+      verdictReached: added > 0,
+      evidenceAdded: added > 0 || observed > 0,
+      detail,
+      produced: added > 0 || observed > 0,
+    };
+  }
+
+  if (record.kind === "pursue") {
       const target = record.findingId ? snapshot.findings.find((f) => f.id === record.findingId) : undefined;
       if (!target) {
         return {
@@ -1968,7 +1993,17 @@ export function tickLoop(projectRoot: string, snapshot: TreeSnapshot, opts: Tick
     // (or the reverse) — and the plateau counts those two kinds differently. Counted in SECTIONS,
     // so a run that recorded nothing stays in recon instead of enumerating from an empty note.
     const inReconPhase = !reconPhaseOver(snapshot, reconRounds);
-    const kindForRound: RoundKind = inReconPhase ? "recon" : pursuitTarget ? "pursue" : secKind;
+    // A COMBINE ROUND IS SCHEDULED, not left to the model's spare attention. Between depth (a specific
+    // finding one hop from the objective) and the plan (the next item's turn) — a pair that reaches
+    // further is worth more than another item, and less than finishing the gate you are already inside.
+    const combineDue = !inReconPhase && !pursuitTarget && shouldCombine(snapshot);
+    const kindForRound: RoundKind = inReconPhase
+      ? "recon"
+      : pursuitTarget
+        ? "pursue"
+        : combineDue
+          ? "combine"
+          : secKind;
     const coverageReport = secCoverage(snapshot, projectRoot);
     const progress = surfaceProgress(snapshot);
     const brief = withBriefExtras(
