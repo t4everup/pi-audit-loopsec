@@ -72,6 +72,7 @@ import {
   renderSecSurfaceBrief,
   secCitedFiles,
   secCoverage,
+  forgetCoverage,
   secLedgerPath,
   secReportPath,
   MAX_ESCALATION_ROUNDS,
@@ -4692,4 +4693,57 @@ test("a combine round that records a chain is productive; one that records nothi
   const concluded = evaluateRound(loadSec(cwd2).snapshot, rec2, false);
   assert.equal(concluded.produced, true, "the negative conclusion is written down, so the round is not wasted");
   assert.match(concluded.detail, /conclusion/);
+});
+
+// =================================================================
+// THE COVERAGE WALK IS MEMOISED — it was 1.2s per round on a 3000-file project
+// =================================================================
+//
+// The walk reads the project tree (up to maxFilesScanned) to find directories nothing has cited. It ran
+// on EVERY TICK and its output goes only into the report: the model never sees it and no loop decision
+// reads it.
+
+test("the coverage walk is MEMOISED between rounds, and the figure says which round it is from", () => {
+  // On a 3000-file project a fresh walk is ~1.2s and a memo hit is ~2ms, and the walk ran on every tick
+  // for a number that goes only into the report.
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 1);
+  saveSettings(cwd, { coverageEveryRounds: 5 });
+  submitSecRecon(cwd, NOTE);
+  recordSurface(cwd, { title: "cited", kind: "file", file: "src/a.c", line: 1 });
+  fs.mkdirSync(path.join(cwd, "src"), { recursive: true });
+  fs.writeFileSync(path.join(cwd, "src", "a.c"), "int x;\n");
+  forgetCoverage(cwd);
+
+  const r0 = loadSec(cwd).snapshot.loop!.round;
+  const first = secCoverage(loadSec(cwd).snapshot, cwd, { fresh: true });
+  assert.equal(first.measuredAtRound, r0, "the figure carries the round it belongs to");
+
+  tickLoop(cwd, loadSec(cwd).snapshot); // the round advances; the tick's own measurement should REUSE
+  const r1 = loadSec(cwd).snapshot.loop!.round;
+  assert.ok(r1 > r0);
+  const reused = secCoverage(loadSec(cwd).snapshot, cwd);
+  assert.equal(reused.measuredAtRound, r0, `still the measurement from round ${r0}`);
+
+  // Forcing it walks now.
+  const forced = secCoverage(loadSec(cwd).snapshot, cwd, { fresh: true });
+  assert.equal(forced.measuredAtRound, r1, "a forced walk is attributed to the current round");
+});
+
+test("coverageEveryRounds=1 measures every round — the old behaviour, still available", () => {
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 1);
+  saveSettings(cwd, { coverageEveryRounds: 1 });
+  submitSecRecon(cwd, NOTE);
+  recordSurface(cwd, { title: "cited", kind: "file", file: "src/a.c", line: 1 });
+  fs.mkdirSync(path.join(cwd, "src"), { recursive: true });
+  fs.writeFileSync(path.join(cwd, "src", "a.c"), "int x;\n");
+  forgetCoverage(cwd);
+
+  const r0 = loadSec(cwd).snapshot.loop!.round;
+  secCoverage(loadSec(cwd).snapshot, cwd, { fresh: true });
+  tickLoop(cwd, loadSec(cwd).snapshot);
+  const r1 = loadSec(cwd).snapshot.loop!.round;
+  const after = secCoverage(loadSec(cwd).snapshot, cwd);
+  assert.equal(after.measuredAtRound, r1, `remeasured every round, not stale from ${r0}`);
 });

@@ -93,6 +93,13 @@ export interface CoverageReport {
   truncated: boolean;
   /** Why the walk could not run, when it could not. */
   reason: string;
+  /**
+   * The round this measurement belongs to, when the walk is memoised (see `secCoverage`).
+   *
+   * Printed with the figure: a coverage number with no timestamp reads as current, and a memoised one can be
+   * a few rounds old.
+   */
+  measuredAtRound?: number;
   /** Directories with ZERO cited files, biggest first. */
   gaps: DirectoryGap[];
   /**

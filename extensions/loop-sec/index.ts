@@ -541,7 +541,9 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
               return;
             }
             {
-              const coverageReport = secCoverage(snapshot, cwd);
+              // FRESH: an operator asking for the report wants the coverage number now, not whatever the
+              // last tick memoised (see `secCoverage`).
+              const coverageReport = secCoverage(snapshot, cwd, { fresh: true });
               const written = writeSecReport(cwd, snapshot, snapshot.loop, { coverageReport });
               if (!written.ok) {
                 notify(`The report could not be written: ${written.errors.join("; ")}`, "error");

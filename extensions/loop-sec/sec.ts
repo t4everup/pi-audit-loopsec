@@ -56,6 +56,7 @@ import { coverageGaps, coverageHeadline, type CoverageReport } from "./coverage.
 import {
   allowCommandProbesOf,
   allowDestructiveProbesOf,
+  coverageEveryRoundsOf,
   fenceLanguageOf,
   loadSettings,
   pursuitRoundsOf,
@@ -1783,8 +1784,49 @@ export function secCitedFiles(snapshot: Pick<TreeSnapshot, "findings">): Set<str
   return cited;
 }
 
-export function secCoverage(snapshot: TreeSnapshot, projectRoot: string): CoverageReport {
-  return coverageGaps(snapshot, projectRoot, secCitedFiles(snapshot));
+/**
+ * The coverage walk, memoised for a few rounds.
+ *
+ * THE WALK IS THE MOST EXPENSIVE THING A ROUND DOES: it reads the project tree (up to
+ * `maxFilesScanned`, 4000 by default) to find directories nothing has cited. It ran on EVERY TICK, and its
+ * output goes into the REPORT — not into the brief, and not into any decision the loop makes. The model
+ * never sees it; the operator sees it in `SEC-REPORT.md`.
+ *
+ * So it is measured every `coverageEveryRounds` rounds and reused in between, and the report says WHICH
+ * ROUND it was measured at — a coverage figure with no timestamp is a figure the reader assumes is current.
+ * `/loopsec report` passes `fresh` and always walks: an operator asking for the report wants the number now.
+ *
+ * The cache is per project, in memory; a restart measures once more.
+ */
+interface CoverageCacheEntry {
+  round: number;
+  cited: number;
+  report: CoverageReport;
+}
+const coverageCache = new Map<string, CoverageCacheEntry>();
+
+/** Drop the memo. Exported for tests, and for anything that archives a run. */
+export function forgetCoverage(projectRoot: string): void {
+  coverageCache.delete(projectRoot);
+}
+
+export function secCoverage(snapshot: TreeSnapshot, projectRoot: string, opts: { fresh?: boolean } = {}): CoverageReport {
+  const cited = secCitedFiles(snapshot);
+  const round = snapshot.loop?.round ?? snapshot.rounds;
+  const every = Math.max(1, coverageEveryRoundsOf(projectRoot));
+  if (!opts.fresh) {
+    const cached = coverageCache.get(projectRoot);
+    // REUSE IS DECIDED BY THE ROUND, NOT BY THE CITED SET. Keying it on the cited set was correct and
+    // useless: a run that is actively exploring adds a citation almost every round, so the memo was
+    // invalidated every round and the walk ran every round — which is exactly the run that is slow.
+    // The number can therefore lag by up to `every` rounds, and the report says which round it is from.
+    if (cached && round - cached.round >= 0 && round - cached.round < every) {
+      return { ...cached.report, measuredAtRound: cached.round };
+    }
+  }
+  const report = coverageGaps(snapshot, projectRoot, cited);
+  coverageCache.set(projectRoot, { round, cited: cited.size, report });
+  return { ...report, measuredAtRound: round };
 }
 
 // -----------------------------------------------------------------
@@ -3206,6 +3248,11 @@ export function renderSecReport(
     lines.push(`| | |`);
     lines.push(`|---|---|`);
     lines.push(`| ${t.rowCited} | ${coverageHeadline(coverage, lang)} |`);
+    // A COVERAGE NUMBER WITH NO TIMESTAMP READS AS CURRENT, and a memoised one can be several rounds old.
+    if (coverage.measuredAtRound !== undefined && coverage.measuredAtRound !== snapshot.rounds) {
+      lines.push("");
+      lines.push(t.coverageMeasuredAt(coverage.measuredAtRound));
+    }
     lines.push(`| ${t.rowGapDirs} | ${coverage.gaps.length} |`);
     lines.push("");
     if (coverage.projectFiles === null) {

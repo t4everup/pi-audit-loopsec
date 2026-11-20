@@ -2004,6 +2004,8 @@ export function tickLoop(projectRoot: string, snapshot: TreeSnapshot, opts: Tick
         : combineDue
           ? "combine"
           : secKind;
+    // MEMOISED: the walk reads the project tree and its output goes only into the report, so paying it on
+    // every tick spent a full tree walk per round on a number no decision reads.
     const coverageReport = secCoverage(snapshot, projectRoot);
     const progress = surfaceProgress(snapshot);
     const brief = withBriefExtras(

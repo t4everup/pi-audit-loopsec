@@ -63,6 +63,14 @@ export interface HypothesisSettings {
   locationContext: number;
   /** Hard cap on how many files a grep probe will open. */
   maxFilesScanned: number;
+  /**
+   * How often the coverage walk runs.
+   *
+   * It walks the project tree (up to `maxFilesScanned`) on every tick, and its output goes only into the
+   * report — the model never sees it and no loop decision reads it. Five rounds keeps the operator's report
+   * fresh enough while a long run stops paying a full tree walk per round. `/loopsec report` always walks.
+   */
+  coverageEveryRounds: number;
   /** Hard cap on the size of one file a probe will read (bytes). */
   maxFileBytes: number;
   /** Hard cap on the total lines a grep probe will examine. */
@@ -185,6 +193,7 @@ export const DEFAULT_SETTINGS: HypothesisSettings = {
   maxGrepMatches: 50,
   locationContext: 6,
   maxFilesScanned: 4_000,
+  coverageEveryRounds: 5,
   maxFileBytes: 2_000_000,
   maxLinesScanned: 400_000,
   reconSegmentParagraphs: 4,
@@ -422,6 +431,14 @@ export function allowDestructiveProbesOf(projectRoot: string): boolean {
   }
 }
 
+export function coverageEveryRoundsOf(projectRoot: string): number {
+  try {
+    return loadSettings(projectRoot).settings.coverageEveryRounds;
+  } catch {
+    return DEFAULT_SETTINGS.coverageEveryRounds;
+  }
+}
+
 export function lockTtlMsOf(projectRoot: string): number {
   try {
     return loadSettings(projectRoot).settings.lockTtlMs;
@@ -521,6 +538,7 @@ function applySettingsObject(o: Record<string, unknown>, settings: HypothesisSet
   num("maxGrepMatches", 1, 5_000);
   num("locationContext", 0, 200);
   num("maxFilesScanned", 1, 200_000);
+  num("coverageEveryRounds", 1, 100);
   num("maxFileBytes", 1_024, 200_000_000);
   num("maxLinesScanned", 100, 20_000_000);
   // Clamped to the design's 3–5 range rather than to an arbitrary bound.

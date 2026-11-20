@@ -149,6 +149,8 @@ export interface SecStrings {
   verifyNotConfirmed: string;
 
   coverageTitle: string;
+  /** Appended to the coverage row when the number is a memoised one. */
+  coverageMeasuredAt: (round: number) => string;
   rowCited: string;
   rowGapDirs: string;  coverageNotMeasured: (why: string) => string;
   coverageNoGap: string;
@@ -329,6 +331,8 @@ const SEC_ZH: SecStrings = {
     "**没有记录任何发现。** 这是合法结果——一轮为了看起来有产出而编造发现，比空手而归更糟——但它**不是**这条发现不成立的证据：本次运行只围绕它一个，其余部分没有按扫描方式覆盖。",
 
   coverageTitle: "## 覆盖",
+  coverageMeasuredAt: (round) =>
+    `> 这个数字测于第 ${round} 轮，不是本轮（全项目扫描按 \`coverageEveryRounds\` 隔几轮做一次，\`/loopsec report\` 会重测）。`,
   rowCited: "**被某条发现引用过的文件**",
   rowGapDirs: "**ZERO 发现的目录**",
   coverageNotMeasured: (why) => `_未测量 —— ${why}。**未测量不等于已覆盖。**_`,
@@ -490,6 +494,8 @@ const SEC_EN: SecStrings = {
     "**No findings were recorded.** That is a legitimate outcome — a run that invents findings to look productive is worse than one that comes back empty — but it is not evidence that THIS finding does not hold: the run was scoped to it alone, and nothing else was covered the way a sweep covers it.",
 
   coverageTitle: "## Coverage",
+  coverageMeasuredAt: (round) =>
+    `> Measured at round ${round}, not this one (the project walk runs every \`coverageEveryRounds\` rounds; \`/loopsec report\` remeasures).`,
   rowCited: "**Files cited by a finding**",
   rowGapDirs: "**Directories with ZERO findings**",
   coverageNotMeasured: (why) => `_Not measured — ${why}. **Not measured is not fully covered.**_`,
