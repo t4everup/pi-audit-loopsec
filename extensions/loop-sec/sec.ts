@@ -166,9 +166,9 @@ export interface EscalationInput {
  * will plan a 40-round chain and abandon it half way.
  */
 export function escalateItem(projectRoot: string, input: EscalationInput, at = nowIso()): Result<{ id: string; bonus: number; effective: number; kind: "finding" | "surface" }> {
-  const id = (input.id ?? "").trim().toUpperCase();
+  const id = asText(input.id).trim().toUpperCase();
   const rounds = Math.floor(Number(input.rounds));
-  const reason = (input.reason ?? "").trim();
+  const reason = asText(input.reason).trim();
   if (!/^[FS]-\d+$/.test(id)) {
     return { ok: false, errors: [`id must be F-xxxx (a finding's pursuit budget) or S-xxxx (an item's dig budget), got "${input.id}"`] };
   }
@@ -551,7 +551,7 @@ const DESTRUCTIVE_PROBE =
 
 /** True when this command would mutate state rather than observe it. Exported for the tests. */
 export function looksDestructive(command: string): boolean {
-  const cmd = (command ?? "").trim();
+  const cmd = asText(command).trim();
   if (cmd === "") return false;
   // Searching for a dangerous word is not performing it.
   if (READ_ONLY_LEADERS.test(cmd)) return false;
@@ -603,11 +603,11 @@ export function verifyFinding(
     const known = snapshot.findings.map((f) => f.id).join(", ") || "(none yet)";
     return { ok: false, errors: [`${id} is not a finding in this run. Known findings: ${known}`] };
   }
-  const command = (input.command ?? "").trim();
+  const command = asText(input.command).trim();
   if (!command) {
     return { ok: false, errors: ["`command` is required — say exactly what to run, so the reader can re-run it"] };
   }
-  const expect = (input.expect ?? "").trim();
+  const expect = asText(input.expect).trim();
   if (!expect) {
     return {
       ok: false,
@@ -669,14 +669,14 @@ export function verifyFinding(
   const redacted = redactSecrets(clippedRaw);
   const clipped = redacted.text;
   const expectExit = input.expectExit === "nonzero" ? "nonzero" : "zero";
-  const expectOutput = input.expectOutput && input.expectOutput.trim() ? input.expectOutput : null;
+  const expectOutput = asText(input.expectOutput).trim() ? asText(input.expectOutput) : null;
   const judged = verdictOf({
     exitCode,
     timedOut,
     expectExit,
     ...(expectOutput !== null ? { expectOutput } : {}),
     output: clipped,
-    ...(input.preconditionHeld !== undefined ? { preconditionHeld: input.preconditionHeld } : {}),
+    ...(typeof input.preconditionHeld === "boolean" ? { preconditionHeld: input.preconditionHeld } : {}),
   });
   const verification: SecVerification = {
     at,
@@ -688,7 +688,7 @@ export function verifyFinding(
     expect,
     expectExit,
     ...(expectOutput !== null ? { expectOutput } : {}),
-    ...(input.precondition ? { precondition: input.precondition.trim() } : {}),
+    ...(asText(input.precondition).trim() ? { precondition: asText(input.precondition).trim() } : {}),
     ...(input.preconditionHeld !== undefined ? { preconditionHeld: input.preconditionHeld } : {}),
     verdict: judged.verdict,
     ...(judged.cause ? { inconclusiveCause: judged.cause } : {}),
@@ -746,7 +746,7 @@ export function reconNotePath(projectRoot: string): string {
  * the report say the run spent a round mapping a project it was handed a target from.
  */
 export function submitDeepSeed(projectRoot: string, note: string, at = nowIso()): Result<string> {
-  const text = (note ?? "").trim();
+  const text = asText(note).trim();
   if (text.length < 200) {
     return { ok: false, errors: [`a deep seed must be at least 200 characters (got ${text.length})`] };
   }
@@ -767,7 +767,7 @@ export function submitDeepSeed(projectRoot: string, note: string, at = nowIso())
 }
 
 export function submitSecRecon(projectRoot: string, note: string, at = nowIso()): Result<string> {
-  const text = (note ?? "").trim();
+  const text = asText(note).trim();
   if (text.length < 200) {
     return {
       ok: false,
@@ -818,6 +818,22 @@ export function submitSecRecon(projectRoot: string, note: string, at = nowIso())
 // afford to be small because nothing is lost, and depth stops depending on how much of the conversation
 // survived.
 
+// -----------------------------------------------------------------
+// COERCION — a wrong TYPE must be a refusal, not a throw
+// -----------------------------------------------------------------
+//
+// Everything below is driven by a model through a JSON schema, and the schema is the real gate. But a tool
+// whose `execute` throws surfaces as "Extension ... error: <message>" with the round HALF-RECORDED, which is
+// a worse outcome than a clean refusal — and the same functions are called from tests and by embedders.
+// A hostile-input sweep found 90 such throws: `(input.files ?? []).filter` when `files` was a number,
+// `asText(reason).trim()` when the reason was 0.
+//
+// These three make the coercion explicit, so every check downstream sees the type it says it sees.
+const asText = (value: unknown): string => (typeof value === "string" ? value : value == null ? "" : String(value));
+const asList = <T>(value: unknown): T[] => (Array.isArray(value) ? (value as T[]) : []);
+const asNum = (value: unknown): number | undefined =>
+  typeof value === "number" && Number.isFinite(value) ? value : undefined;
+
 export interface ObservationInput {
   text: string;
   location?: { file: string; line: number };
@@ -836,7 +852,7 @@ export interface ObservationInput {
  */
 export function validateObservation(input: ObservationInput): Result<ObservationInput> {
   const errors: string[] = [];
-  const text = (input.text ?? "").trim();
+  const text = asText(input?.text).trim();
   // TWENTY, not thirty. The point of the minimum is to exclude "checked", "nothing found", "ok" — not
   // to enforce prose. Measured against the way this mode is actually used: a complete Chinese
   // observation ("守卫读的是 query string，handler 读 body") is 20-odd characters, and a 30-character
@@ -848,24 +864,33 @@ export function validateObservation(input: ObservationInput): Result<Observation
     );
   }
   const hasLocation =
-    !!input.location &&
+    !!input?.location &&
     typeof input.location.file === "string" &&
     input.location.file.trim() !== "" &&
-    input.location.line > 0;
-  const files = (input.files ?? []).filter((f) => typeof f === "string" && f.trim() !== "");
+    (asNum(input.location.line) ?? 0) > 0;
+  const files = asList<unknown>(input?.files).filter((f): f is string => typeof f === "string" && f.trim() !== "");
   if (!hasLocation && files.length === 0) {
     errors.push(
       "it must be locatable: pass `file`+`line`, or `files` when the fact is about a module/build/config " +
         "rather than one line. An observation a reader cannot open is a guess with a timestamp.",
     );
   }
-  if (input.surfaceId && !/^S-\d+$/.test(input.surfaceId)) {
-    errors.push(`surfaceId must look like S-0001, got "${input.surfaceId}"`);
+  if (input?.surfaceId && !/^S-\d+$/.test(asText(input.surfaceId))) {
+    errors.push(`surfaceId must look like S-0001, got "${asText(input.surfaceId)}"`);
   }
-  if (input.findingId && !/^F-\d+$/.test(input.findingId)) {
-    errors.push(`findingId must look like F-0001, got "${input.findingId}"`);
+  if (input?.findingId && !/^F-\d+$/.test(asText(input.findingId))) {
+    errors.push(`findingId must look like F-0001, got "${asText(input.findingId)}"`);
   }
-  return errors.length === 0 ? { ok: true, value: { ...input, text }, warnings: [] } : { ok: false, errors };
+  // The value handed on is COERCED, so `recordObservation` never has to defend itself again.
+  const cleaned: ObservationInput = {
+    text,
+    ...(hasLocation ? { location: { file: input.location!.file, line: Math.max(1, Math.floor(asNum(input.location!.line) ?? 1)) } } : {}),
+    ...(files.length > 0 ? { files } : {}),
+    ...(input?.how ? { how: asText(input.how) } : {}),
+    ...(input?.surfaceId ? { surfaceId: asText(input.surfaceId) } : {}),
+    ...(input?.findingId ? { findingId: asText(input.findingId) } : {}),
+  };
+  return errors.length === 0 ? { ok: true, value: cleaned, warnings: [] } : { ok: false, errors };
 }
 
 function nextObservationId(snapshot: TreeSnapshot): string {
@@ -933,7 +958,7 @@ export interface RecallHit {
  * difference between a lead and a fabrication.
  */
 export function recallRecords(snapshot: TreeSnapshot, query: string, limit = 20): RecallHit[] {
-  const q = (query ?? "").trim().toLowerCase();
+  const q = asText(query).trim().toLowerCase();
   if (q === "") return [];
   const terms = q.split(/\s+/).filter(Boolean);
   const hits: RecallHit[] = [];
@@ -990,7 +1015,7 @@ export function showRecord(
   snapshot: TreeSnapshot,
   id: string,
 ): { kind: "observation" | "finding" | "surface"; text: string } | null {
-  const key = (id ?? "").trim().toUpperCase();
+  const key = asText(id).trim().toUpperCase();
   const o = snapshot.observations.find((x) => x.id.toUpperCase() === key);
   if (o) {
     return {
@@ -1192,7 +1217,8 @@ export function shouldCombine(snapshot: TreeSnapshot): boolean {
  * as titles, which is the comparison the round is for.
  */
 export function capabilityOf(f: { category: string; impact?: string }): string {
-  const impact = f.impact ?? "";
+  // Coerced: this is called on whatever the record holds, and a hand-edited log can put a number here.
+  const impact = asText(f?.impact);
   if (impact.startsWith("rce")) return "执行（任意命令）—— 终点，不是中间能力";
   if (impact === "file-write") return "写文件";
   if (impact === "file-read") return "读文件";
@@ -1200,7 +1226,7 @@ export function capabilityOf(f: { category: string; impact?: string }): string {
   if (impact === "db-superuser") return "数据库高权限";
   if (impact === "blind-injection") return "只能盲注 —— 契约不算终点";
   if (impact === "info-disclosure") return "泄露信息";
-  switch (f.category) {
+  switch (asText(f?.category)) {
     case "path-traversal":
     case "arbitrary-file-read":
       return "读文件（路径可控）";
@@ -1456,7 +1482,7 @@ export function clearSurface(
   guardLocation?: { file: string; line: number },
   at = nowIso(),
 ): Result<SecSurface> {
-  const text = (reason ?? "").trim();
+  const text = asText(reason).trim();
   if (text.length < 20) {
     return {
       ok: false,
@@ -1483,14 +1509,17 @@ export function clearSurface(
   // "this whole module is never built" to either invent a line number or record nothing. Recording nothing
   // is worse: the item stays open and a later round reads the same files again. So it is accepted and
   // marked UNCCHECKABLE in the report — which is what it is — instead of being made unrecordable.
-  const noLocation = !guardLocation || !guardLocation.file || !(guardLocation.line > 0);
+  // The guard location is coerced here, once, so every use below sees a string and a number.
+  const guardFile = asText(guardLocation?.file).trim();
+  const guardLine = asNum(guardLocation?.line) ?? 0;
+  const noLocation = !guardFile || !(guardLine > 0);
   const patched = updateSurface(
     projectRoot,
     id,
     {
       status: "cleared",
       clearedReason: text,
-      ...(noLocation ? {} : { guardLocation: { file: guardLocation!.file, line: Math.max(1, Math.floor(guardLocation!.line)) } }),
+      ...(noLocation ? {} : { guardLocation: { file: guardFile, line: Math.max(1, Math.floor(guardLine)) } }),
     },
     at,
   );
@@ -1568,7 +1597,7 @@ export function digSurface(
  * holds, and withdrawing that assertion is a claim too.
  */
 export function reopenSurface(projectRoot: string, id: string, reason: string, at = nowIso()): Result<SecSurface> {
-  const text = (reason ?? "").trim();
+  const text = asText(reason).trim();
   if (text.length < 20) {
     return {
       ok: false,
@@ -1592,11 +1621,14 @@ export function reopenSurface(projectRoot: string, id: string, reason: string, a
 export function updateSurface(
   projectRoot: string,
   id: string,
-  patch: SecSurfacePatch,
+  patchIn: SecSurfacePatch,
   at = nowIso(),
 ): Result<SecSurface> {
 
   const snapshot = loadSec(projectRoot).snapshot;
+  // A NULL PATCH IS NOT A CRASH. The tool layer builds this object, but these functions are also called by
+  // tests and embedders, and a throw here escapes as "Extension ... error".
+  let patch: SecSurfacePatch = patchIn ?? {};
   // A PATCH THAT CHANGES DEPENDENCIES GETS THE SAME CHECKS as a fresh record — otherwise `sec_update`
   // becomes the way to introduce a cycle that `sec_surface` refuses.
   // Same rule as recordSurface: keep the item, drop the offending edges, say which and why.

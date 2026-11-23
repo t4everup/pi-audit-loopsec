@@ -51,7 +51,7 @@ import { acquireTurnLock, releaseTurnLock, turnLockDir } from "../extensions/loo
 // language tag" failed with `got "bash"` — the test was correct and the assertion was reading a file
 // outside the test.
 process.env.PI_LOOPSC_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "loopsec-home-"));
-import { loopCommandName, reachesTheBar, type SecFindingStep } from "../extensions/loop-sec/types.ts";
+import { loopCommandName, reachesTheBar, verdictOf, type SecFindingStep } from "../extensions/loop-sec/types.ts";
 import {
   appendSecLedger,
   SEC_DIG_BUDGET,
@@ -85,6 +85,8 @@ import {
   COMBINE_COOLDOWN,
   deepWrapUp,
   escalateItem,
+  capabilityOf,
+  submitDeepSeed,
   hasAnswered,
   isBlocked,
   unsatisfiedRequires,
@@ -5059,4 +5061,395 @@ test("re-entering the lock REFRESHES the owner timestamp, so a long run is not t
   const after = JSON.parse(fs.readFileSync(path.join(dir, "owner.json"), "utf-8")).at;
   assert.notEqual(after, before, "refreshed — otherwise every long run looks abandoned after the TTL");
   releaseTurnLock(cwd);
+});
+
+// =================================================================
+// EXHAUSTIVE SWEEP — every round kind, in every state it can meet
+// =================================================================
+//
+// Two crashes reached a live run this session (a null `assigned` in a combine summary, and a lock from a
+// dead process). Both were branches nobody had pictured. This test does not picture them either: it
+// enumerates the states and asserts that a tick SURVIVES each one and produces something a model can read.
+
+function sweepStates(): Array<{ name: string; setup: (cwd: string) => void }> {
+  const states: Array<{ name: string; setup: (cwd: string) => void }> = [];
+  // A MEANINGFUL matrix, not every product: the axes that change the round-kind decision are the recon
+  // phase, whether anything is open, and whether there is something to deepen. The coverage walk is turned
+  // off in these fixtures — it is the one thing in a tick that costs real time and it does not affect which
+  // branch runs.
+  for (const recon of [0, 2]) {
+    for (const surfaces of [0, 1, 3]) {
+      for (const surfaceState of surfaces === 0 ? ["open"] : ["open", "blocked", "cleared"]) {
+        for (const findings of [0, 1, 3]) {
+          states.push({
+            name: `recon=${recon} surfaces=${surfaces}(${surfaceState}) findings=${findings}`,
+            setup: (cwd) => {
+              saveSettings(cwd, { reconRounds: 2, allowCommandProbes: false, coverageEveryRounds: 100 });
+              startLoop(cwd, loadSec(cwd).snapshot, { kind: "sec", objective: "x", plateauWindow: 99 });
+              for (let i = 0; i < recon; i++) submitSecRecon(cwd, `${NOTE}\n\nsection ${i}`);
+              const ids: string[] = [];
+              for (let i = 0; i < surfaces; i++) {
+                const r = recordSurface(cwd, {
+                  title: `S${i}`, kind: "sink", file: `s${i}.py`, line: i + 1,
+                  ...(surfaceState === "blocked" && i > 0 ? { requires: ["S-0001"] } : {}),
+                });
+                if (r.ok) ids.push(r.value.id);
+              }
+              for (let i = 0; i < findings; i++) {
+                recordFinding(cwd, {
+                  title: `F${i}`, category: i % 2 ? "rce" : "ssrf", severity: i === 0 ? "critical" : "high",
+                  file: `f${i}.py`, line: i + 1, evidence: "e",
+                  ...(i === 0 ? { preAuth: true, impact: "rce-arbitrary" } : {}),
+                });
+              }
+              if (surfaceState === "cleared") {
+                for (const id of ids) {
+                  clearSurface(cwd, id, `守卫在 ${id} 对应行之前执行，这条路径不在公开路由表里`, { file: "s.py", line: 1 });
+                }
+              }
+            },
+          });
+        }
+      }
+    }
+  }
+  return states;
+}
+
+test("EVERY round kind survives EVERY state — a tick never throws and always says something", { timeout: 120_000 }, () => {
+  const failures: string[] = [];
+  const kinds = new Set<string>();
+  const states = sweepStates();
+  for (const state of states) {
+    const cwd = seeded();
+    try {
+      state.setup(cwd);
+      // Three ticks: dispatch, settle-and-dispatch, settle — so every branch of the decide-and-dispatch path
+      // is exercised at least once in each state.
+      for (let i = 0; i < 3; i++) {
+        const r = tickLoop(cwd, loadSec(cwd).snapshot);
+        const rec = loadSec(cwd).snapshot.roundRecords.at(-1);
+        if (rec) kinds.add(rec.kind);
+        if (r.action === "sent") {
+          if (!r.brief || r.brief.trim() === "") failures.push(`${state.name}: sent with an empty brief`);
+          if (!r.summary || r.summary.length === 0) failures.push(`${state.name}: sent with an empty summary`);
+          if (r.summary?.some((l) => typeof l !== "string" || l.includes("undefined"))) {
+            failures.push(`${state.name}: a non-string or "undefined" in the summary (${r.summary.join(" | ")})`);
+          }
+        }
+        modelActed();
+      }
+    } catch (error) {
+      failures.push(`${state.name}: THREW ${(error as Error).message}`);
+    }
+  }
+  assert.deepEqual(failures, [], `${failures.length} failure(s) across ${states.length} states`);
+  assert.ok(kinds.has("analyze"), `analyze was never reached: ${[...kinds].join(",")}`);
+  assert.ok(kinds.has("surface") || kinds.has("recon"), `neither surface nor recon reached: ${[...kinds].join(",")}`);
+});
+
+test("a DEEP run survives the same sweep, with no sub-questions and with them all answered", () => {
+  const failures: string[] = [];
+  for (const subQuestions of [0, 1, 3]) {
+    for (const answered of [false, true]) {
+      const cwd = seeded();
+      try {
+        saveSettings(cwd, { reconRounds: 1, allowCommandProbes: false });
+        startLoop(cwd, loadSec(cwd).snapshot, { kind: "sec", objective: "x", plateauWindow: 99 });
+        submitSecRecon(cwd, NOTE);
+        recordFinding(cwd, { title: "gated", category: "rce", severity: "critical", file: "a.py", line: 1, evidence: "e", preAuth: false });
+        const deep = startDeepRun(cwd, "F-0001");
+        if (!deep.ok) {
+          failures.push(`deep(0) setup failed: ${deep.errors.join("; ")}`);
+          continue;
+        }
+        for (let i = 0; i < subQuestions; i++) {
+          const r = recordSurface(cwd, { title: `Q${i}`, kind: "boundary", file: `g${i}.py`, line: i + 1 });
+          if (answered && r.ok) {
+            clearSurface(cwd, r.value.id, `守卫读 query，处理器读 body —— 不同源，这条不成立 #${i}`, { file: "g.py", line: 1 });
+          }
+        }
+        for (let i = 0; i < 3; i++) {
+          const r = tickLoop(cwd, loadSec(cwd).snapshot);
+          if (r.action === "sent" && !r.brief?.trim()) failures.push(`deep(q=${subQuestions},a=${answered}): empty brief`);
+          modelActed();
+        }
+      } catch (error) {
+        failures.push(`deep(q=${subQuestions},a=${answered}): THREW ${(error as Error).message}`);
+      }
+    }
+  }
+  assert.deepEqual(failures, []);
+});
+
+test("a run at its ROUND CAP and at its PLATEAU still answers cleanly", () => {
+  for (const [label, settings, plateau] of [
+    ["cap reached", {}, 99],
+    ["plateau reached", {}, 1],
+  ] as Array<[string, Record<string, unknown>, number]>) {
+    const cwd = seeded();
+    saveSettings(cwd, settings);
+    startLoop(cwd, loadSec(cwd).snapshot, { kind: "sec", objective: "x", plateauWindow: plateau, maxRounds: 1 });
+    submitSecRecon(cwd, NOTE);
+    recordSurface(cwd, { title: "S1", kind: "sink", file: "s.py", line: 1 });
+    const first = tickLoop(cwd, loadSec(cwd).snapshot);
+    assert.equal(first.action, "sent", `${label}: the first round goes`);
+    modelActed();
+    const second = tickLoop(cwd, loadSec(cwd).snapshot);
+    assert.ok(second.action === "stopped" || second.action === "paused", `${label}: got ${second.action}`);
+    assert.ok(second.reason && second.reason.length > 0, `${label}: the reason is stated`);
+  }
+});
+
+// =================================================================
+// EVERY FIELD SURVIVES THE LOG — the test that makes the 12th omission impossible
+// =================================================================
+//
+// Twelve times this session a field was added to a record and dropped by a normalizer on reload:
+// `Evidence.reproduces`, `SecSurface.priority`, `loop.deep`, `deep.directive`, `toolCallsAtStart`,
+// `silentStreak`, `observationCountAtStart`, `pursuitBonus`, `digBonus`, `SecVerification.redacted`,
+// `impact`/`assumptions` landing in the wrong interface, and `"combine"` missing from `ROUND_KINDS`.
+//
+// A hand-written test can only cover the fields its author remembered — which is the same failure. So this
+// builds a record with EVERY field set, sends it through the real log, and diffs the keys. A field added
+// later without a normalizer entry fails here, because the fixture is written from the type's own field list.
+
+/** A value that is obviously not a default, so a dropped field cannot be mistaken for an unchanged one. */
+function probe(kind: "string" | "number" | "boolean"): unknown {
+  return kind === "string" ? "PROBE-VALUE" : kind === "number" ? 4_242 : true;
+}
+
+test("EVERY SecFinding field survives the log round trip", () => {
+  const cwd = seeded();
+  withSurface(cwd, 1);
+  const base = recordFinding(cwd, { title: "base", category: "rce", severity: "high", file: "a.py", line: 1, evidence: "e" });
+  if (!base.ok) return assert.fail("must record");
+  const full: Record<string, unknown> = {
+    id: "F-0009",
+    at: new Date().toISOString(),
+    round: 7,
+    title: "PROBE-VALUE",
+    category: "ssrf",
+    severity: "critical",
+    preAuth: true,
+    location: { file: "probe.py", line: 42 },
+    evidence: "PROBE-VALUE",
+    reasoning: "PROBE-VALUE",
+    poc: "PROBE-VALUE",
+    path: [{ detail: "PROBE-VALUE", file: "p.py", line: 3 }],
+    surfaceId: "S-0001",
+    impact: "rce-arbitrary",
+    assumptions: ["PROBE-VALUE"],
+    chainOf: ["F-0001", "F-0002"],
+    blockers: ["PROBE-VALUE"],
+    deepen: true,
+    pursuitBonus: 5,
+    pursuitSpent: 2,
+    pursuitClosed: "PROBE-VALUE",
+    verification: {
+      at: new Date().toISOString(),
+      command: "PROBE-VALUE",
+      output: "PROBE-VALUE",
+      exitCode: 0,
+      timedOut: false,
+      expect: "PROBE-VALUE",
+      expectExit: "zero",
+      expectOutput: "PROBE-VALUE",
+      verdict: "reproduced",
+      confirmed: true,
+    },
+  };
+  appendSecEvent(cwd, { type: "finding_recorded", at: new Date().toISOString(), finding: full } as never);
+  const back = loadSec(cwd).snapshot.findings.find((f) => f.id === "F-0009");
+  assert.ok(back, "the record was written");
+  const lost = Object.keys(full).filter((k) => back![k as keyof typeof back] === undefined);
+  assert.deepEqual(lost, [], `fields dropped by the finding normalizer: ${lost.join(", ")}`);
+  // and the nested verification's own fields
+  const vLost = Object.keys(full.verification as object).filter(
+    (k) => (back!.verification as unknown as Record<string, unknown> | undefined)?.[k] === undefined,
+  );
+  assert.deepEqual(vLost, [], `fields dropped by the VERIFICATION normalizer: ${vLost.join(", ")}`);
+});
+
+test("EVERY SecSurface field survives the log round trip", () => {
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 1);
+  const full: Record<string, unknown> = {
+    id: "S-0009",
+    at: new Date().toISOString(),
+    round: 5,
+    kind: "boundary",
+    title: "PROBE-VALUE",
+    location: { file: "probe.py", line: 9 },
+    categories: ["rce"],
+    requires: ["S-0001"],
+    priority: 3,
+    digBonus: 4,
+    digRounds: 2,
+    attempts: 1,
+    status: "cleared",
+    clearedReason: "PROBE-VALUE",
+    guardLocation: { file: "guard.py", line: 7 },
+    examinedAt: new Date().toISOString(),
+    findingId: "F-0001",
+  };
+  appendSecEvent(cwd, { type: "surface_recorded", at: new Date().toISOString(), surface: full } as never);
+  const back = loadSec(cwd).snapshot.surfaces.find((s) => s.id === "S-0009");
+  assert.ok(back, "the record was written");
+  const lost = Object.keys(full).filter((k) => back![k as keyof typeof back] === undefined);
+  assert.deepEqual(lost, [], `fields dropped by the surface normalizer: ${lost.join(", ")}`);
+});
+
+test("EVERY AuditLoopState field survives the log round trip, including the deep marker", () => {
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 1);
+  const full: Record<string, unknown> = {
+    kind: "sec",
+    objective: "PROBE-VALUE",
+    contract: null,
+    status: "paused",
+    startedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    round: 12,
+    awaitingRound: null,
+    maxRounds: 40,
+    focus: ["rce"],
+    deep: {
+      findingId: "F-0008",
+      title: "PROBE-VALUE",
+      severity: "critical",
+      category: "rce",
+      parentDir: ".",
+      directive: "PROBE-VALUE",
+    },
+    consolidationStall: 1,
+    coverageRounds: 2,
+    pauseAfterRound: 30,
+    plateauWindow: 9,
+    stallRounds: 3,
+    silentStreak: 2,
+    pausedMs: 1_000,
+    pausedAt: new Date().toISOString(),
+    pausedReason: "PROBE-VALUE",
+    endedAt: null,
+    stopReason: "PROBE-VALUE",
+  };
+  appendSecEvent(cwd, { type: "loop_updated", at: new Date().toISOString(), loop: full } as never);
+  const back = loadSec(cwd).snapshot.loop as unknown as Record<string, unknown> | null;
+  assert.ok(back, "the loop was written");
+  const lost = Object.keys(full).filter((k) => k in (back ?? {}) === false);
+  assert.deepEqual(lost, [], `fields dropped by the loop normalizer: ${lost.join(", ")}`);
+  // The nested deep marker too — a dropped directive turns a steered run into a generic one, silently.
+  const deepLost = Object.keys(full.deep as object).filter((k) => (back?.deep as Record<string, unknown> | undefined)?.[k] === undefined);
+  assert.deepEqual(deepLost, [], `fields dropped from loop.deep: ${deepLost.join(", ")}`);
+});
+
+test("EVERY RoundRecord field survives the log round trip", () => {
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 1);
+  const full: Record<string, unknown> = {
+    round: 4,
+    at: new Date().toISOString(),
+    kind: "combine",
+    segmentId: null,
+    nodeId: null,
+    nodeStatusAtStart: null,
+    nodeEvidenceAtStart: 0,
+    confirmedAtStart: 0,
+    nodeCountAtStart: 0,
+    toolCallsAtStart: 6,
+    observationCountAtStart: 3,
+    findingCountAtStart: 2,
+    surfaceCountAtStart: 5,
+    surfaceExaminedAtStart: 1,
+    surfaceId: "S-0001",
+    surfaceWasDigging: true,
+    findingId: "F-0001",
+    pursuitBlockersAtStart: "PROBE-VALUE",
+    summary: ["PROBE-VALUE"],
+  };
+  appendSecEvent(cwd, { type: "round_detail", at: new Date().toISOString(), record: full } as never);
+  const back = loadSec(cwd).snapshot.roundRecords.find((r) => r.round === 4) as unknown as Record<string, unknown> | undefined;
+  assert.ok(back, "the record was written");
+  const lost = Object.keys(full).filter((k) => k in (back ?? {}) === false);
+  assert.deepEqual(lost, [], `fields dropped by the round-record normalizer: ${lost.join(", ")}`);
+  assert.equal(back?.kind, "combine", "and the KIND is one the normalizer knows");
+});
+
+test("EVERY SecObservation field survives the log round trip", () => {
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 1);
+  const full: Record<string, unknown> = {
+    id: "O-0009",
+    at: new Date().toISOString(),
+    round: 3,
+    text: "PROBE-VALUE",
+    location: { file: "probe.py", line: 5 },
+    files: ["a.py", "b.py"],
+    how: "PROBE-VALUE",
+    surfaceId: "S-0001",
+    findingId: "F-0001",
+  };
+  appendSecEvent(cwd, { type: "observation_recorded", at: new Date().toISOString(), observation: full } as never);
+  const back = loadSec(cwd).snapshot.observations.find((o) => o.id === "O-0009") as unknown as Record<string, unknown> | undefined;
+  assert.ok(back, "the record was written");
+  const lost = Object.keys(full).filter((k) => k in (back ?? {}) === false);
+  assert.deepEqual(lost, [], `fields dropped by the observation normalizer: ${lost.join(", ")}`);
+});
+
+// =================================================================
+// HOSTILE INPUT — every tool function returns a Result, never throws
+// =================================================================
+//
+// The tool layer is what a model drives, and a model can send anything: an empty string, a wrong id, a
+// number where a string belongs, an object where the code expects a validated shape. A throw here escapes
+// into the command handler and surfaces as "Extension ... error: <message>" with the round half-recorded.
+
+const JUNK: unknown[] = ["", "   ", "NOPE", "F-9999", "S-9999", "O-9999", "F-1", "-1", "null", "undefined", 0, -1, 3.5, null, undefined, {}, [], true, false];
+
+test("no tool function throws on hostile input — it returns a Result", () => {
+  const cwd = seeded();
+  withSurface(cwd, 2);
+  const f = recordFinding(cwd, { title: "t", category: "rce", severity: "high", file: "a.py", line: 1, evidence: "e" });
+  if (!f.ok) return assert.fail("must record");
+
+  const failures: string[] = [];
+  const call = (label: string, fn: () => unknown): void => {
+    try {
+      const out = fn() as { ok?: unknown };
+      if (out && typeof out === "object" && "ok" in out && typeof out.ok !== "boolean") {
+        failures.push(`${label}: returned an object without a boolean ok`);
+      }
+    } catch (error) {
+      failures.push(`${label}: THREW ${(error as Error).message}`);
+    }
+  };
+
+  for (const junk of JUNK) {
+    const j = junk as never;
+    call(`recordSurface(${JSON.stringify(junk)})`, () => recordSurface(cwd, { title: j, kind: j, file: j, line: j }));
+    call(`recordFinding(${JSON.stringify(junk)})`, () =>
+      recordFinding(cwd, { title: j, category: j, severity: j, file: j, line: j, evidence: j, impact: j, assumptions: j, chainOf: j, path: j }),
+    );
+    call(`clearSurface(${JSON.stringify(junk)})`, () => clearSurface(cwd, j, j, j));
+    call(`digSurface(${JSON.stringify(junk)})`, () => digSurface(cwd, j));
+    call(`reopenSurface(${JSON.stringify(junk)})`, () => reopenSurface(cwd, j, j));
+    call(`updateSurface(${JSON.stringify(junk)})`, () => updateSurface(cwd, j, j));
+    call(`updateFinding(${JSON.stringify(junk)})`, () => updateFinding(cwd, j, j));
+    call(`recordObservation(${JSON.stringify(junk)})`, () => recordObservation(cwd, { text: j, location: j, files: j, how: j, surfaceId: j, findingId: j }));
+    call(`escalateItem(${JSON.stringify(junk)})`, () => escalateItem(cwd, { id: j, rounds: j, reason: j }));
+    call(`showRecord(${JSON.stringify(junk)})`, () => showRecord(loadSec(cwd).snapshot, j));
+    call(`recallRecords(${JSON.stringify(junk)})`, () => recallRecords(loadSec(cwd).snapshot, j, j));
+    call(`submitSecRecon(${JSON.stringify(junk)})`, () => submitSecRecon(cwd, j));
+    call(`submitDeepSeed(${JSON.stringify(junk)})`, () => submitDeepSeed(cwd, j));
+    call(`verifyFinding(${JSON.stringify(junk)})`, () => verifyFinding(cwd, f.value.id, { command: j, expect: j, expectOutput: j, expectExit: j, precondition: j, preconditionHeld: j }));
+    call(`pauseLoop(${JSON.stringify(junk)})`, () => pauseLoop(cwd, loadSec(cwd).snapshot, j));
+    call(`resumeLoop(${JSON.stringify(junk)})`, () => resumeLoop(cwd, loadSec(cwd).snapshot, j));
+    call(`stopLoop(${JSON.stringify(junk)})`, () => stopLoop(cwd, loadSec(cwd).snapshot, j));
+    call(`startDeepRun(${JSON.stringify(junk)})`, () => startDeepRun(cwd, j));
+    call(`capabilityOf(${JSON.stringify(junk)})`, () => capabilityOf({ category: j as never, impact: j as never }));
+    call(`verdictOf(${JSON.stringify(junk)})`, () => verdictOf({ exitCode: j as never, timedOut: j as never, expectExit: j as never, output: j as never }));
+  }
+
+  assert.deepEqual(failures, [], `${failures.length} throw(s):\n${failures.slice(0, 12).join("\n")}`);
 });

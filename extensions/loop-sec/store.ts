@@ -1718,7 +1718,9 @@ function normalizeRoundRecord(value: unknown): RoundRecord | null {
     round: num(o.round),
     at: typeof o.at === "string" ? o.at : "",
     kind: typeof o.kind === "string" && ROUND_KINDS.includes(o.kind as RoundKind) ? (o.kind as RoundKind) : "verify",
-    ...(typeof o.segmentId === "string" && o.segmentId ? { segmentId: o.segmentId } : {}),
+    // NULL IS A VALUE for this field (the record type says `string | null`), so a JSON null is preserved
+    // rather than dropped — dropping it turns "this round has no segment" into "nobody recorded one".
+    segmentId: typeof o.segmentId === "string" && o.segmentId ? o.segmentId : null,
     nodeId: typeof o.nodeId === "string" && o.nodeId ? o.nodeId : null,
     nodeStatusAtStart: typeof o.nodeStatusAtStart === "string" && STATUSES.has(o.nodeStatusAtStart as HypothesisStatus)
       ? (o.nodeStatusAtStart as HypothesisStatus)

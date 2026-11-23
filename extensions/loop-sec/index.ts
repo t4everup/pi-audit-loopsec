@@ -494,7 +494,7 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
               notify(`REJECTED: ${result.errors.join("\n")}`, "warning");
               return;
             }
-            notify(result.message!, "info");
+            notify(result.message, "info");
             runRound();
             return;
           }
@@ -659,7 +659,7 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
             // refresh only happens on a settle or another command, and a
             // command that appears to do nothing is worse than none.
             if (ctx.hasUI) ctx.ui.setWidget("hypothesis-loop", undefined, { placement: "belowEditor" });
-            notify(result.message!, "info");
+            notify(result.message, "info");
             return;
           }
 
@@ -918,7 +918,7 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
               notify(result.errors.join("; "), "warning");
               return;
             }
-            notify(result.message!, "info");
+            notify(result.message, "info");
             refreshWidget(ctx);
             return;
           }

@@ -546,7 +546,8 @@ export interface StartDeepResult {
 
 export function startDeepRun(projectRoot: string, findingId: string, opts: StartDeepOptions = {}): StartDeepResult {
   const at = opts.at ?? nowIso();
-  const id = (findingId ?? "").trim().toUpperCase();
+  // Coerced: the command passes a string, but this is a public entry point.
+  const id = (typeof findingId === "string" ? findingId : "").trim().toUpperCase();
   if (!id) return { ok: false, errors: ["deep needs a finding id: `/loopsec deep F-0008`"] };
 
   // Every read below is the MAIN run's, because the pointer has not moved yet.
@@ -962,12 +963,16 @@ function advanceRunsLocked(projectRoot: string, opts: { at?: string; dryRun?: bo
   return out;
 }
 
-export interface LoopControlResult {
-  ok: boolean;
-  errors: string[];
-  loop?: AuditLoopState;
-  message?: string;
-}
+/**
+ * The result of a control verb (pause / resume / stop / dismiss / show).
+ *
+ * `message` is REQUIRED on success, and that is a type rather than a comment: every caller does
+ * `notify(result.message!)`, so an `ok: true` that forgot one would notify `undefined` — and it would take
+ * a runtime path to notice. A union makes the compiler ask.
+ */
+export type LoopControlResult =
+  | { ok: true; errors: []; loop?: AuditLoopState; message: string }
+  | { ok: false; errors: string[]; loop?: AuditLoopState };
 
 /**
  * "There is no loop" — but WHICH there, and is it really absent?
@@ -1097,10 +1102,12 @@ export function pauseAfterRounds(
 export function resumeLoop(
   projectRoot: string,
   snapshot: TreeSnapshot,
-  opts: { maxRounds?: number; forRounds?: number } = {},
+  optsIn: { maxRounds?: number; forRounds?: number } = {},
   at = nowIso(),
   kindHint?: AuditLoopKind,
 ): LoopControlResult {
+  // A null options object is not a crash (see startDeepRun).
+  const opts = optsIn ?? {};
   const loop = snapshot.loop;
   if (!loop) return { ok: false, errors: noLoopErrors(projectRoot, noLoopKind(snapshot, kindHint)) };
   if (loop.status === "complete") return { ok: false, errors: ["this run already met its contract — start a new one instead of resuming"] };
