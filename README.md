@@ -263,6 +263,20 @@ To change the defaults for every project at once (this is optional now):
 /loopsec config --global allowCommandProbes=true commandTimeoutMs=300000 maxOutputChars=20000
 ```
 
+### A failing provider PAUSES, it does not STOP
+
+The declared SDK says nothing about WHY a turn ended, so an exhausted quota, a dead network and a killed session all look alike from here: **a round with no tool call at all**. The loop used to keep sending briefs (burning whatever quota was left) and then STOP on the plateau with "the well looks dry" — a claim about the code that nothing supports, printed in the report.
+
+After `pauseOnSilentRounds` (default **3**, 0 disables) consecutive silent rounds the run is **paused**, with a reason naming the likely causes and pointing at `resume`. It is checked BEFORE the plateau, because when both are due the environment is the likelier explanation and the one you can act on.
+
+```text
+3 轮连续没有任何工具调用 —— 可能是模型额度用尽、网络/供应商故障，或者会话被中断。
+这不是对项目的任何结论（项目没被分析过一轮），所以运行被 PAUSE 而不是 STOP。
+修好之后 /loopsec resume 会从第 3 轮继续。
+```
+
+`resume` clears the streak, so a fixed key does not re-pause on the next tick.
+
 ### Mutation needs its OWN consent
 
 `allowCommandProbes` says this project may be probed. It does not say a probe may **change** something,
@@ -342,6 +356,7 @@ model's opinion of what the output means.
 | `pursuitRounds` | 3 | depth rounds per finding, before `sec_escalate` can add more |
 | `reconRounds` | 2 | recon sections before the surface phase |
 | `coverageEveryRounds` | 5 | how often the project walk runs |
+| `pauseOnSilentRounds` | 3 | silent rounds (no tool call at all) before the run PAUSES; 0 disables |
 | `lockTtlMs` | 1800000 | how long a round lock survives a dead process |
 | `commandTimeoutMs` | 300000 | per-probe time budget |
 | `maxOutputChars` | 20000 | per-probe output cap (after redaction) |

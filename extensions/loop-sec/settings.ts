@@ -71,6 +71,19 @@ export interface HypothesisSettings {
    * fresh enough while a long run stops paying a full tree walk per round. `/loopsec report` always walks.
    */
   coverageEveryRounds: number;
+  /**
+   * Pause after this many consecutive rounds with NO tool call at all. 0 disables it.
+   *
+   * The declared SDK reports nothing about WHY a turn ended, so an exhausted quota, a dead network or a
+   * killed session all look alike from here: a round in which the model called nothing. What the loop used
+   * to do with that was keep sending briefs — burning whatever quota was left — and then, once the stall
+   * counter filled, STOP with "the well looks dry". That is a false statement about the project, and the
+   * report printed it.
+   *
+   * Pausing instead is the honest response: nothing was concluded, the run is resumable, and the reason
+   * names the likely cause instead of blaming the code.
+   */
+  pauseOnSilentRounds: number;
   /** Hard cap on the size of one file a probe will read (bytes). */
   maxFileBytes: number;
   /** Hard cap on the total lines a grep probe will examine. */
@@ -194,6 +207,7 @@ export const DEFAULT_SETTINGS: HypothesisSettings = {
   locationContext: 6,
   maxFilesScanned: 4_000,
   coverageEveryRounds: 5,
+  pauseOnSilentRounds: 3,
   maxFileBytes: 2_000_000,
   maxLinesScanned: 400_000,
   reconSegmentParagraphs: 4,
@@ -431,6 +445,14 @@ export function allowDestructiveProbesOf(projectRoot: string): boolean {
   }
 }
 
+export function pauseOnSilentRoundsOf(projectRoot: string): number {
+  try {
+    return loadSettings(projectRoot).settings.pauseOnSilentRounds;
+  } catch {
+    return DEFAULT_SETTINGS.pauseOnSilentRounds;
+  }
+}
+
 export function coverageEveryRoundsOf(projectRoot: string): number {
   try {
     return loadSettings(projectRoot).settings.coverageEveryRounds;
@@ -539,6 +561,7 @@ function applySettingsObject(o: Record<string, unknown>, settings: HypothesisSet
   num("locationContext", 0, 200);
   num("maxFilesScanned", 1, 200_000);
   num("coverageEveryRounds", 1, 100);
+  num("pauseOnSilentRounds", 0, 20);
   num("maxFileBytes", 1_024, 200_000_000);
   num("maxLinesScanned", 100, 20_000_000);
   // Clamped to the design's 3–5 range rather than to an arbitrary bound.

@@ -466,6 +466,8 @@ test("a round that examines NOTHING is unproductive, and the plateau fires", () 
   // The model answers nothing at all: the item is never cleared, no finding lands.
   let stopped: string | null = null;
   for (let i = 0; i < 12; i++) {
+    // Ran, concluded nothing — NOT silent (three silent rounds are the environment failing, and pause).
+    modelActed();
     const result = tickLoop(cwd, loadSec(cwd).snapshot);
     if (result.action !== "sent") {
       stopped = result.reason;
@@ -476,13 +478,15 @@ test("a round that examines NOTHING is unproductive, and the plateau fires", () 
   assert.match(stopped!, /plateau/);
 });
 
-test("a surface round that enumerates nothing is unproductive", () => {
+test("a surface round that enumerates nothing is unproductive, and the plateau fires", () => {
+  // A round that RAN and recorded nothing: `modelActed` keeps it out of the SILENT class, which is what a
+  // dead provider looks like and which now pauses the run after three (see pauseOnSilentRounds).
   const cwd = seeded();
   startSec(cwd, "挖掘认证前rce漏洞", 2);
   submitSecRecon(cwd, NOTE);
-  // No items are ever recorded, so every round is a surface round that adds nothing.
   let stopped: string | null = null;
   for (let i = 0; i < 8; i++) {
+    modelActed();
     const result = tickLoop(cwd, loadSec(cwd).snapshot);
     if (result.action !== "sent") {
       stopped = result.reason;
@@ -1373,7 +1377,12 @@ test("MAX_ITEM_ATTEMPTS rounds with no conclusion drop an item behind the rest o
   recordSurface(cwd, { title: "GET /a", kind: "entrypoint", file: "a.py", line: 1 });
   recordSurface(cwd, { title: "GET /b", kind: "entrypoint", file: "b.py", line: 2 });
   // S-0001 is first in enumeration order, so it is handed every round until it is exhausted.
-  for (let i = 0; i < MAX_ITEM_ATTEMPTS; i++) tickLoop(cwd, loadSec(cwd).snapshot);
+  // The model RAN each round and concluded nothing — an unproductive round, not a silent one. A silent
+  // round is what a dead provider looks like, and three of those pause the run (see pauseOnSilentRounds).
+  for (let i = 0; i < MAX_ITEM_ATTEMPTS; i++) {
+    modelActed();
+    tickLoop(cwd, loadSec(cwd).snapshot);
+  }
   const a = loadSec(cwd).snapshot.surfaces[0]!;
   assert.equal(a.attempts, MAX_ITEM_ATTEMPTS, "it was handed the budget");
   assert.equal(a.status, "open", "an exhausted item is DEPRIORITISED, not thrown away");
@@ -1393,7 +1402,12 @@ test("an exhausted item's brief says the round MUST end in a conclusion", () => 
   submitSecRecon(cwd, NOTE);
   recordSurface(cwd, { title: "GET /a", kind: "entrypoint", file: "a.py", line: 1 });
   recordSurface(cwd, { title: "GET /b", kind: "entrypoint", file: "b.py", line: 2 });
-  for (let i = 0; i < MAX_ITEM_ATTEMPTS; i++) tickLoop(cwd, loadSec(cwd).snapshot);
+  // Three rounds that RAN on S-0001 and recorded nothing — the item becomes exhausted without the run
+  // looking dead (a silent round means the environment failed and pauses the run after three).
+  for (let i = 0; i < MAX_ITEM_ATTEMPTS; i++) {
+    modelActed();
+    tickLoop(cwd, loadSec(cwd).snapshot);
+  }
   // Promotion brings it back — the deprioritisation must not be a silent ban.
   updateSurface(cwd, "S-0001", { priority: 1 });
   const r = tickLoop(cwd, loadSec(cwd).snapshot);
@@ -2643,6 +2657,7 @@ test("the depth reflex has a GLOBAL bound: three in a row, then breadth goes fir
 
   const kinds: string[] = [];
   for (let i = 0; i < 6; i++) {
+    modelActed(); // a round that RAN; a silent round means the environment failed and would pause
     tickLoop(cwd, loadSec(cwd).snapshot);
     kinds.push(loadSec(cwd).snapshot.roundRecords.at(-1)!.kind);
   }
@@ -2671,6 +2686,7 @@ test("the ratio cap holds the reflex even when no run of three happened", () => 
   }
   const kinds: string[] = [];
   for (let i = 0; i < 12; i++) {
+    modelActed();
     tickLoop(cwd, loadSec(cwd).snapshot);
     kinds.push(loadSec(cwd).snapshot.roundRecords.at(-1)!.kind);
   }
@@ -2694,7 +2710,10 @@ test("a depth target blocked by the cap is QUEUED, not dropped — and the brief
   recordFinding(cwd, { title: "deep", category: "rce", severity: "high", file: "f.py", line: 1, evidence: "e", deepen: true });
 
   // Burn the consecutive allowance.
-  for (let i = 0; i < MAX_CONSECUTIVE_DEPTH; i++) tickLoop(cwd, loadSec(cwd).snapshot);
+  for (let i = 0; i < MAX_CONSECUTIVE_DEPTH; i++) {
+    modelActed();
+    tickLoop(cwd, loadSec(cwd).snapshot);
+  }
   assert.equal(loadSec(cwd).snapshot.roundRecords.at(-1)!.kind, "pursue");
   // The cap is evaluated BEFORE the round it blocks, which is the only place it can be: after the
   // analyze round has run, depth is allowed again — that is the whole point of making the sweep go.
@@ -3874,35 +3893,78 @@ test("with everything examined, the debt block does not pretend there is work le
 // aborted". What CAN be measured is whether the model called a single tool after the brief: a round with
 // zero tool calls examined nothing, so it is no evidence about the project.
 
-test("one silent round does not cost a plateau slot; the next one does", () => {
+test("repeated SILENCE pauses the run instead of stopping it — the environment is not the project", () => {
+  // An exhausted quota, a dead network and a killed session all look alike from here: a round with no tool
+  // call at all. The loop used to keep sending briefs (burning quota) and then STOP with "the well looks
+  // dry" — a claim about the code that nothing supports.
   const cwd = seeded();
-  // plateau 2: two COUNTING unproductive rounds stop the run.
   startSec(cwd, "挖掘认证前rce漏洞", 2);
   submitSecRecon(cwd, NOTE);
   recordSurface(cwd, { title: "S1", kind: "sink", file: "s.py", line: 1 });
 
-  // No tool calls happen in this test at all, so every round is silent.
+  // No tool calls at all, so every round is silent.
   const first = tickLoop(cwd, loadSec(cwd).snapshot);
   assert.equal(first.action, "sent");
-  // tick 1 dispatched round 1; tick 2 settles it. ONE settle has happened, so the streak is 1 and the
-  // plateau has not moved: the first silent round is exempt.
   const second = tickLoop(cwd, loadSec(cwd).snapshot);
-  assert.equal(second.action, "sent");
-  let s = loadSec(cwd).snapshot;
-  assert.equal(s.loop?.silentStreak, 1, "the streak is recorded");
-  assert.equal(s.loop?.stallRounds, 0, "and the exempt round did not cost a slot");
+  assert.equal(second.action, "sent", "the first silent round is exempt");
+  assert.equal(loadSec(cwd).snapshot.loop?.silentStreak, 1);
+  assert.equal(loadSec(cwd).snapshot.loop?.stallRounds, 0, "and it did not cost a slot");
 
-  // tick 3 settles round 2 — the SECOND consecutive silent round counts.
-  const third = tickLoop(cwd, loadSec(cwd).snapshot);
-  assert.equal(third.action, "sent");
-  s = loadSec(cwd).snapshot;
-  assert.equal(s.loop?.silentStreak, 2);
-  assert.equal(s.loop?.stallRounds, 1, "the second one counts");
+  tickLoop(cwd, loadSec(cwd).snapshot); // streak 2
+  const third = tickLoop(cwd, loadSec(cwd).snapshot); // streak 3 → PAUSE
+  assert.equal(third.action, "paused", `got ${third.action}: ${third.reason}`);
+  assert.match(third.reason, /没有任何工具调用/, "the reason names what happened");
+  assert.match(third.reason, /额度|网络/, "and the likely causes");
+  assert.match(third.reason, /resume/, "and what to do");
+  const stopped = loadSec(cwd).snapshot.loop!;
+  assert.equal(stopped.status, "paused", "PAUSED, not stopped: nothing was concluded");
+  assert.equal(stopped.awaitingRound, null);
+});
 
-  // tick 4 settles round 3 → stall reaches the plateau of 2 and the run stops.
-  const fourth = tickLoop(cwd, loadSec(cwd).snapshot);
-  assert.equal(fourth.action, "stopped");
-  assert.match(fourth.reason, /plateau/, "repeated silence still stops the run — the bound is what keeps it from spinning");
+test("a round that PRODUCES resets the silent streak", () => {
+  const cwd = seeded();
+  startSec(cwd, "挖掘认证前rce漏洞", 99, 1);
+  submitSecRecon(cwd, NOTE);
+  recordSurface(cwd, { title: "S1", kind: "sink", file: "s.py", line: 1 });
+  tickLoop(cwd, loadSec(cwd).snapshot);
+  tickLoop(cwd, loadSec(cwd).snapshot);
+  assert.equal(loadSec(cwd).snapshot.loop?.silentStreak, 1, "one settle saw a silent round");
+  clearSurface(cwd, "S-0001", "check_auth 在 s.c:1 之前执行，这条路径不在公开路由表里", { file: "s.c", line: 1 });
+  modelActed();
+  tickLoop(cwd, loadSec(cwd).snapshot);
+  assert.equal(loadSec(cwd).snapshot.loop?.silentStreak ?? 0, 0, "producing clears the streak");
+});
+
+test("pauseOnSilentRounds=0 turns the pause off — the plateau is then the only stopper", () => {
+  const cwd = seeded();
+  startSec(cwd, "x", 2, 1);
+  saveSettings(cwd, { pauseOnSilentRounds: 0 });
+  submitSecRecon(cwd, NOTE);
+  recordSurface(cwd, { title: "S1", kind: "sink", file: "s.py", line: 1 });
+  let last = "";
+  for (let i = 0; i < 8; i++) {
+    const r = tickLoop(cwd, loadSec(cwd).snapshot);
+    last = `${r.action}: ${r.reason}`;
+    if (r.action !== "sent") break;
+  }
+  assert.match(last, /stopped: /, `the plateau, not a pause: ${last}`);
+  assert.match(last, /plateau/);
+});
+
+test("resume clears the silent streak, so a fixed quota does not re-pause on the next tick", () => {
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 1);
+  submitSecRecon(cwd, NOTE);
+  recordSurface(cwd, { title: "S1", kind: "sink", file: "s.py", line: 1 });
+  for (let i = 0; i < 4; i++) tickLoop(cwd, loadSec(cwd).snapshot);
+  assert.equal(loadSec(cwd).snapshot.loop?.status, "paused");
+  assert.ok((loadSec(cwd).snapshot.loop?.silentStreak ?? 0) >= 3);
+
+  assert.equal(resumeLoop(cwd, loadSec(cwd).snapshot, {}).ok, true);
+  assert.equal(loadSec(cwd).snapshot.loop?.silentStreak ?? 0, 0, "the streak belonged to the failed attempt");
+  modelActed();
+  const next = tickLoop(cwd, loadSec(cwd).snapshot);
+  assert.equal(next.action, "sent", "and it runs instead of pausing again");
 });
 
 test("a round that PRODUCES resets the silent streak", () => {

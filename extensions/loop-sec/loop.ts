@@ -126,7 +126,7 @@ function appendLoopEvent(projectRoot: string, kind: AuditLoopKind, event: TreeEv
   return kind === "sec" ? appendSecEvent(projectRoot, event) : appendEvent(projectRoot, event);
 }
 import { markNotesDelivered, pendingNotes, renderNotesSection, renderNotesStatus, writeOperatorMirror } from "./notes.js";
-import { loadSettings, lockTtlMsOf, reportLanguageOf } from "./settings.js";
+import { loadSettings, lockTtlMsOf, pauseOnSilentRoundsOf, reportLanguageOf } from "./settings.js";
 import { secToolCallCount } from "./activity.js";
 import { acquireTurnLock, releaseTurnLock } from "./lock.js";
 import { contractPath, ensureContractFile, renderContractDigest, renderContractFull } from "./contract.js";
@@ -1144,6 +1144,8 @@ export function resumeLoop(
     ...restWithoutHidden,
     status: "running",
     stallRounds: 0,
+    // CLEARED, or the very next tick re-pauses on a streak that belongs to the previous attempt.
+    silentStreak: 0,
     // A RESUMED RUN HAS NO ROUND IN FLIGHT. Clearing it here also HEALS a run that an earlier `pause`
     // left fenced (the fence used to survive a pause), and that is the only thing which makes such a
     // project schedulable again without hand-editing the log.
@@ -1885,6 +1887,33 @@ export function tickLoop(projectRoot: string, snapshot: TreeSnapshot, opts: Tick
     };
     writeLoop(projectRoot, spent, at);
     return { action: "paused", reason: spent.pausedReason!, round: current.round, previous };
+  }
+
+  // 2c. THE ENVIRONMENT FAILING IS NOT THE PROJECT RUNNING DRY.
+  //
+  // A round with no tool call at all is what an exhausted quota, a dead network and a killed session all
+  // look like from here — the declared SDK says nothing about why a turn ended. Before this, the loop kept
+  // sending briefs (burning whatever quota was left) and then STOPPED on the plateau with "the well looks
+  // dry", which is a claim about the code that nothing supports. Pausing keeps the run resumable and puts
+  // the likely cause in the record.
+  //
+  // BEFORE the plateau on purpose: when both are due, the environment is the more likely explanation and the
+  // one the operator can act on.
+  const silentPauseAfter = pauseOnSilentRoundsOf(projectRoot);
+  if (silentPauseAfter > 0 && (current.silentStreak ?? 0) >= silentPauseAfter) {
+    const pausedReason =
+      `${current.silentStreak} 轮连续没有任何工具调用 —— 可能是模型额度用尽、网络/供应商故障，或者会话被中断。` +
+      `这不是对项目的任何结论（项目没被分析过一轮），所以运行被 PAUSE 而不是 STOP。` +
+      `修好之后 /loopsec resume 会从第 ${current.round} 轮继续。`;
+    const paused: AuditLoopState = {
+      ...current,
+      status: "paused",
+      awaitingRound: null,
+      pausedReason,
+      pausedAt: at,
+    };
+    writeLoop(projectRoot, paused, at);
+    return { action: "paused", reason: pausedReason, round: current.round, previous };
   }
 
   // 3. The plateau.
