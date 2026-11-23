@@ -4917,3 +4917,38 @@ test("a log with torn lines is NOT cached — a damaged answer must not be serve
   assert.equal(second.torn, first.torn);
   assert.equal(fs.statSync(log).size, sizeAfterTorn);
 });
+
+test("a COMBINE round with NOTHING open does not crash — that is when it is scheduled", () => {
+  // The reported failure: `Cannot read properties of null (reading 'id')` on every round. A combine pass is
+  // scheduled exactly when the work list has nothing workable left, and the round summary had no branch for
+  // it — so the kind fell through to the analyze lines, which dereference the assigned item.
+  const cwd = seeded();
+  startSec(cwd, "挖掘认证前rce", 99, 1);
+  saveSettings(cwd, { allowCommandProbes: false });
+  submitSecRecon(cwd, NOTE);
+  recordSurface(cwd, { title: "S1", kind: "sink", file: "s.py", line: 1 });
+  recordFinding(cwd, { title: "a", category: "ssrf", severity: "high", file: "a.py", line: 1, evidence: "e" });
+  recordFinding(cwd, { title: "b", category: "path-traversal", severity: "high", file: "b.py", line: 2, evidence: "e" });
+  // THE STATE THAT TRIGGERED IT: every surface item already examined.
+  clearSurface(cwd, "S-0001", "check_auth 在 s.py:1 之前执行，这条路径不在公开路由表里", { file: "s.py", line: 1 });
+  assert.equal(nextOpenSurface(loadSec(cwd).snapshot), null, "nothing left to analyse");
+
+  const ticked = tickLoop(cwd, loadSec(cwd).snapshot); // must not throw
+  assert.equal(loadSec(cwd).snapshot.roundRecords.at(-1)!.kind, "combine");
+  assert.match(ticked.summary!.join("\n"), /COMBINE/, "and the summary names the pass");
+  assert.ok(!ticked.summary!.join("\n").includes("null"), `guard against a null leaking into the summary: ${ticked.summary!.join(" | ")}`);
+});
+
+test("an empty work list with NO combine due falls back to surface, also without crashing", () => {
+  const cwd = seeded();
+  startSec(cwd, "x", 99, 1);
+  saveSettings(cwd, { allowCommandProbes: false });
+  submitSecRecon(cwd, NOTE);
+  recordSurface(cwd, { title: "S1", kind: "sink", file: "s.py", line: 1 });
+  clearSurface(cwd, "S-0001", "check_auth 在 s.py:1 之前执行，这条路径不在公开路由表里", { file: "s.py", line: 1 });
+  // ONE finding: `shouldCombine` needs two, so the round is a surface round with nothing assigned.
+  recordFinding(cwd, { title: "only", category: "rce", severity: "high", file: "a.py", line: 1, evidence: "e" });
+  const ticked = tickLoop(cwd, loadSec(cwd).snapshot);
+  assert.equal(loadSec(cwd).snapshot.roundRecords.at(-1)!.kind, "surface");
+  assert.match(ticked.summary!.join("\n"), /enumerate the attack surface/);
+});

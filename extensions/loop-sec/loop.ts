@@ -2065,12 +2065,28 @@ export function tickLoop(projectRoot: string, snapshot: TreeSnapshot, opts: Tick
                 `${pursuitTarget!.id} [${pursuitTarget!.severity ?? "unrated"}] ${pursuitTarget!.category} — ${clip(pursuitTarget!.title, 90)}`,
                 `${gatesOfFinding(pursuitTarget!).length} gate(s), pursuit ${pursuitTarget!.pursuitSpent ?? 0}/${pursuitBudget} — NOT working the work list this round`,
               ]
-            : [
-                `SEC ROUND ${round} — analyse ${assigned!.id}`,
-                `${assigned!.kind}: ${assigned!.title}` +
-                  (assigned!.location ? ` (${assigned!.location.file}:${assigned!.location.line})` : ""),
-                `${progress.examined}/${progress.total} examined · ${snapshot.findings.length} finding(s) so far`,
-              ]),
+            : kindForRound === "combine"
+              ? [
+                  // COMBINE NEEDED ITS OWN BRANCH, and the crash is why: without it the kind fell through to
+                  // the analyze lines, which dereference `assigned` — and a combine round is scheduled
+                  // precisely when nothing is open, so `assigned` is null and the whole command threw
+                  // "Cannot read properties of null (reading 'id')" on every round. The tests missed it
+                  // because their fixtures always had an open item.
+                  `SEC ROUND ${round} — COMBINE: do any two findings reach further together?`,
+                  `${snapshot.findings.length} finding(s) recorded · ${snapshot.findings.filter((f) => (f.chainOf?.length ?? 0) > 0).length} chain(s) so far`,
+                  "这一轮不分析新地方：看已记录的东西能不能拼起来。",
+                ]
+              : assigned
+                ? [
+                    `SEC ROUND ${round} — analyse ${assigned.id}`,
+                    `${assigned.kind}: ${assigned.title}` +
+                      (assigned.location ? ` (${assigned.location.file}:${assigned.location.line})` : ""),
+                    `${progress.examined}/${progress.total} examined · ${snapshot.findings.length} finding(s) so far`,
+                  ]
+                : [
+                    `SEC ROUND ${round} — enumerate the attack surface`,
+                    "清单上没有可分析的项了（全部 cleared 或被前置阻塞），这一轮去枚举新的地方。",
+                  ]),
     ];
     // SPEND THE PURSUIT BUDGET ON PREPARE, like a dig: a crash or a stalled turn must not hand out
     // unlimited rounds on one finding. The blockers are also snapshotted, because that string is the
