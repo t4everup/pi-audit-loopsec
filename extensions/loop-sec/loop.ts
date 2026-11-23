@@ -388,13 +388,10 @@ export interface StartLoopOptions {
   at?: string;
 }
 
-export interface StartLoopResult {
-  ok: boolean;
-  errors: string[];
-  loop?: AuditLoopState;
-  /** True when an existing PAUSED loop was resumed instead of a new one started. */
-  resumed?: boolean;
-}
+/** Success implies a loop — the caller does `started.loop.kind`, and optional would be a lie. */
+export type StartLoopResult =
+  | { ok: true; errors: []; loop: AuditLoopState; resumed?: boolean }
+  | { ok: false; errors: string[] };
 
 /**
  * Can `/start` be satisfied by resuming the loop that is already there?
@@ -531,18 +528,21 @@ export interface StartDeepOptions {
   at?: string;
 }
 
-export interface StartDeepResult {
-  ok: boolean;
-  errors: string[];
-  dir?: string;
-  /** The run's short name, e.g. `sec002-deep-F0008-...`. */
-  run?: string;
-  loop?: AuditLoopState;
-  /** True when an existing deep run was REOPENED rather than created. */
-  resumed?: boolean;
-  /** The round the reopened run is on — so the operator is told where they are coming back to. */
-  round?: number;
-}
+/** Success implies `dir` and `run` — the caller prints both. */
+export type StartDeepResult =
+  | {
+      ok: true;
+      errors: [];
+      dir: string;
+      /** The run's short name, e.g. `sec002-deep-F0008-...`. */
+      run: string;
+      loop?: AuditLoopState;
+      /** True when an existing deep run was REOPENED rather than created. */
+      resumed?: boolean;
+      /** The round the reopened run is on. */
+      round?: number;
+    }
+  | { ok: false; errors: string[] };
 
 export function startDeepRun(projectRoot: string, findingId: string, opts: StartDeepOptions = {}): StartDeepResult {
   const at = opts.at ?? nowIso();

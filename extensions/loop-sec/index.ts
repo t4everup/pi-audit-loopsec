@@ -1016,10 +1016,10 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
         if (started.resumed) {
           notify(
             [
-              `Resumed the paused ${started.loop!.kind} at round ${started.loop!.round}: ${clip(started.loop!.objective, 120)}`,
+              `Resumed the paused ${started.loop.kind} at round ${started.loop.round}: ${clip(started.loop.objective, 120)}`,
               `  nothing was reset — the findings, the surface list and the round number are unchanged.`,
               `  the stall counter was reset, so the plateau starts fresh.`,
-              `  to start a DIFFERENT audit: /${started.loop!.kind} stop first.`,
+              `  to start a DIFFERENT audit: /${started.loop.kind} stop first.`,
             ].join("\n"),
             "info",
           );
@@ -1030,7 +1030,7 @@ export default function loopsecExtension(pi: ExtensionAPI): void {
           [
             `SEC loop started: ${clip(objective, 120)}`,
             `  drive it with /${loopCommandName(kind)} — status, pause, report, help`,
-            `  unbounded; plateau after ${started.loop!.plateauWindow} unproductive rounds`,
+            `  unbounded; plateau after ${started.loop.plateauWindow} unproductive rounds`,
             `  findings ledger: ${secLedgerPath(cwd)}`,
           ].join("\n"),
           "info",
