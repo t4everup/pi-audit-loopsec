@@ -364,9 +364,15 @@ model's opinion of what the output means.
 | `reportLanguage` / `fenceLanguage` | zh / c | the report |
 | `focus` | none | reorders the work list; never filters a finding |
 
-**One ROUND in flight, many runs live.** The eight tools resolve `active.json`'s turn
-claim, so the round being worked determines where its writes go. That is why several runs
-can advance in rotation without any of them knowing that the others exist.
+**One ROUND in flight, many runs live — across PROCESSES too.** The eight tools resolve `active.json`'s turn claim, so
+the round being worked determines where its writes go. That is why several runs can advance in rotation
+without any of them knowing that the others exist.
+
+A round lock (an atomic `mkdir`) makes that hold across windows: a second pi window on the same project
+SKIPS its turn rather than interleaving. `lockTtlMs` (default 30 min) only matters for an owner that
+cannot be asked — a **dead** owner is detected by pid liveness and taken over in milliseconds, so closing
+a window mid-round does not leave the project locked. Re-entering the lock refreshes its timestamp, so a
+long-running window is never taken for stale.
 
 **exFAT-safe:** only `appendFileSync` and `writeFileSync`. No rename, no link, no
 held descriptor. A torn last line is repaired, never silently swallowed.

@@ -37,7 +37,7 @@ export interface LockOwner {
 }
 
 export type LockResult =
-  | { ok: true; release: () => void; reentrant?: boolean }
+  | { ok: true; release: () => void; reentrant?: boolean; /** The dead owner whose lock was taken over. */ tookOver?: LockOwner }
   | { ok: false; reason: string; holder?: LockOwner };
 
 /**
@@ -64,8 +64,40 @@ export function releaseTurnLock(projectRoot: string): void {
   }
 }
 
+/** Remove the lock. Shared by every acquire path so the two cannot drift. */
+function makeRelease(dir: string): () => void {
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {
+      /* the TTL will clear it */
+    }
+  };
+}
+
 export function turnLockDir(projectRoot: string): string {
   return path.join(secBaseDir(projectRoot), TURN_LOCK_NAME);
+}
+
+/**
+ * Is that process still there?
+ *
+ * process.kill(pid, 0) sends no signal; it only asks the OS whether the process exists. ESRCH means it is gone,
+ * EPERM means it exists but belongs to somebody else (still alive), anything else is treated as alive —
+ * refusing to take over a lock we are unsure about is the safe direction.
+ */
+function pidAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  if (pid === process.pid) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
 }
 
 function readOwner(dir: string): LockOwner | null {
@@ -157,16 +189,38 @@ export function acquireTurnLock(
     // in this process has.
     const holder = readOwner(dir);
     if (holder && holder.pid === self) {
+      // RE-ENTRANT, AND REFRESHED. The timestamp is rewritten because the lock's lifetime is the round: a run
+      // that has been going for an hour is not stale, and another window must not take over a lock whose owner
+      // is alive and working. Without the refresh every long run looked abandoned after `ttl` from its FIRST
+      // acquisition.
+      writeOwner();
       return { ok: true, release: () => {}, reentrant: true };
     }
+    // A DEAD OWNER IS NOT A LOCK, and this is checked BEFORE the TTL. A real run paid for the difference: a
+    // window was closed mid-round, its lock survived, and the other window reported "another process is working
+    // a round (pid 29468)" on every attempt for the full 30-minute TTL while nothing was working. A pid is
+    // answerable right now, so ask it instead of waiting.
+    if (holder && !pidAlive(holder.pid)) {
+      try {
+        fs.rmSync(dir, { recursive: true, force: true });
+        fs.mkdirSync(dir);
+        writeOwner();
+      } catch (error) {
+        return { ok: false, reason: `could not take over a lock left by pid ${holder.pid}: ${(error as Error).message}` };
+      }
+      return { ok: true, release: makeRelease(dir), tookOver: holder };
+    }
+    // Held by a process that IS alive: the TTL is the only remaining reason to take it.
     const age = ageOfMs(dir, now);
     if (age <= ttl) {
       return {
         ok: false,
         reason:
-          `another process is working a round` +
-          (holder ? ` (pid ${holder.pid}, since ${holder.at}${holder.run ? `, run ${holder.run}` : ""})` : "") +
-          ` — this window skipped its turn so the two do not interleave`,
+          `another pi window is working a round` +
+          (holder
+            ? ` (pid ${holder.pid}, alive, since ${holder.at}${holder.run ? `, run ${holder.run}` : ""})`
+            : "") +
+          ` — this window skipped its turn so the two do not interleave. Close that window, or make it pause.`,
         ...(holder ? { holder } : {}),
       };
     }

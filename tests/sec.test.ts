@@ -4195,14 +4195,15 @@ test("a second window cannot take a round while the first holds the lock", () =>
   // The failure this exists to stop: two windows on one project, both writing the single turn claim, so
   // the loser's tool calls resolve to the winner's run and its finding lands in another audit's log.
   const cwd = seeded();
-  // A different pid is what "another window" means: re-entrancy within one process is by design, since
-  // the lock's lifetime is the round and the settle re-enters it.
-  const other = 999_999;
-  const first = acquireTurnLock(cwd, { ttlMs: 600_000, pid: other });
+  // A LIVE, different pid is what "another window" means: re-entrancy within one process is by design (the
+  // lock's lifetime is the round and the settle re-enters it), and a FABRICATED pid is now detected as a
+  // dead owner and taken over — see the takeover test below.
+  const other = process.ppid;
+  const first = acquireTurnLock(cwd, { ttlMs: 600_000, pid: process.ppid });
   assert.equal(first.ok, true);
   const second = acquireTurnLock(cwd, { ttlMs: 600_000 });
   assert.equal(second.ok, false, "the second window must not work a round");
-  assert.match(second.ok ? "" : second.reason, /another process is working a round/);
+  assert.match(second.ok ? "" : second.reason, /another pi window is working a round/);
   assert.match(second.ok ? "" : second.reason, new RegExp(`pid ${other}`), "and it names the holder");
   if (first.ok) first.release();
 });
@@ -4210,13 +4211,13 @@ test("a second window cannot take a round while the first holds the lock", () =>
 test("advanceRuns SKIPS when another process holds the lock, and says so", () => {
   const cwd = seeded();
   runIn(cwd, "挖掘认证前rce");
-  const held = acquireTurnLock(cwd, { ttlMs: 600_000, pid: 999_999 });
+  const held = acquireTurnLock(cwd, { ttlMs: 600_000, pid: process.ppid });
   assert.equal(held.ok, true);
   const before = loadSec(cwd).snapshot.loop?.round;
 
   const advanced = advanceRuns(cwd);
   assert.equal(advanced.sent, undefined, "no round was dispatched");
-  assert.match(advanced.idleReason ?? "", /another process/);
+  assert.match(advanced.idleReason ?? "", /another pi window/);
   assert.equal(loadSec(cwd).snapshot.loop?.round, before, "and nothing moved");
 
   if (held.ok) held.release();
@@ -4438,14 +4439,14 @@ test("the lock is held for the DURATION of the round, not just the dispatch", ()
   const first = advanceRuns(cwd);
   assert.ok(first.sent, "a round was dispatched");
 
-  const otherDuring = acquireTurnLock(cwd, { ttlMs: 600_000, pid: 999_999 });
+  const otherDuring = acquireTurnLock(cwd, { ttlMs: 600_000, pid: process.ppid });
   assert.equal(otherDuring.ok, false, "another window cannot take it while the round is in flight");
-  assert.match(otherDuring.ok ? "" : otherDuring.reason, /another process/);
+  assert.match(otherDuring.ok ? "" : otherDuring.reason, /another pi window/);
 
   // Pause, then settle: the round ends and NOTHING is dispatched, so the lock is released.
   pauseLoop(cwd, loadSec(cwd).snapshot, "test");
   advanceRuns(cwd);
-  const otherAfter = acquireTurnLock(cwd, { ttlMs: 600_000, pid: 999_999 });
+  const otherAfter = acquireTurnLock(cwd, { ttlMs: 600_000, pid: process.ppid });
   assert.equal(otherAfter.ok, true, "once the round is over the lock is free");
   if (otherAfter.ok) otherAfter.release();
 });
@@ -5013,4 +5014,49 @@ test("an empty work list with NO combine due falls back to surface, also without
   const ticked = tickLoop(cwd, loadSec(cwd).snapshot);
   assert.equal(loadSec(cwd).snapshot.roundRecords.at(-1)!.kind, "surface");
   assert.match(ticked.summary!.join("\n"), /enumerate the attack surface/);
+});
+
+test("a lock left by a DEAD process is taken over at once, not after the TTL", () => {
+  // The stuck run this fixes: a window closed mid-round, its lock survived, and the other window reported
+  // "another process is working a round (pid 29468)" on every attempt for the full 30-minute TTL.
+  const cwd = seeded();
+  const dir = turnLockDir(cwd);
+  fs.mkdirSync(dir, { recursive: true });
+  // A pid that cannot exist. pidAlive() asks the OS, gets ESRCH, and the lock is dead.
+  fs.writeFileSync(path.join(dir, "owner.json"), JSON.stringify({ pid: 99_999_999, at: new Date().toISOString() }), "utf-8");
+
+  const took = acquireTurnLock(cwd, { ttlMs: 1_800_000 });
+  assert.equal(took.ok, true, "taken over immediately — the TTL never came into it");
+  assert.equal(took.ok && took.tookOver?.pid, 99_999_999, "and it says whose lock it was");
+  releaseTurnLock(cwd);
+});
+
+test("a lock held by a LIVE process is NOT taken over", () => {
+  const cwd = seeded();
+  const held = acquireTurnLock(cwd, { ttlMs: 1_800_000, pid: process.ppid });
+  assert.equal(held.ok, true);
+  const second = acquireTurnLock(cwd, { ttlMs: 1_800_000 });
+  assert.equal(second.ok, false, "a live owner keeps its lock");
+  assert.match(second.ok ? "" : second.reason, /another pi window is working a round/);
+  assert.match(second.ok ? "" : second.reason, /alive/, "and the message says the owner is alive");
+  assert.match(second.ok ? "" : second.reason, /Close that window/, "with the escape hatch");
+  if (held.ok) held.release();
+});
+
+test("re-entering the lock REFRESHES the owner timestamp, so a long run is not taken for stale", () => {
+  const cwd = seeded();
+  const oldAt = Date.now() - 1_700_000;
+  const first = acquireTurnLock(cwd, { ttlMs: 1_800_000, at: oldAt });
+  assert.equal(first.ok, true);
+  const dir = turnLockDir(cwd);
+  const before = JSON.parse(fs.readFileSync(path.join(dir, "owner.json"), "utf-8")).at;
+  assert.equal(before, new Date(oldAt).toISOString());
+
+  // The same process re-enters on its next settle; the timestamp moves forward.
+  const again = acquireTurnLock(cwd, { ttlMs: 1_800_000 });
+  assert.equal(again.ok, true);
+  assert.equal(again.ok && again.reentrant, true);
+  const after = JSON.parse(fs.readFileSync(path.join(dir, "owner.json"), "utf-8")).at;
+  assert.notEqual(after, before, "refreshed — otherwise every long run looks abandoned after the TTL");
+  releaseTurnLock(cwd);
 });
